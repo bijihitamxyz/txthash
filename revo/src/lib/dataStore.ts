@@ -10,8 +10,8 @@
  * - All fs operations (mkdirSync, readFileSync, writeFileSync, etc.) wrapped in safe try/catch blocks
  */
 
-import fs from 'fs';
-import path from 'path';
+const fs = typeof window === "undefined" ? eval("require")("fs") : null;
+const path = typeof window === "undefined" ? eval("require")("path") : null;
 
 declare global {
   // eslint-disable-next-line no-var

@@ -1,12 +1,14 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: false,
-  turbopack: {},
   typescript: {
     ignoreBuildErrors: true,
   },
-  eslint: {
-    ignoreDuringBuilds: true,
+  turbopack: {
+    resolveAlias: {
+      fs: { browser: './src/lib/emptyModule.js' },
+      path: { browser: './src/lib/emptyModule.js' },
+    },
   },
 };
 
