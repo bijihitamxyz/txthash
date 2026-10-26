@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { readDataFileAsync, writeDataFileAsync, getDataDir } from './dataStore';
 
 export type LicenseDuration = '7d' | '30d';
 export type LicenseStatus = 'ACTIVE' | 'REVOKED' | 'EXPIRED';
@@ -32,13 +33,15 @@ export interface LicenseStats {
 const KEY_CHARSET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 
 /**
- * Returns the absolute path to licenses_db.json
+ * Returns the absolute path to licenses_db.json dynamically:
+ * Resolves to '/tmp/quant-data/licenses_db.json' on Vercel
+ * or path.join(process.cwd(), 'data', 'licenses_db.json') locally.
  */
 export function getLicensesDbPath(): string {
   if (process.env.DB_FILE) {
     return process.env.DB_FILE;
   }
-  return path.join(process.cwd(), 'data', 'licenses_db.json');
+  return path.join(getDataDir(), 'licenses_db.json');
 }
 
 // Queue for sequential write safety to prevent file corruption
@@ -51,30 +54,53 @@ function withFileLock<T>(taskFn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Ensures data directory exists and returns default db structure
+ * Ensures data directory exists and returns default db structure safely
  */
 function ensureDbFileExists(filePath: string): void {
-  const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
+  try {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) {
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+      } catch (err) {
+        console.warn('[LICENSE DB] ensureDbFileExists mkdirSync warning:', err);
+      }
+    }
 
-  if (!fs.existsSync(filePath)) {
-    const initialData: LicenseDbData = { licenses: [] };
-    fs.writeFileSync(filePath, JSON.stringify(initialData, null, 2), 'utf-8');
+    if (!fs.existsSync(filePath)) {
+      // Check seed file first
+      let initialContent = '';
+      const seedFile = path.join(process.cwd(), 'data', 'licenses_db.json');
+      try {
+        if (fs.existsSync(seedFile)) {
+          initialContent = fs.readFileSync(seedFile, 'utf-8');
+        }
+      } catch {}
+
+      if (!initialContent.trim()) {
+        const initialData: LicenseDbData = { licenses: [] };
+        initialContent = JSON.stringify(initialData, null, 2);
+      }
+
+      try {
+        fs.writeFileSync(filePath, initialContent, 'utf-8');
+      } catch (err) {
+        console.warn('[LICENSE DB] ensureDbFileExists writeFileSync warning:', err);
+      }
+    }
+  } catch (err) {
+    console.warn('[LICENSE DB] ensureDbFileExists unexpected error:', err);
   }
 }
 
 /**
  * Safely reads the license records, automatically updating status to EXPIRED
- * if expiresAt has passed.
+ * if expiresAt has passed. Backed by /tmp/quant-data, seed file fallback,
+ * and globalThis.__QUANT_MEMORY_STORE__.
  */
 export async function readLicenses(): Promise<LicenseRecord[]> {
-  const filePath = getLicensesDbPath();
-  ensureDbFileExists(filePath);
-
   try {
-    const content = await fs.promises.readFile(filePath, 'utf-8');
+    const content = await readDataFileAsync('licenses_db.json', JSON.stringify({ licenses: [] }, null, 2));
     if (!content.trim()) {
       return [];
     }
@@ -111,18 +137,17 @@ export async function readLicenses(): Promise<LicenseRecord[]> {
 
 /**
  * Safely writes the license records atomically using a temp file.
+ * Backed by globalThis.__QUANT_MEMORY_STORE__ so EROFS never throws.
  */
 export async function writeLicenses(licenses: LicenseRecord[]): Promise<void> {
   return withFileLock(async () => {
-    const filePath = getLicensesDbPath();
-    ensureDbFileExists(filePath);
-
-    const tmpPath = `${filePath}.tmp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const payload: LicenseDbData = { licenses };
-    const jsonStr = JSON.stringify(payload, null, 2);
-
-    await fs.promises.writeFile(tmpPath, jsonStr, 'utf-8');
-    await fs.promises.rename(tmpPath, filePath);
+    try {
+      const payload: LicenseDbData = { licenses };
+      const jsonStr = JSON.stringify(payload, null, 2);
+      await writeDataFileAsync('licenses_db.json', jsonStr);
+    } catch (err) {
+      console.error('[LICENSE DB] Error writing licenses:', err);
+    }
   });
 }
 
@@ -330,7 +355,7 @@ export async function deleteLicenseRecord(keyOrId: string): Promise<boolean> {
   const clean = keyOrId.trim().toUpperCase();
   const initialLength = licenses.length;
   const filtered = licenses.filter(
-    (l) => l.id !== keyOrId && l.licenseKey.toUpperCase() !== clean
+    (l) => l.id !== keyOrId && l.licenseKey.toUpperCase() === clean
   );
 
   if (filtered.length === initialLength) {

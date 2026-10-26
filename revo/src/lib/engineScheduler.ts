@@ -37,37 +37,61 @@ class EngineScheduler {
   private isInitialized = false;
 
   constructor() {
-    this.init();
+    try {
+      this.init();
+    } catch (err) {
+      console.warn('[EngineScheduler] Constructor initialization warning:', err);
+    }
   }
 
   public init() {
-    if (this.isInitialized) return;
-    this.isInitialized = true;
+    try {
+      if (this.isInitialized) return;
+      this.isInitialized = true;
 
-    // Start background loop
-    this.startLoop();
-    console.log('[EngineScheduler] Unified in-process engine scheduler initialized (3s heartbeat).');
+      // Skip starting interval loop during production build to prevent hanging next build
+      if (process.env.NEXT_PHASE === 'phase-production-build') {
+        return;
+      }
+
+      // Start background loop
+      this.startLoop();
+      console.log('[EngineScheduler] Unified in-process engine scheduler initialized (3s heartbeat).');
+    } catch (err) {
+      console.warn('[EngineScheduler] Failed to initialize scheduler loop:', err);
+    }
   }
 
   private startLoop() {
-    if (this.timer) {
-      clearInterval(this.timer);
-    }
-
-    this.timer = setInterval(async () => {
-      try {
-        await this.heartbeatTick();
-      } catch (err) {
-        console.error('[EngineScheduler] Error during heartbeat tick:', err);
+    try {
+      if (this.timer) {
+        clearInterval(this.timer);
       }
-    }, this.tickIntervalMs);
+
+      this.timer = setInterval(async () => {
+        try {
+          await this.heartbeatTick();
+        } catch (err) {
+          console.error('[EngineScheduler] Error during heartbeat tick:', err);
+        }
+      }, this.tickIntervalMs);
+
+      // Unref timer if available so Node.js process / serverless lambda can exit cleanly
+      if (this.timer && typeof this.timer.unref === 'function') {
+        this.timer.unref();
+      }
+    } catch (err) {
+      console.warn('[EngineScheduler] Error starting heartbeat loop:', err);
+    }
   }
 
   public stopLoop() {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = null;
-    }
+    try {
+      if (this.timer) {
+        clearInterval(this.timer);
+        this.timer = null;
+      }
+    } catch {}
   }
 
   public isRunning(): boolean {
@@ -416,6 +440,15 @@ class EngineScheduler {
         positions: updatedPositions,
         telemetryCount: state.telemetryLogs.length,
       };
+    } catch (err: any) {
+      console.error('[EngineScheduler] Error during heartbeatTick execution (handled safely):', err);
+      return {
+        executed: false,
+        timestamp: Date.now(),
+        positions: [],
+        telemetryCount: 0,
+        message: err?.message || 'Heartbeat tick execution error',
+      };
     } finally {
       this.isTickExecuting = false;
     }
@@ -433,5 +466,9 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 export function ensureSchedulerStarted() {
-  engineScheduler.init();
+  try {
+    engineScheduler.init();
+  } catch (err) {
+    console.warn('[EngineScheduler] ensureSchedulerStarted error (handled safely):', err);
+  }
 }

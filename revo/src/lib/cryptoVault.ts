@@ -2,7 +2,7 @@
  * AES-256-GCM Encrypted Credential Vault (src/lib/cryptoVault.ts)
  * Secure client & server credential encryption using Web Crypto API.
  * Stores Exness Demo Account, Exness Real Account, and BYOK AI Provider keys.
- * Zero native C++ compilation dependencies. Compatible with Linux/Termux and Browser runtime.
+ * Zero native C++ compilation dependencies. Compatible with Linux/Termux, Vercel, and Browser runtime.
  */
 
 const DEFAULT_SALT = 'EXNESS_AI_QUANT_TRADER_VAULT_2026_MASTER';
@@ -250,6 +250,32 @@ export async function loadVaultFromLocalStorage(): Promise<StoredCredentials | n
     };
   } catch (err) {
     console.error('Failed to decrypt stored credentials vault:', err);
+    return null;
+  }
+}
+
+/**
+ * Server-Side Persistent Credential Vault (backed by safe dataStore)
+ */
+export async function saveServerVault(creds: StoredCredentials): Promise<void> {
+  try {
+    const jsonStr = JSON.stringify(creds);
+    const encrypted = await encryptCredential(jsonStr);
+    const { writeDataFileAsync } = await import('./dataStore');
+    await writeDataFileAsync('vault.enc', encrypted);
+  } catch (err) {
+    console.warn('[cryptoVault] saveServerVault error (ignored):', err);
+  }
+}
+
+export async function loadServerVault(): Promise<StoredCredentials | null> {
+  try {
+    const { readDataFileAsync } = await import('./dataStore');
+    const encrypted = await readDataFileAsync('vault.enc', '');
+    if (!encrypted || !encrypted.trim()) return null;
+    const decrypted = await decryptCredential(encrypted);
+    return JSON.parse(decrypted);
+  } catch {
     return null;
   }
 }

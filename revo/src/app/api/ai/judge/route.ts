@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs';
 import path from 'path';
 import { verifyAdminSecret } from '@/lib/licenseDb';
 import { testAiPing } from '@/core/aiJudge';
+import { readDataFileAsync, writeDataFileAsync, getDataDir } from '@/lib/dataStore';
 
 export const dynamic = 'force-dynamic';
 
@@ -24,25 +24,12 @@ export function getAiConfigPath(): string {
   if (process.env.AI_CONFIG_FILE) {
     return process.env.AI_CONFIG_FILE;
   }
-  return path.join(process.cwd(), 'data', 'ai_config.json');
+  return path.join(getDataDir(), 'ai_config.json');
 }
 
 export async function readCentralAiConfig(): Promise<CentralAiConfig> {
-  const filePath = getAiConfigPath();
   try {
-    const dataDir = path.join(process.cwd(), 'data');
-    if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true });
-    }
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    if (!fs.existsSync(filePath)) {
-      fs.writeFileSync(filePath, JSON.stringify(DEFAULT_CENTRAL_AI_CONFIG, null, 2), 'utf-8');
-      return { ...DEFAULT_CENTRAL_AI_CONFIG };
-    }
-    const raw = fs.readFileSync(filePath, 'utf-8');
+    const raw = await readDataFileAsync('ai_config.json', JSON.stringify(DEFAULT_CENTRAL_AI_CONFIG, null, 2));
     if (!raw.trim()) {
       return { ...DEFAULT_CENTRAL_AI_CONFIG };
     }
@@ -60,32 +47,32 @@ export async function readCentralAiConfig(): Promise<CentralAiConfig> {
 }
 
 export async function writeCentralAiConfig(config: Partial<CentralAiConfig>): Promise<CentralAiConfig> {
-  const filePath = getAiConfigPath();
-  const dataDir = path.join(process.cwd(), 'data');
-  // Automatically ensure the data directory exists before writing data/ai_config.json
-  fs.mkdirSync(dataDir, { recursive: true });
-  const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+  try {
+    const current = await readCentralAiConfig();
+
+    // If apiKey is masked with bullets, preserve the current real key
+    const isMasked = config.apiKey && config.apiKey.includes('••••••••');
+    const effectiveApiKey = isMasked
+      ? current.apiKey
+      : (config.apiKey !== undefined ? config.apiKey.trim() : current.apiKey);
+
+    const updated: CentralAiConfig = {
+      baseUrl: (config.baseUrl ?? current.baseUrl ?? DEFAULT_CENTRAL_AI_CONFIG.baseUrl).trim(),
+      model: (config.model ?? current.model ?? DEFAULT_CENTRAL_AI_CONFIG.model).trim(),
+      apiKey: effectiveApiKey,
+      updatedAt: Date.now(),
+    };
+
+    await writeDataFileAsync('ai_config.json', JSON.stringify(updated, null, 2));
+    return updated;
+  } catch (err) {
+    console.error('[writeCentralAiConfig] Error writing ai_config.json:', err);
+    return {
+      ...DEFAULT_CENTRAL_AI_CONFIG,
+      ...config,
+      updatedAt: Date.now(),
+    } as CentralAiConfig;
   }
-
-  const current = await readCentralAiConfig();
-
-  // If apiKey is masked with bullets, preserve the current real key
-  const isMasked = config.apiKey && config.apiKey.includes('••••••••');
-  const effectiveApiKey = isMasked
-    ? current.apiKey
-    : (config.apiKey !== undefined ? config.apiKey.trim() : current.apiKey);
-
-  const updated: CentralAiConfig = {
-    baseUrl: (config.baseUrl ?? current.baseUrl ?? DEFAULT_CENTRAL_AI_CONFIG.baseUrl).trim(),
-    model: (config.model ?? current.model ?? DEFAULT_CENTRAL_AI_CONFIG.model).trim(),
-    apiKey: effectiveApiKey,
-    updatedAt: Date.now(),
-  };
-
-  fs.writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8');
-  return updated;
 }
 
 export interface AiJudgeVerdict {

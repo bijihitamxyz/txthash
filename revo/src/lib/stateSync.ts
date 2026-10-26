@@ -4,7 +4,7 @@
  * between the frontend store and a server-side encrypted state cache
  * with an in-memory singleton (globalThis.__EXNESS_BOT_STATE__) so the internal scheduler
  * continues trading and trailing 24/7 even if the browser tab is refreshed or closed.
- * Fully Termux/Android compatible with zero hardcoded /tmp paths.
+ * Fully Termux/Android and Vercel Serverless compatible with safe /tmp fallback.
  */
 
 import fs from 'fs';
@@ -68,15 +68,16 @@ export const DEFAULT_STATE: BotRuntimeState = {
 };
 
 declare global {
+  // eslint-disable-next-line no-var
   var __EXNESS_BOT_STATE__: BotRuntimeState | undefined;
 }
 
 function getStateFilePath(): string {
   try {
-    const tmp = os.tmpdir();
-    return path.join(tmp, 'exness-bot-state.enc');
+    const dataDir = process.env.VERCEL ? '/tmp/quant-data' : (os.tmpdir() || '/tmp');
+    return path.join(dataDir, 'exness-bot-state.enc');
   } catch {
-    return path.join(process.cwd(), '.exness-bot-state.enc');
+    return '/tmp/exness-bot-state.enc';
   }
 }
 
@@ -90,8 +91,16 @@ class StateSyncManager {
   constructor() {
     try {
       const targetFile = getStateFilePath();
+      const dir = path.dirname(targetFile);
+      if (!fs.existsSync(dir)) {
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+        } catch {}
+      }
       if (fs.existsSync(targetFile)) {
-        fs.unlinkSync(targetFile);
+        try {
+          fs.unlinkSync(targetFile);
+        } catch {}
       }
     } catch {}
     if (globalThis.__EXNESS_BOT_STATE__) {
@@ -226,6 +235,12 @@ class StateSyncManager {
     globalThis.__EXNESS_BOT_STATE__ = { ...this.inMemoryState };
     try {
       const targetFile = getStateFilePath();
+      const dir = path.dirname(targetFile);
+      if (!fs.existsSync(dir)) {
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+        } catch {}
+      }
       const json = JSON.stringify(this.inMemoryState);
       const encrypted = await encryptCredential(json);
       await fs.promises.writeFile(targetFile, encrypted, 'utf8');
@@ -240,7 +255,9 @@ class StateSyncManager {
     try {
       const targetFile = getStateFilePath();
       if (fs.existsSync(targetFile)) {
-        fs.unlinkSync(targetFile);
+        try {
+          fs.unlinkSync(targetFile);
+        } catch {}
       }
     } catch {
       // Silently ignore
