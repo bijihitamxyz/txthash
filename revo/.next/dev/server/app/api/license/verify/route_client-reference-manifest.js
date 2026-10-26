@@ -1,0 +1,1 @@
+globalThis.__RSC_MANIFEST=(globalThis.__RSC_MANIFEST||{});globalThis.__RSC_MANIFEST["/api/license/verify/route"]={"moduleLoading":{"prefix":"/_next/"},"ssrModuleMapping":{},"edgeSSRModuleMapping":{},"clientModules":{},"entryCSSFiles":{"/data/data/com.termux/files/home/revo/src/app/api/license/verify/route":[]},"rscModuleMapping":{},"edgeRscModuleMapping":{}};

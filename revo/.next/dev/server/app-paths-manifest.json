@@ -1,0 +1,6 @@
+{
+  "/api/license/verify/route": "app/api/license/verify/route.js",
+  "/api/exness/route": "app/api/exness/route.js",
+  "/api/engine-tick/route": "app/api/engine-tick/route.js",
+  "/page": "app/page.js"
+}

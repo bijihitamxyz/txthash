@@ -1,0 +1,6 @@
+{
+  "baseUrl": "https://integrate.api.nvidia.com/v1",
+  "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+  "apiKey": "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",
+  "updatedAt": 1792990022383
+}

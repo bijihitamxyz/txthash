@@ -1,0 +1,4 @@
+node_modules/
+.env
+*.log
+licenses_db.json.tmp

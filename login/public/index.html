@@ -1,0 +1,1061 @@
+<!DOCTYPE html>
+<html lang="id" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Exness Quant Terminal // License Portal</title>
+  <!-- Tailwind CSS via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- QRCode.js library for dynamic client-side QR generation -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            slate: {
+              950: '#020617',
+              900: '#0f172a',
+              850: '#111e38',
+              800: '#1e293b',
+              700: '#334155'
+            }
+          },
+          fontFamily: {
+            mono: ['JetBrains Mono', 'Menlo', 'Monaco', 'Courier New', 'monospace']
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+    body {
+      font-family: 'Inter', sans-serif;
+    }
+    .quant-gradient {
+      background: radial-gradient(ellipse 80% 80% at 50% -20%, rgba(99, 102, 241, 0.18), rgba(2, 6, 23, 0));
+    }
+    .custom-scrollbar::-webkit-scrollbar {
+      width: 6px;
+    }
+    .custom-scrollbar::-webkit-scrollbar-thumb {
+      background: #334155;
+      border-radius: 9999px;
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between quant-gradient selection:bg-indigo-500 selection:text-white">
+
+  <!-- Top Ambient Glow -->
+  <div class="pointer-events-none fixed -top-40 left-1/2 -translate-x-1/2 h-96 w-[42rem] rounded-full bg-indigo-600/15 blur-3xl" aria-hidden="true"></div>
+
+  <!-- Navigation Bar -->
+  <header class="border-b border-slate-800/80 bg-slate-950/80 backdrop-blur-md sticky top-0 z-40">
+    <div class="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+      <!-- Brand Logo -->
+      <a href="/" class="flex items-center gap-3 group">
+        <div class="relative flex h-10 w-10 items-center justify-center rounded-xl border border-indigo-500/40 bg-slate-900 shadow-inner shadow-indigo-500/20 group-hover:border-indigo-400 transition-colors">
+          <svg class="h-5 w-5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
+          <span class="absolute -top-1 -right-1 flex h-2.5 w-2.5">
+            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+            <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500 ring-2 ring-slate-950"></span>
+          </span>
+        </div>
+        <div>
+          <div class="flex items-center gap-2">
+            <span class="font-bold tracking-tight text-white group-hover:text-indigo-300 transition-colors">EXNESS QUANT</span>
+            <span class="rounded bg-indigo-950/80 border border-indigo-800/60 px-1.5 py-0.2 text-[10px] font-mono text-indigo-300">v2.4</span>
+          </div>
+          <p class="text-[11px] text-slate-400">Institutional Algorithmic Terminal</p>
+        </div>
+      </a>
+
+      <!-- Right Navigation Actions -->
+      <div class="flex items-center gap-3">
+        <div class="hidden sm:flex items-center gap-2 px-3 py-1 rounded-full border border-slate-800 bg-slate-900/60 text-[11px] font-mono text-emerald-400">
+          <span class="h-2 w-2 rounded-full bg-emerald-500 animate-pulse"></span>
+          <span>SYSTEM OPERATIONAL</span>
+        </div>
+        <a href="/admin" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 hover:border-slate-700 text-xs font-medium text-slate-300 hover:text-white transition-all shadow-sm">
+          <svg class="w-3.5 h-3.5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+          </svg>
+          <span>Admin Portal</span>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Container -->
+  <main class="max-w-4xl mx-auto px-4 py-8 sm:py-12 w-full flex-1">
+
+    <!-- Tab Switcher Navigation -->
+    <div class="flex justify-center mb-8">
+      <div class="p-1 rounded-xl border border-slate-800 bg-slate-900/90 backdrop-blur-md flex gap-1 shadow-lg shadow-indigo-950/20">
+        <button id="tab-login-btn" onclick="switchMainTab('login')" class="flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs sm:text-sm font-semibold transition-all bg-indigo-600 text-white shadow-md shadow-indigo-600/30">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+          </svg>
+          <span>Login Lisensi</span>
+        </button>
+        <button id="tab-register-btn" onclick="switchMainTab('register')" class="flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs sm:text-sm font-semibold transition-all text-slate-400 hover:text-slate-200 hover:bg-slate-800">
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 3h2l.4 2M7 13h10l4-8H5.4M7 13L5.4 5M7 13l-2.293 2.293c-.63.63-.184 1.707.707 1.707H17m0 0a2 2 0 100 4 2 2 0 000-4zm-8 2a2 2 0 11-4 0 2 2 0 014 0z" />
+          </svg>
+          <span>Daftar / Beli Lisensi</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- ===================================================================== -->
+    <!-- TAB 1: LOGIN LISENSI -->
+    <!-- ===================================================================== -->
+    <section id="tab-login-section" class="w-full">
+      
+      <!-- Sub-view 1A: Form Input Lisensi (Saat belum verified) -->
+      <div id="login-form-card" class="max-w-md mx-auto rounded-2xl border border-slate-800/90 bg-slate-900/95 p-6 sm:p-8 shadow-2xl shadow-indigo-950/40 backdrop-blur-xl relative">
+        <div class="text-center mb-6">
+          <div class="inline-flex h-12 w-12 items-center justify-center rounded-xl border border-indigo-500/30 bg-slate-950 shadow-inner mb-3">
+            <svg class="w-6 h-6 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+            </svg>
+          </div>
+          <h2 class="text-xl font-bold tracking-tight text-white">Aktivasi Lisensi Trading</h2>
+          <p class="text-xs text-slate-400 mt-1">Masukkan kunci lisensi untuk mengaktifkan algorithmic terminal bot.</p>
+        </div>
+
+        <!-- Alert Notification Box -->
+        <div id="login-alert" class="hidden mb-4 p-3.5 rounded-xl text-xs flex items-start gap-3"></div>
+
+        <form id="license-verify-form" onsubmit="handleVerifyLicense(event)" class="space-y-4">
+          <div>
+            <div class="flex items-center justify-between mb-1.5">
+              <label class="block text-xs font-mono font-medium text-slate-300 uppercase tracking-wider">License Key</label>
+              <span class="text-[11px] font-mono text-slate-500">EQ-7D-... / EQ-30D-...</span>
+            </div>
+            <div class="relative">
+              <input
+                id="license-key-input"
+                type="text"
+                autocomplete="off"
+                placeholder="EQ-7D-XXXX-XXXX"
+                oninput="formatLicenseInput(this)"
+                class="w-full rounded-xl border border-slate-800 bg-slate-950 px-4 py-3.5 pr-20 font-mono text-base tracking-wider text-white placeholder-slate-600 focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 uppercase transition-all"
+                required
+              />
+              <div class="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                <button type="button" onclick="pasteClipboard()" title="Paste from clipboard" class="p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 text-[11px] font-mono flex items-center gap-1 border border-slate-800 bg-slate-900 transition-colors">
+                  <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+                  </svg>
+                  <span>Paste</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            id="btn-verify-submit"
+            class="w-full py-3.5 px-4 rounded-xl font-semibold text-sm text-white bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 shadow-lg shadow-indigo-600/30 transition-all flex items-center justify-center gap-2 group disabled:opacity-50"
+          >
+            <span id="btn-verify-text">Activate & Verify</span>
+            <svg id="btn-verify-icon" class="w-4 h-4 transition-transform group-hover:translate-x-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+            </svg>
+            <svg id="btn-verify-spinner" class="hidden animate-spin h-4 w-4 text-white" viewBox="0 0 24 24">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none"></circle>
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+            </svg>
+          </button>
+        </form>
+
+        <div class="mt-6 pt-4 border-t border-slate-800 text-center">
+          <p class="text-xs text-slate-400">
+            Belum memiliki lisensi? 
+            <button onclick="switchMainTab('register')" class="text-indigo-400 font-medium hover:text-indigo-300 underline">
+              Beli / Daftar di sini
+            </button>
+          </p>
+        </div>
+      </div>
+
+      <!-- Sub-view 1B: Live Preview Screen Unlocked Session (Muncul saat sudah verified) -->
+      <div id="unlocked-preview-card" class="hidden max-w-xl mx-auto rounded-2xl border border-emerald-500/40 bg-slate-900/95 p-6 sm:p-8 shadow-2xl shadow-emerald-950/40 backdrop-blur-xl relative">
+        <div class="flex items-center justify-between pb-5 border-b border-slate-800">
+          <div class="flex items-center gap-3">
+            <div class="h-12 w-12 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shadow-inner">
+              <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            </div>
+            <div>
+              <div class="flex items-center gap-2">
+                <h3 class="text-lg font-bold text-white">Terminal Access Unlocked</h3>
+                <span class="px-2 py-0.5 rounded-full text-[10px] font-mono bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 animate-pulse font-semibold">ACTIVE</span>
+              </div>
+              <p class="text-xs text-slate-400">Algorithmic execution connection ready</p>
+            </div>
+          </div>
+          <button onclick="handleLogout()" class="px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-800 hover:bg-rose-950/40 hover:border-rose-700 hover:text-rose-300 text-xs text-slate-300 font-medium transition-colors flex items-center gap-1.5">
+            <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+            </svg>
+            <span>Logout</span>
+          </button>
+        </div>
+
+        <!-- Session Details Grid -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 my-6">
+          <div class="p-3.5 rounded-xl border border-slate-800 bg-slate-950/60">
+            <span class="text-[11px] font-mono text-slate-500 uppercase tracking-wider block mb-1">Trader Account</span>
+            <div class="flex items-center gap-2">
+              <span id="session-username" class="font-bold text-white text-base">@trader</span>
+              <span id="session-telegram" class="text-xs text-indigo-400 font-mono"></span>
+            </div>
+          </div>
+
+          <div class="p-3.5 rounded-xl border border-slate-800 bg-slate-950/60">
+            <span class="text-[11px] font-mono text-slate-500 uppercase tracking-wider block mb-1">Durasi Tersisa</span>
+            <div class="flex items-baseline gap-2">
+              <span id="session-remaining-days" class="text-lg font-extrabold text-emerald-400">7 Hari</span>
+              <span id="session-duration-badge" class="text-[11px] font-mono text-slate-400">Plan 7D</span>
+            </div>
+          </div>
+
+          <div class="p-3.5 rounded-xl border border-slate-800 bg-slate-950/60 sm:col-span-2">
+            <div class="flex items-center justify-between mb-1">
+              <span class="text-[11px] font-mono text-slate-500 uppercase tracking-wider">Active License Key</span>
+              <button onclick="copyActiveLicenseKey()" class="text-[11px] font-mono text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
+                <svg class="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+                <span>Salin Key</span>
+              </button>
+            </div>
+            <div id="session-key" class="font-mono text-sm tracking-wider text-indigo-300 font-semibold bg-slate-900 px-3 py-2 rounded-lg border border-slate-800">
+              EQ-7D-XXXX-XXXX
+            </div>
+          </div>
+        </div>
+
+        <!-- Terminal Stream Capabilities -->
+        <div class="p-4 rounded-xl border border-indigo-900/40 bg-indigo-950/20 mb-6">
+          <span class="text-xs font-semibold text-indigo-300 block mb-2">Unlocked Quantitative Modules:</span>
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-2 text-xs text-slate-300">
+            <div class="flex items-center gap-1.5">
+              <svg class="w-4 h-4 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
+              </svg>
+              <span>Exness Real-Time API</span>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <svg class="w-4 h-4 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
+              </svg>
+              <span>Dynamic Risk Engine</span>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <svg class="w-4 h-4 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
+              </svg>
+              <span>Automated Hedging</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Launch Terminal Action -->
+        <button onclick="launchQuantTerminal()" class="w-full py-3.5 px-4 rounded-xl font-bold text-sm text-slate-950 bg-emerald-400 hover:bg-emerald-300 active:bg-emerald-500 shadow-lg shadow-emerald-500/20 transition-all flex items-center justify-center gap-2">
+          <span>🚀 Buka Trading Bot Terminal</span>
+          <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+          </svg>
+        </button>
+      </div>
+
+    </section>
+
+    <!-- ===================================================================== -->
+    <!-- TAB 2: DAFTAR / BELI LISENSI (MULTI-STEP WIZARD) -->
+    <!-- ===================================================================== -->
+    <section id="tab-register-section" class="hidden w-full max-w-2xl mx-auto">
+      
+      <!-- Wizard Step Indicator -->
+      <div class="flex items-center justify-center mb-8">
+        <div class="flex items-center gap-3">
+          <div id="step-badge-1" class="flex items-center gap-2 px-3 py-1.5 rounded-full border border-indigo-500 bg-indigo-600/20 text-indigo-300 text-xs font-semibold">
+            <span class="flex h-5 w-5 rounded-full bg-indigo-600 text-white items-center justify-center text-[10px]">1</span>
+            <span>Data & Paket</span>
+          </div>
+          <div class="w-8 h-0.5 bg-slate-800" id="step-connector"></div>
+          <div id="step-badge-2" class="flex items-center gap-2 px-3 py-1.5 rounded-full border border-slate-800 bg-slate-900 text-slate-500 text-xs font-semibold">
+            <span class="flex h-5 w-5 rounded-full bg-slate-800 text-slate-400 items-center justify-center text-[10px]">2</span>
+            <span>Pembayaran</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- STEP 1: Form Registrasi & Pilihan Durasi -->
+      <div id="register-step-1" class="rounded-2xl border border-slate-800 bg-slate-900/95 p-6 sm:p-8 shadow-2xl backdrop-blur-xl">
+        <div class="mb-6">
+          <h2 class="text-xl font-bold text-white">Pilih Paket Lisensi</h2>
+          <p class="text-xs text-slate-400 mt-1">Lengkapi informasi Anda dan tentukan durasi lisensi yang diinginkan.</p>
+        </div>
+
+        <form id="checkout-form" onsubmit="handleProceedToStep2(event)" class="space-y-6">
+          <!-- User Details Inputs -->
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-xs font-medium text-slate-300 mb-1.5">Email Aktif</label>
+              <input
+                id="reg-email"
+                type="email"
+                placeholder="trader@quant.com"
+                required
+                class="w-full rounded-xl border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-white placeholder-slate-600 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+            </div>
+            <div>
+              <label class="block text-xs font-medium text-slate-300 mb-1.5">Username Bot</label>
+              <input
+                id="reg-username"
+                type="text"
+                placeholder="alexquant"
+                required
+                class="w-full rounded-xl border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-white placeholder-slate-600 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+            </div>
+            <div class="sm:col-span-2">
+              <label class="block text-xs font-medium text-slate-300 mb-1.5">Telegram (@username)</label>
+              <input
+                id="reg-telegram"
+                type="text"
+                placeholder="@alexquant"
+                required
+                class="w-full rounded-xl border border-slate-800 bg-slate-950 px-3.5 py-2.5 text-sm text-white placeholder-slate-600 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+              />
+            </div>
+          </div>
+
+          <!-- Duration Package Selection Cards -->
+          <div>
+            <label class="block text-xs font-medium text-slate-300 mb-2">Pilih Durasi Lisensi</label>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <!-- Plan 7D -->
+              <label class="relative cursor-pointer">
+                <input type="radio" name="plan-duration" value="7d" checked class="peer sr-only" onchange="updateSelectedPlan()" />
+                <div class="rounded-xl border border-slate-800 bg-slate-950 p-4 transition-all peer-checked:border-indigo-500 peer-checked:bg-indigo-950/20 peer-checked:ring-1 peer-checked:ring-indigo-500">
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="rounded bg-slate-800 px-2 py-0.5 text-[10px] font-mono text-indigo-300 font-semibold">TRIAL STARTER</span>
+                    <span class="font-mono text-xs text-indigo-400 font-bold">EQ-7D-...</span>
+                  </div>
+                  <h4 class="text-base font-bold text-white">7 Hari / 1 Minggu</h4>
+                  <div class="mt-2 text-lg font-black text-indigo-400">
+                    Rp 150.000 <span class="text-xs font-normal text-slate-400">/ 10 USDT</span>
+                  </div>
+                  <ul class="mt-3 space-y-1 text-[11px] text-slate-400">
+                    <li>✓ Full algorithmic signal execution</li>
+                    <li>✓ 24/7 high-speed cloud runtime</li>
+                  </ul>
+                </div>
+              </label>
+
+              <!-- Plan 30D -->
+              <label class="relative cursor-pointer">
+                <input type="radio" name="plan-duration" value="30d" class="peer sr-only" onchange="updateSelectedPlan()" />
+                <div class="rounded-xl border border-slate-800 bg-slate-950 p-4 transition-all peer-checked:border-indigo-500 peer-checked:bg-indigo-950/20 peer-checked:ring-1 peer-checked:ring-indigo-500">
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="rounded bg-emerald-950 border border-emerald-800 px-2 py-0.5 text-[10px] font-mono text-emerald-300 font-semibold">POPULAR (HEMAT 20%)</span>
+                    <span class="font-mono text-xs text-emerald-400 font-bold">EQ-30D-...</span>
+                  </div>
+                  <h4 class="text-base font-bold text-white">30 Hari / 1 Bulan</h4>
+                  <div class="mt-2 text-lg font-black text-emerald-400">
+                    Rp 500.000 <span class="text-xs font-normal text-slate-400">/ 35 USDT</span>
+                  </div>
+                  <ul class="mt-3 space-y-1 text-[11px] text-slate-400">
+                    <li>✓ Semua fitur Starter + Multi-pairs</li>
+                    <li>✓ VIP Priority execution & support</li>
+                  </ul>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            id="btn-step1-next"
+            class="w-full py-3.5 px-4 rounded-xl font-semibold text-sm text-white bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 shadow-lg shadow-indigo-600/30 transition-all flex items-center justify-center gap-2"
+          >
+            <span>Lanjut ke Pembayaran</span>
+            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+            </svg>
+          </button>
+        </form>
+      </div>
+
+      <!-- STEP 2: Payment Screen (Checkout Screen) -->
+      <div id="register-step-2" class="hidden rounded-2xl border border-slate-800 bg-slate-900/95 p-6 sm:p-8 shadow-2xl backdrop-blur-xl">
+        <!-- Invoice Details Bar -->
+        <div class="flex flex-wrap items-center justify-between gap-3 pb-4 mb-6 border-b border-slate-800">
+          <div>
+            <span class="text-[10px] font-mono text-slate-500 uppercase tracking-wider block">INVOICE NUMBER</span>
+            <div class="flex items-center gap-2">
+              <span id="inv-id" class="font-mono text-sm font-bold text-indigo-400">INV-XXXXXXXX</span>
+              <button onclick="copyInvoiceId()" class="text-slate-400 hover:text-white" title="Copy Invoice ID">
+                <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <!-- Countdown Timer -->
+          <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-amber-900/40 bg-amber-950/30 text-amber-300 font-mono text-xs">
+            <svg class="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span>Batas Bayar: <strong id="countdown-timer">14:59</strong></span>
+          </div>
+        </div>
+
+        <!-- Payment Method Tabs -->
+        <div class="flex rounded-xl border border-slate-800 bg-slate-950 p-1 mb-6">
+          <button id="paytab-qris" onclick="switchPaymentMethod('QRIS')" class="flex-1 py-2 rounded-lg text-xs font-semibold bg-indigo-600 text-white shadow-sm flex items-center justify-center gap-2 transition-all">
+            <span>🇮🇩 QRIS (IDR)</span>
+            <span class="text-[10px] rounded px-1 bg-indigo-800/80">3-Digit Unik</span>
+          </button>
+          <button id="paytab-usdt" onclick="switchPaymentMethod('USDT')" class="flex-1 py-2 rounded-lg text-xs font-semibold text-slate-400 hover:text-white flex items-center justify-center gap-2 transition-all">
+            <span>🌐 USDT (Crypto)</span>
+            <span class="text-[10px] rounded px-1 bg-slate-800">TRC-20</span>
+          </button>
+        </div>
+
+        <!-- QRIS Payment View -->
+        <div id="method-qris-view" class="space-y-6">
+          <div class="text-center">
+            <span class="text-xs text-slate-400">Total Pembayaran (Termasuk 3 Digit Kode Unik):</span>
+            <div class="mt-1 text-3xl font-black text-white font-mono flex items-center justify-center gap-2">
+              <span id="qris-total-amount">Rp 150.482</span>
+              <button onclick="copyQrisAmount()" class="text-xs px-2 py-1 rounded bg-slate-800 text-indigo-400 hover:text-white border border-slate-700">Salin</button>
+            </div>
+            <p class="text-[11px] text-amber-400/90 mt-1">⚠️ Wajib transfer tepat hingga 3 digit terakhir agar pembayaran terverifikasi otomatis.</p>
+          </div>
+
+          <!-- Dynamic QR Code Card -->
+          <div class="flex flex-col items-center">
+            <div class="p-4 bg-white rounded-2xl shadow-xl shadow-black/50 border-4 border-slate-700 flex flex-col items-center">
+              <div class="flex items-center gap-1.5 mb-2">
+                <span class="text-[10px] font-bold text-slate-900 tracking-wider">QRIS STANDAR NASIONAL</span>
+              </div>
+              <div id="qris-qrcode-container" class="w-48 h-48 flex items-center justify-center bg-white"></div>
+              <span class="text-[9px] font-mono text-slate-600 mt-2">NMID: ID102002100000103</span>
+            </div>
+            <div class="flex gap-2 mt-3">
+              <button onclick="downloadQrCode()" class="text-xs px-3 py-1.5 rounded-lg border border-slate-800 bg-slate-900 hover:bg-slate-800 text-slate-300 font-medium">Download QR</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- USDT Payment View -->
+        <div id="method-usdt-view" class="hidden space-y-6">
+          <div class="text-center">
+            <span class="text-xs text-slate-400">Total Nominal Transfer:</span>
+            <div class="mt-1 text-3xl font-black text-emerald-400 font-mono">
+              <span id="usdt-total-amount">10.00</span> USDT
+            </div>
+            <span class="inline-block mt-1 px-2.5 py-0.5 rounded-full text-[11px] font-mono bg-emerald-950/80 border border-emerald-800 text-emerald-300">Network: TRC-20 (Tron)</span>
+          </div>
+
+          <!-- USDT Wallet Box & QR -->
+          <div class="flex flex-col items-center">
+            <div class="p-3 bg-white rounded-xl mb-4">
+              <div id="usdt-qrcode-container" class="w-44 h-44 flex items-center justify-center bg-white"></div>
+            </div>
+            <div class="w-full">
+              <label class="block text-[11px] font-mono text-slate-400 mb-1">USDT Deposit Address (TRC-20):</label>
+              <div class="flex items-center gap-2 p-2.5 rounded-xl border border-slate-800 bg-slate-950 font-mono text-xs text-slate-200">
+                <span id="usdt-address-text" class="truncate flex-1">TExnessQuantTRC20OfficialWallet789</span>
+                <button onclick="copyUsdtAddress()" class="px-2.5 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-sans font-medium shrink-0">Salin</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Reserved License Key Notice -->
+        <div class="mt-6 p-3.5 rounded-xl border border-slate-800 bg-slate-950/70 text-xs text-slate-400 flex items-center justify-between">
+          <span>Kunci Lisensi yang Dipesan:</span>
+          <span id="reserved-key-badge" class="font-mono font-bold text-indigo-400">EQ-7D-XXXX-XXXX</span>
+        </div>
+
+        <!-- Confirmation Alert Box -->
+        <div id="confirm-status-box" class="hidden mt-4 p-4 rounded-xl border border-emerald-800/60 bg-emerald-950/30 text-xs text-emerald-300">
+          <div class="flex items-start gap-2.5">
+            <svg class="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <div>
+              <p class="font-bold text-emerald-200">Pembayaran Dikonfirmasi!</p>
+              <p class="mt-0.5 text-emerald-400/90 leading-relaxed">
+                Status pesanan Anda telah dicatat sebagai <strong>PENDING</strong> verifikasi Admin. Begitu Admin menyetujui, lisensi Anda akan aktif secara instan.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Payment Actions -->
+        <div class="mt-6 space-y-3">
+          <button
+            type="button"
+            id="btn-confirm-payment"
+            onclick="handleConfirmPayment()"
+            class="w-full py-3.5 px-4 rounded-xl font-bold text-sm text-white bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 shadow-lg shadow-emerald-600/30 transition-all flex items-center justify-center gap-2"
+          >
+            <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
+            </svg>
+            <span>Saya Sudah Bayar (Konfirmasi)</span>
+          </button>
+
+          <div class="flex gap-2">
+            <button
+              type="button"
+              onclick="checkInvoiceStatusManual()"
+              class="flex-1 py-2.5 px-3 rounded-xl border border-slate-800 bg-slate-900 hover:bg-slate-800 text-xs font-semibold text-slate-300 transition-colors flex items-center justify-center gap-1.5"
+            >
+              <svg class="w-3.5 h-3.5 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+              </svg>
+              <span>Cek Status Verifikasi</span>
+            </button>
+            <button
+              type="button"
+              onclick="returnToStep1()"
+              class="py-2.5 px-4 rounded-xl border border-slate-800 bg-slate-950 hover:bg-slate-900 text-xs font-semibold text-slate-400 hover:text-white transition-colors"
+            >
+              ← Ubah Pesanan
+            </button>
+          </div>
+        </div>
+
+      </div>
+
+    </section>
+
+  </main>
+
+  <!-- Global Toast Notification -->
+  <div id="toast" class="fixed bottom-6 right-6 z-50 transform translate-y-20 opacity-0 transition-all duration-300 rounded-xl border px-4 py-3 text-xs font-medium shadow-2xl flex items-center gap-2.5 pointer-events-none">
+    <span id="toast-icon"></span>
+    <span id="toast-message"></span>
+  </div>
+
+  <!-- Footer -->
+  <footer class="border-t border-slate-800/80 bg-slate-950/80 backdrop-blur-md py-6 text-center text-xs text-slate-500">
+    <div class="max-w-6xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-3">
+      <div class="flex items-center gap-2">
+        <span class="h-2 w-2 rounded-full bg-emerald-500"></span>
+        <span>Exness Quantitative Algorithmic License Gateway v2.4</span>
+      </div>
+      <div class="flex items-center gap-4 text-slate-400">
+        <a href="/admin" class="hover:text-indigo-400 transition-colors">Admin Login</a>
+        <span>•</span>
+        <a href="/api" target="_blank" class="hover:text-indigo-400 transition-colors">API Docs</a>
+        <span>•</span>
+        <span>256-Bit Hardware Encryption</span>
+      </div>
+    </div>
+  </footer>
+
+  <!-- ===================================================================== -->
+  <!-- APPLICATION LOGIC SCRIPT -->
+  <!-- ===================================================================== -->
+  <script>
+    // State Store
+    const STORAGE_KEY = 'exness_quant_license';
+    let currentInvoice = null;
+    let countdownInterval = null;
+    let countdownSeconds = 15 * 60;
+    let activePaymentMethod = 'QRIS';
+
+    // On Load
+    document.addEventListener('DOMContentLoaded', () => {
+      checkCachedSession();
+    });
+
+    // -------------------------------------------------------------
+    // Tab Management
+    // -------------------------------------------------------------
+    function switchMainTab(tabName) {
+      const loginSection = document.getElementById('tab-login-section');
+      const registerSection = document.getElementById('tab-register-section');
+      const loginBtn = document.getElementById('tab-login-btn');
+      const regBtn = document.getElementById('tab-register-btn');
+
+      if (tabName === 'login') {
+        loginSection.classList.remove('hidden');
+        registerSection.classList.add('hidden');
+        loginBtn.className = 'flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs sm:text-sm font-semibold transition-all bg-indigo-600 text-white shadow-md shadow-indigo-600/30';
+        regBtn.className = 'flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs sm:text-sm font-semibold transition-all text-slate-400 hover:text-slate-200 hover:bg-slate-800';
+      } else {
+        loginSection.classList.add('hidden');
+        registerSection.classList.remove('hidden');
+        regBtn.className = 'flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs sm:text-sm font-semibold transition-all bg-indigo-600 text-white shadow-md shadow-indigo-600/30';
+        loginBtn.className = 'flex items-center gap-2 px-5 py-2.5 rounded-lg text-xs sm:text-sm font-semibold transition-all text-slate-400 hover:text-slate-200 hover:bg-slate-800';
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Tab 1: License Verification & Session
+    // -------------------------------------------------------------
+    function formatLicenseInput(input) {
+      let val = input.value.toUpperCase().replace(/[^A-Z0-9-]/g, '');
+      // Auto-hyphenate EQ7DXXXXXXXX -> EQ-7D-XXXX-XXXX
+      const raw = val.replace(/-/g, '');
+      if (raw.startsWith('EQ7D') && raw.length > 4 && !val.includes('-')) {
+        val = `EQ-7D-${raw.slice(4, 8)}${raw.length > 8 ? '-' + raw.slice(8, 12) : ''}`;
+      } else if (raw.startsWith('EQ30D') && raw.length > 5 && !val.includes('-')) {
+        val = `EQ-30D-${raw.slice(5, 9)}${raw.length > 9 ? '-' + raw.slice(9, 13) : ''}`;
+      } else if (raw.startsWith('EQ') && raw.length > 2 && !val.includes('-')) {
+        val = `EQ-${raw.slice(2, 6)}${raw.length > 6 ? '-' + raw.slice(6, 10) : ''}`;
+      }
+      input.value = val;
+    }
+
+    async function pasteClipboard() {
+      try {
+        const text = await navigator.clipboard.readText();
+        const cleaned = text.trim().toUpperCase().replace(/[^A-Z0-9-]/g, '');
+        if (cleaned) {
+          const input = document.getElementById('license-key-input');
+          input.value = cleaned;
+          formatLicenseInput(input);
+          showToast('Key berhasil disalin dari clipboard!', 'success');
+        }
+      } catch (e) {
+        showToast('Gunakan Ctrl+V / Command+V untuk menempelkan.', 'info');
+      }
+    }
+
+    async function handleVerifyLicense(e) {
+      if (e) e.preventDefault();
+      const input = document.getElementById('license-key-input');
+      const key = input.value.trim().toUpperCase();
+
+      if (!key) {
+        showLoginAlert('Mohon masukkan kunci lisensi Anda.', 'error');
+        return;
+      }
+
+      setVerifyLoading(true);
+      hideLoginAlert();
+
+      try {
+        const res = await fetch('/api/license/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ licenseKey: key })
+        });
+        const data = await res.json();
+
+        if (res.ok && data.valid && data.status === 'ACTIVE') {
+          // Success: save to localStorage
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+          showToast('Lisensi berhasil diverifikasi!', 'success');
+          renderUnlockedSession(data);
+        } else {
+          // Error / Pending / Expired
+          let msg = data.message || 'Verifikasi lisensi gagal.';
+          if (data.status === 'PENDING') {
+            msg = 'Lisensi ini berstatus PENDING (Menunggu konfirmasi pembayaran oleh Admin).';
+          } else if (data.status === 'EXPIRED') {
+            msg = 'Lisensi ini telah KADALUARSA. Silakan lakukan perpanjangan.';
+          } else if (data.status === 'REVOKED') {
+            msg = 'Lisensi ini telah DICABUT (Revoked) oleh Admin.';
+          }
+          showLoginAlert(msg, 'error');
+        }
+      } catch (err) {
+        showLoginAlert('Gagal terhubung ke server lisensi. Pastikan server aktif.', 'error');
+      } finally {
+        setVerifyLoading(false);
+      }
+    }
+
+    function setVerifyLoading(isLoading) {
+      const btn = document.getElementById('btn-verify-submit');
+      const text = document.getElementById('btn-verify-text');
+      const icon = document.getElementById('btn-verify-icon');
+      const spinner = document.getElementById('btn-verify-spinner');
+
+      btn.disabled = isLoading;
+      if (isLoading) {
+        text.innerText = 'Memverifikasi...';
+        icon.classList.add('hidden');
+        spinner.classList.remove('hidden');
+      } else {
+        text.innerText = 'Activate & Verify';
+        icon.classList.remove('hidden');
+        spinner.classList.add('hidden');
+      }
+    }
+
+    function showLoginAlert(message, type = 'error') {
+      const box = document.getElementById('login-alert');
+      box.classList.remove('hidden', 'bg-rose-950/60', 'border-rose-800', 'text-rose-300', 'bg-emerald-950/60', 'border-emerald-800', 'text-emerald-300');
+      if (type === 'error') {
+        box.classList.add('bg-rose-950/60', 'border', 'border-rose-800', 'text-rose-300');
+        box.innerHTML = `<svg class="w-4 h-4 shrink-0 text-rose-400 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg><div>${message}</div>`;
+      } else {
+        box.classList.add('bg-emerald-950/60', 'border', 'border-emerald-800', 'text-emerald-300');
+        box.innerHTML = `<svg class="w-4 h-4 shrink-0 text-emerald-400 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg><div>${message}</div>`;
+      }
+    }
+
+    function hideLoginAlert() {
+      document.getElementById('login-alert').classList.add('hidden');
+    }
+
+    function renderUnlockedSession(sessionData) {
+      document.getElementById('login-form-card').classList.add('hidden');
+      const unlockedCard = document.getElementById('unlocked-preview-card');
+      unlockedCard.classList.remove('hidden');
+
+      document.getElementById('session-username').innerText = `@${sessionData.username || 'Trader'}`;
+      document.getElementById('session-telegram').innerText = sessionData.telegram || '';
+      document.getElementById('session-key').innerText = sessionData.licenseKey;
+
+      const days = sessionData.remainingDays || 0;
+      document.getElementById('session-remaining-days').innerText = `${days} Hari`;
+      document.getElementById('session-duration-badge').innerText = `Plan ${sessionData.duration || '7d'}`.toUpperCase();
+    }
+
+    function checkCachedSession() {
+      try {
+        const cached = localStorage.getItem(STORAGE_KEY);
+        if (cached) {
+          const parsed = JSON.parse(cached);
+          if (parsed && parsed.valid && parsed.expiresAt) {
+            const isAlive = new Date(parsed.expiresAt).getTime() > Date.now();
+            if (isAlive) {
+              renderUnlockedSession(parsed);
+              return;
+            }
+          }
+          localStorage.removeItem(STORAGE_KEY);
+        }
+      } catch (e) {}
+    }
+
+    function handleLogout() {
+      localStorage.removeItem(STORAGE_KEY);
+      document.getElementById('unlocked-preview-card').classList.add('hidden');
+      document.getElementById('login-form-card').classList.remove('hidden');
+      document.getElementById('license-key-input').value = '';
+      hideLoginAlert();
+      showToast('Anda telah logout dari sesi lisensi.', 'info');
+    }
+
+    function copyActiveLicenseKey() {
+      const key = document.getElementById('session-key').innerText.trim();
+      navigator.clipboard.writeText(key).then(() => {
+        showToast('Kunci lisensi berhasil disalin ke clipboard!', 'success');
+      });
+    }
+
+    function launchQuantTerminal() {
+      showToast('🚀 Menginisialisasi Quantitative Algorithmic Terminal...', 'success');
+    }
+
+    // -------------------------------------------------------------
+    // Tab 2: Checkout & Multi-Step Wizard
+    // -------------------------------------------------------------
+    function updateSelectedPlan() {
+      // visual update handled by peer CSS
+    }
+
+    async function handleProceedToStep2(e) {
+      e.preventDefault();
+      const email = document.getElementById('reg-email').value.trim();
+      const username = document.getElementById('reg-username').value.trim();
+      let telegram = document.getElementById('reg-telegram').value.trim();
+      if (!telegram.startsWith('@')) telegram = `@${telegram}`;
+
+      const durationRadios = document.getElementsByName('plan-duration');
+      let duration = '7d';
+      for (const r of durationRadios) {
+        if (r.checked) duration = r.value;
+      }
+
+      const nextBtn = document.getElementById('btn-step1-next');
+      nextBtn.disabled = true;
+      nextBtn.innerText = 'Memproses Pesanan...';
+
+      try {
+        const res = await fetch('/api/license/checkout', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email,
+            username,
+            telegram,
+            duration,
+            paymentMethod: activePaymentMethod
+          })
+        });
+
+        const data = await res.json();
+        if (res.ok && data.success && data.invoice) {
+          currentInvoice = data.invoice;
+          setupStep2Payment(data.invoice);
+          showToast('Invoice berhasil dibuat!', 'success');
+        } else {
+          showToast(data.error || 'Gagal memproses pesanan.', 'error');
+        }
+      } catch (err) {
+        showToast('Gagal menghubungi server.', 'error');
+      } finally {
+        nextBtn.disabled = false;
+        nextBtn.innerText = 'Lanjut ke Pembayaran →';
+      }
+    }
+
+    function setupStep2Payment(invoice) {
+      document.getElementById('register-step-1').classList.add('hidden');
+      document.getElementById('register-step-2').classList.remove('hidden');
+
+      // Update Step Badges
+      document.getElementById('step-badge-1').className = 'flex items-center gap-2 px-3 py-1.5 rounded-full border border-slate-800 bg-slate-900 text-slate-400 text-xs font-semibold';
+      document.getElementById('step-badge-2').className = 'flex items-center gap-2 px-3 py-1.5 rounded-full border border-indigo-500 bg-indigo-600/20 text-indigo-300 text-xs font-semibold';
+      document.getElementById('step-connector').className = 'w-8 h-0.5 bg-indigo-500';
+
+      // Set Invoice Data
+      document.getElementById('inv-id').innerText = invoice.invoiceId;
+      document.getElementById('reserved-key-badge').innerText = invoice.licenseKey;
+
+      // Amounts
+      const formattedIdr = new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 0 }).format(invoice.totalAmount);
+      document.getElementById('qris-total-amount').innerText = formattedIdr;
+      document.getElementById('usdt-total-amount').innerText = invoice.amountUsdt.toFixed(2);
+      document.getElementById('usdt-address-text').innerText = invoice.usdtAddress;
+
+      // Generate QR codes
+      renderQrCodes(invoice);
+
+      // Start countdown timer
+      startCountdownTimer();
+    }
+
+    function renderQrCodes(invoice) {
+      // 1. QRIS QR Code
+      const qrisContainer = document.getElementById('qris-qrcode-container');
+      qrisContainer.innerHTML = '';
+      const qrisData = invoice.qrisPayload || `https://qris.id/pay/${invoice.invoiceId}`;
+
+      try {
+        new QRCode(qrisContainer, {
+          text: qrisData,
+          width: 180,
+          height: 180,
+          colorDark: '#0f172a',
+          colorLight: '#ffffff',
+          correctLevel: QRCode.CorrectLevel.M
+        });
+      } catch (e) {
+        // Fallback to QR server API
+        qrisContainer.innerHTML = `<img src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(qrisData)}" alt="QRIS QR Code" class="w-44 h-44 rounded" />`;
+      }
+
+      // 2. USDT QR Code
+      const usdtContainer = document.getElementById('usdt-qrcode-container');
+      usdtContainer.innerHTML = '';
+      const usdtData = invoice.usdtAddress;
+      try {
+        new QRCode(usdtContainer, {
+          text: usdtData,
+          width: 160,
+          height: 160,
+          colorDark: '#0f172a',
+          colorLight: '#ffffff',
+          correctLevel: QRCode.CorrectLevel.M
+        });
+      } catch (e) {
+        usdtContainer.innerHTML = `<img src="https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(usdtData)}" alt="USDT Wallet QR Code" class="w-40 h-40 rounded" />`;
+      }
+    }
+
+    function switchPaymentMethod(method) {
+      activePaymentMethod = method;
+      const qrisTab = document.getElementById('paytab-qris');
+      const usdtTab = document.getElementById('paytab-usdt');
+      const qrisView = document.getElementById('method-qris-view');
+      const usdtView = document.getElementById('method-usdt-view');
+
+      if (method === 'QRIS') {
+        qrisTab.className = 'flex-1 py-2 rounded-lg text-xs font-semibold bg-indigo-600 text-white shadow-sm flex items-center justify-center gap-2 transition-all';
+        usdtTab.className = 'flex-1 py-2 rounded-lg text-xs font-semibold text-slate-400 hover:text-white flex items-center justify-center gap-2 transition-all';
+        qrisView.classList.remove('hidden');
+        usdtView.classList.add('hidden');
+      } else {
+        usdtTab.className = 'flex-1 py-2 rounded-lg text-xs font-semibold bg-emerald-600 text-white shadow-sm flex items-center justify-center gap-2 transition-all';
+        qrisTab.className = 'flex-1 py-2 rounded-lg text-xs font-semibold text-slate-400 hover:text-white flex items-center justify-center gap-2 transition-all';
+        usdtView.classList.remove('hidden');
+        qrisView.classList.add('hidden');
+      }
+    }
+
+    function startCountdownTimer() {
+      if (countdownInterval) clearInterval(countdownInterval);
+      countdownSeconds = 15 * 60;
+
+      const timerEl = document.getElementById('countdown-timer');
+      countdownInterval = setInterval(() => {
+        countdownSeconds--;
+        if (countdownSeconds <= 0) {
+          clearInterval(countdownInterval);
+          timerEl.innerText = '00:00 (EXPIRED)';
+          return;
+        }
+        const m = Math.floor(countdownSeconds / 60).toString().padStart(2, '0');
+        const s = (countdownSeconds % 60).toString().padStart(2, '0');
+        timerEl.innerText = `${m}:${s}`;
+      }, 1000);
+    }
+
+    async function handleConfirmPayment() {
+      if (!currentInvoice) return;
+      const btn = document.getElementById('btn-confirm-payment');
+      btn.disabled = true;
+
+      try {
+        const res = await fetch('/api/license/confirm-payment', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            invoiceId: currentInvoice.invoiceId,
+            licenseKey: currentInvoice.licenseKey
+          })
+        });
+
+        const data = await res.json();
+        if (res.ok && data.success) {
+          document.getElementById('confirm-status-box').classList.remove('hidden');
+          showToast('Konfirmasi pembayaran diterima! Menunggu admin.', 'success');
+          btn.innerHTML = '<span>✓ Pembayaran Terkonfirmasi (Menunggu Admin)</span>';
+          btn.classList.remove('bg-emerald-600', 'hover:bg-emerald-500');
+          btn.classList.add('bg-slate-800', 'text-slate-400', 'cursor-default');
+        } else {
+          showToast(data.error || 'Gagal mengirim konfirmasi.', 'error');
+          btn.disabled = false;
+        }
+      } catch (err) {
+        showToast('Gagal menghubungi server.', 'error');
+        btn.disabled = false;
+      }
+    }
+
+    async function checkInvoiceStatusManual() {
+      if (!currentInvoice) return;
+      try {
+        const res = await fetch(`/api/license/invoice/${currentInvoice.invoiceId}`);
+        const data = await res.json();
+
+        if (res.ok && data.license && data.license.status === 'ACTIVE') {
+          showToast('🎉 Selamat! Lisensi Anda telah disetujui & aktif!', 'success');
+          // Switch to Tab 1 and populate license key
+          switchMainTab('login');
+          document.getElementById('license-key-input').value = data.license.licenseKey;
+          handleVerifyLicense();
+        } else {
+          showToast('Status saat ini masih PENDING. Harap tunggu persetujuan Admin.', 'info');
+        }
+      } catch (err) {
+        showToast('Gagal memeriksa status.', 'error');
+      }
+    }
+
+    function returnToStep1() {
+      if (countdownInterval) clearInterval(countdownInterval);
+      document.getElementById('register-step-2').classList.add('hidden');
+      document.getElementById('register-step-1').classList.remove('hidden');
+
+      document.getElementById('step-badge-1').className = 'flex items-center gap-2 px-3 py-1.5 rounded-full border border-indigo-500 bg-indigo-600/20 text-indigo-300 text-xs font-semibold';
+      document.getElementById('step-badge-2').className = 'flex items-center gap-2 px-3 py-1.5 rounded-full border border-slate-800 bg-slate-900 text-slate-500 text-xs font-semibold';
+      document.getElementById('step-connector').className = 'w-8 h-0.5 bg-slate-800';
+    }
+
+    // Copy Helpers
+    function copyInvoiceId() {
+      if (currentInvoice) {
+        navigator.clipboard.writeText(currentInvoice.invoiceId);
+        showToast('Invoice ID berhasil disalin!', 'success');
+      }
+    }
+
+    function copyQrisAmount() {
+      if (currentInvoice) {
+        navigator.clipboard.writeText(String(currentInvoice.totalAmount));
+        showToast(`Nominal Rp ${currentInvoice.totalAmount} berhasil disalin!`, 'success');
+      }
+    }
+
+    function copyUsdtAddress() {
+      if (currentInvoice) {
+        navigator.clipboard.writeText(currentInvoice.usdtAddress);
+        showToast('Alamat USDT berhasil disalin!', 'success');
+      }
+    }
+
+    function downloadQrCode() {
+      const img = document.querySelector('#qris-qrcode-container img');
+      if (img && img.src) {
+        const a = document.createElement('a');
+        a.href = img.src;
+        a.download = `QRIS-${currentInvoice ? currentInvoice.invoiceId : 'EXNESS'}.png`;
+        a.click();
+      } else {
+        const canvas = document.querySelector('#qris-qrcode-container canvas');
+        if (canvas) {
+          const a = document.createElement('a');
+          a.href = canvas.toDataURL('image/png');
+          a.download = `QRIS-${currentInvoice ? currentInvoice.invoiceId : 'EXNESS'}.png`;
+          a.click();
+        }
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Toast Notification System
+    // -------------------------------------------------------------
+    let toastTimeout;
+    function showToast(message, type = 'info') {
+      const toast = document.getElementById('toast');
+      const icon = document.getElementById('toast-icon');
+      const msg = document.getElementById('toast-message');
+
+      msg.innerText = message;
+      toast.className = 'fixed bottom-6 right-6 z-50 transform transition-all duration-300 rounded-xl border px-4 py-3 text-xs font-medium shadow-2xl flex items-center gap-2.5 backdrop-blur-md';
+
+      if (type === 'success') {
+        toast.classList.add('bg-emerald-950/90', 'border-emerald-800', 'text-emerald-300');
+        icon.innerHTML = '<svg class="w-4 h-4 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>';
+      } else if (type === 'error') {
+        toast.classList.add('bg-rose-950/90', 'border-rose-800', 'text-rose-300');
+        icon.innerHTML = '<svg class="w-4 h-4 text-rose-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>';
+      } else {
+        toast.classList.add('bg-slate-900/90', 'border-slate-800', 'text-slate-200');
+        icon.innerHTML = '<svg class="w-4 h-4 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>';
+      }
+
+      toast.classList.remove('translate-y-20', 'opacity-0');
+      clearTimeout(toastTimeout);
+      toastTimeout = setTimeout(() => {
+        toast.classList.add('translate-y-20', 'opacity-0');
+      }, 3500);
+    }
+  </script>
+</body>
+</html>
