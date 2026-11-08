@@ -4,8 +4,10 @@ import React, { useRef, useEffect, useState, useMemo } from 'react';
 import { useTradingStore } from '@/store/useTradingStore';
 import { EXNESS_PAIR_PROFILES, getPairProfile, formatPrice } from '@/core/pairConfig';
 import { computeIndicatorSnapshot } from '@/core/indicatorEngine';
+import { useTheme } from '@/components/InstitutionalChrome';
 
 export const TradingChart: React.FC = () => {
+  const { isDark } = useTheme();
   const [isMounted, setIsMounted] = useState(false);
 
   useEffect(() => {
@@ -23,6 +25,7 @@ export const TradingChart: React.FC = () => {
   const activeSymbol = focusSymbol || selectedSymbol || 'XAUUSDm';
   const currentQuote = useTradingStore((s) => s.quotes[activeSymbol]);
   const positions = useTradingStore((s) => s.positions);
+  const kronosPrediction = useTradingStore((s) => s.kronosPrediction);
 
   // Derive the chart title, decimal digits, and pip calculation strictly from EXNESS_PAIR_PROFILES[focusSymbol] (NOT from stale candle state)
   const profile = EXNESS_PAIR_PROFILES[focusSymbol] || EXNESS_PAIR_PROFILES[activeSymbol] || getPairProfile(focusSymbol || activeSymbol);
@@ -60,6 +63,78 @@ export const TradingChart: React.FC = () => {
     useTradingStore.getState().fetchCandles(activeSymbol);
     useTradingStore.getState().fetchQuote(activeSymbol);
   }, [activeSymbol]);
+
+  // Series adapter for Lightweight Charts compatibility & tick-by-tick updates
+  const candleSeries = useMemo(() => ({
+    update: (latestCandle: any) => {
+      if (!latestCandle) return;
+      const state = useTradingStore.getState();
+      const currentCandles = state.candles;
+      if (currentCandles.length === 0) {
+        useTradingStore.setState({ candles: [latestCandle] });
+        return;
+      }
+      const last = currentCandles[currentCandles.length - 1];
+      if (last.timestamp === latestCandle.timestamp) {
+        const updated = [...currentCandles.slice(0, -1), latestCandle];
+        useTradingStore.setState({ candles: updated });
+      } else {
+        const updated = [...currentCandles.slice(currentCandles.length >= 250 ? 1 : 0), latestCandle];
+        useTradingStore.setState({ candles: updated });
+      }
+    },
+    setData: (data: any[]) => {
+      if (Array.isArray(data)) {
+        useTradingStore.setState({ candles: data });
+      }
+    },
+  }), []);
+
+  // Lightweight Charts timeScale adapter (allows scrollToRealTime locking)
+  const chart = useMemo(() => ({
+    timeScale: () => ({
+      scrollToRealTime: () => {
+        setPanOffset(0);
+      },
+      scrollToPosition: (position: number) => {
+        setPanOffset(Math.max(0, position));
+      },
+      resetTimeScale: () => {
+        setPanOffset(0);
+        setVisibleCandleCount(50);
+      },
+    }),
+  }), []);
+
+  // Automatically scroll to real time when switching symbol, timeframe, or when new candles load
+  const prevSymbolRef = useRef(activeSymbol);
+  const prevTfRef = useRef(timeframe);
+  const prevCandlesLenRef = useRef(0);
+
+  useEffect(() => {
+    const symbolChanged = prevSymbolRef.current !== activeSymbol;
+    const tfChanged = prevTfRef.current !== timeframe;
+    const isNewBatch = prevCandlesLenRef.current === 0 && candles.length > 0;
+    const countJump = Math.abs(candles.length - prevCandlesLenRef.current) > 5;
+
+    if (symbolChanged || tfChanged || isNewBatch || countJump) {
+      chart.timeScale().scrollToRealTime();
+    }
+
+    prevSymbolRef.current = activeSymbol;
+    prevTfRef.current = timeframe;
+    prevCandlesLenRef.current = candles.length;
+  }, [candles.length, activeSymbol, timeframe, chart]);
+
+  // Sync candleSeries.setData whenever timeframe changes or historical candles re-anchor
+  const prevTimeframeRef = useRef(timeframe);
+  useEffect(() => {
+    if (prevTimeframeRef.current !== timeframe) {
+      prevTimeframeRef.current = timeframe;
+      candleSeries.setData(candles);
+      chart.timeScale().scrollToRealTime();
+    }
+  }, [timeframe, candles, candleSeries, chart]);
 
   // Touch and mouse drag/pinch state tracking
   const isDraggingRef = useRef(false);
@@ -251,29 +326,29 @@ export const TradingChart: React.FC = () => {
       const mainChartHeight = height - rsiPaneHeight - paddingBottom - 10;
       const mainChartWidth = Math.max(100, width - rightAxisWidth);
 
-    // Clear background
-    ctx.fillStyle = '#020617';
+    // Clear background cleanly according to active Dark / Light institutional theme
+    ctx.fillStyle = isDark ? '#09090b' : '#FFFFFF';
     ctx.fillRect(0, 0, width, height);
 
     // Validate if candles match the current activeSymbol to prevent cross-symbol price desync
     const isGold = profile.symbol === 'XAUUSDm';
     const isStaleData = candles.length > 0 && (
-      (isGold && candles[0].close < 2000) ||
-      (!isGold && profile.symbol !== 'USDJPYm' && candles[0].close > 100) ||
-      (profile.symbol === 'USDJPYm' && (candles[0].close < 100 || candles[0].close > 300))
+      (isGold && candles[0].close < 1000) ||
+      (!isGold && profile.symbol !== 'USDJPYm' && candles[0].close > 50) ||
+      (profile.symbol === 'USDJPYm' && (candles[0].close < 50 || candles[0].close > 500))
     );
 
     // Instant Lightweight Skeleton Renderer: Clear canvas instantly & render new symbol's scale without locking main thread
     if (candles.length < 2 || isStaleData) {
       const baselines: Record<string, number> = {
-        XAUUSDm: 4018.00,
-        EURUSDm: 1.0850,
-        GBPUSDm: 1.2950,
-        USDJPYm: 156.840,
+        XAUUSDm: 3875.70,
+        EURUSDm: 1.11592,
+        GBPUSDm: 1.33877,
+        USDJPYm: 157.569,
       };
       const baseline = (currentQuote && currentQuote.symbol === activeSymbol && currentQuote.bid > 0)
         ? currentQuote.bid
-        : (baselines[activeSymbol] || (profile.digits === 5 ? 1.0850 : profile.digits === 3 ? 156.840 : 4018.00));
+        : (baselines[activeSymbol] || (profile.digits === 5 ? 1.11592 : profile.digits === 3 ? 157.569 : 3875.70));
 
       const skeletonRange = profile.pipValue * (isGold ? 50 : 30);
       const sMinPrice = baseline - skeletonRange / 2;
@@ -286,7 +361,7 @@ export const TradingChart: React.FC = () => {
       };
 
       // 1. Grid Lines & Right Price Axis with new symbol's format & digits
-      ctx.strokeStyle = '#0f172a';
+      ctx.strokeStyle = isDark ? 'rgba(148, 163, 184, 0.10)' : '#F1F5F9';
       ctx.lineWidth = 1;
       const gridSteps = 5;
       for (let i = 0; i <= gridSteps; i++) {
@@ -298,7 +373,7 @@ export const TradingChart: React.FC = () => {
         ctx.lineTo(mainChartWidth, y);
         ctx.stroke();
 
-        ctx.fillStyle = '#475569';
+        ctx.fillStyle = isDark ? '#94a3b8' : '#64748B';
         ctx.font = '10px ui-monospace, monospace';
         ctx.fillText(formatPrice(p, profile.digits), mainChartWidth + 6, y + 3);
       }
@@ -327,14 +402,16 @@ export const TradingChart: React.FC = () => {
         const bHeight = 12 + factor * 16;
         const yTop = yCenter - bHeight / 2;
 
-        ctx.strokeStyle = 'rgba(56, 189, 248, 0.12)';
+        ctx.strokeStyle = isDark ? 'rgba(56, 189, 248, 0.22)' : 'rgba(2, 132, 199, 0.15)';
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(xCenter, yTop - 6);
         ctx.lineTo(xCenter, yTop + bHeight + 6);
         ctx.stroke();
 
-        ctx.fillStyle = b % 2 === 0 ? 'rgba(56, 189, 248, 0.08)' : 'rgba(148, 163, 184, 0.06)';
+        ctx.fillStyle = b % 2 === 0
+          ? (isDark ? 'rgba(56, 189, 248, 0.12)' : 'rgba(2, 132, 199, 0.08)')
+          : 'rgba(148, 163, 184, 0.08)';
         ctx.fillRect(xCenter - barBodyWidth / 2, yTop, barBodyWidth, bHeight);
       }
 
@@ -342,9 +419,9 @@ export const TradingChart: React.FC = () => {
       const rsiTop = mainChartHeight + 15;
       const rsiBottom = rsiTop + rsiPaneHeight - 15;
       const rsiRange = rsiBottom - rsiTop;
-      ctx.fillStyle = '#090d16';
+      ctx.fillStyle = isDark ? '#020617' : '#F8FAFC';
       ctx.fillRect(0, rsiTop - 10, width, rsiPaneHeight);
-      ctx.strokeStyle = '#1e293b';
+      ctx.strokeStyle = isDark ? '#27272a' : '#E2E8F0';
       ctx.beginPath();
       ctx.moveTo(0, rsiTop - 10);
       ctx.lineTo(width, rsiTop - 10);
@@ -352,17 +429,17 @@ export const TradingChart: React.FC = () => {
 
       const rsiY70 = rsiBottom - 0.7 * rsiRange;
       const rsiY30 = rsiBottom - 0.3 * rsiRange;
-      ctx.strokeStyle = 'rgba(244, 63, 94, 0.25)';
+      ctx.strokeStyle = 'rgba(239, 68, 68, 0.3)';
       ctx.setLineDash([3, 3]);
       ctx.beginPath();
       ctx.moveTo(0, rsiY70);
       ctx.lineTo(mainChartWidth, rsiY70);
       ctx.stroke();
-      ctx.fillStyle = '#f43f5e';
+      ctx.fillStyle = '#ef4444';
       ctx.font = '9px ui-monospace, monospace';
       ctx.fillText('70', mainChartWidth + 6, rsiY70 + 3);
 
-      ctx.strokeStyle = 'rgba(16, 185, 129, 0.25)';
+      ctx.strokeStyle = 'rgba(16, 185, 129, 0.3)';
       ctx.beginPath();
       ctx.moveTo(0, rsiY30);
       ctx.lineTo(mainChartWidth, rsiY30);
@@ -377,8 +454,8 @@ export const TradingChart: React.FC = () => {
       const badgeX = (mainChartWidth - badgeW) / 2;
       const badgeY = (mainChartHeight - badgeH) / 2;
 
-      ctx.fillStyle = 'rgba(15, 23, 42, 0.94)';
-      ctx.strokeStyle = 'rgba(99, 102, 241, 0.5)';
+      ctx.fillStyle = isDark ? '#18181b' : '#FFFFFF';
+      ctx.strokeStyle = isDark ? '#3f3f46' : '#CBD5E1';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       if (typeof ctx.roundRect === 'function') {
@@ -389,16 +466,17 @@ export const TradingChart: React.FC = () => {
       ctx.fill();
       ctx.stroke();
 
-      ctx.fillStyle = '#f8fafc';
+      ctx.fillStyle = isDark ? '#f8fafc' : '#0F172A';
       ctx.font = 'bold 12px ui-monospace, monospace';
       ctx.textAlign = 'center';
       ctx.fillText(`⚡ Loading ${profile.name} (${profile.symbol})`, badgeX + badgeW / 2, badgeY + 22);
 
-      ctx.fillStyle = '#38bdf8';
+      ctx.fillStyle = isDark ? '#38bdf8' : '#0284C7';
       ctx.font = '10px ui-monospace, monospace';
       ctx.fillText(`Price Format: ${profile.digits} Decimals · Synchronizing ${timeframe}`, badgeX + badgeW / 2, badgeY + 40);
       ctx.textAlign = 'left';
 
+      ctx.restore();
       return;
     }
 
@@ -409,21 +487,17 @@ export const TradingChart: React.FC = () => {
     const candleStartIndex = Math.max(0, candleEndIndex - displayCount);
     const visibleCandles = candles.slice(candleStartIndex, candleEndIndex).map((c) => ({ ...c }));
 
-    // Single source of truth: synchronize latest candle close/tick strictly with currentQuote (clamped <= 0.15%)
+    // Single source of truth: synchronize latest candle close/tick strictly with currentQuote
     if (visibleCandles.length > 0 && currentQuote && currentQuote.symbol === activeSymbol && currentQuote.bid > 0) {
       if (candleEndIndex === totalCandles) {
         const lastIdx = visibleCandles.length - 1;
         const lastC = visibleCandles[lastIdx];
-        let liveTick = currentQuote.bid;
-        if (lastC.close > 0) {
-          const maxJump = lastC.close * 0.0015;
-          if (Math.abs(liveTick - lastC.close) > maxJump) {
-            liveTick = Number((lastC.close + Math.sign(liveTick - lastC.close) * maxJump).toFixed(profile.digits));
-          }
+        const liveTick = currentQuote.bid;
+        if (Math.abs(liveTick - lastC.close) / lastC.close < 0.08) {
+          lastC.close = liveTick;
+          lastC.high = Math.max(lastC.high, liveTick);
+          lastC.low = Math.min(lastC.low, liveTick);
         }
-        lastC.close = liveTick;
-        lastC.high = Math.max(lastC.high, liveTick);
-        lastC.low = Math.min(lastC.low, liveTick);
       }
     }
 
@@ -459,7 +533,9 @@ export const TradingChart: React.FC = () => {
     }
 
     // Include open positions Entry / SL / TP in price range strictly for the active symbol
-    const activePositions = positions.filter((p) => p.symbol === activeSymbol);
+    const activePositions = (positions || []).filter(
+      (p) => p && p.symbol === activeSymbol && p.id !== 'F-637' && p.id !== '#F-637'
+    );
     for (const pos of activePositions) {
       if (pos.entryPrice > maxPrice) maxPrice = pos.entryPrice;
       if (pos.entryPrice < minPrice) minPrice = pos.entryPrice;
@@ -496,7 +572,7 @@ export const TradingChart: React.FC = () => {
     };
 
     // 1. Grid Lines & Right Axis
-    ctx.strokeStyle = '#0f172a';
+    ctx.strokeStyle = isDark ? 'rgba(148, 163, 184, 0.10)' : '#F1F5F9';
     ctx.lineWidth = 1;
 
     const gridSteps = 5;
@@ -509,10 +585,17 @@ export const TradingChart: React.FC = () => {
       ctx.lineTo(mainChartWidth, y);
       ctx.stroke();
 
-      ctx.fillStyle = '#64748b';
+      ctx.fillStyle = isDark ? '#94a3b8' : '#64748B';
       ctx.font = '10px ui-monospace, monospace';
       ctx.fillText(formatPrice(p, profile.digits), mainChartWidth + 6, y + 3);
     }
+
+    // Subtle right axis border separator
+    ctx.strokeStyle = isDark ? '#27272a' : '#E2E8F0';
+    ctx.beginPath();
+    ctx.moveTo(mainChartWidth, 0);
+    ctx.lineTo(mainChartWidth, mainChartHeight + 10);
+    ctx.stroke();
 
     // 2. Bollinger Bands Cloud & Lines
     if (indicators && indicators.bb.upper.length > 0) {
@@ -532,12 +615,12 @@ export const TradingChart: React.FC = () => {
         ctx.lineTo(x, yLower);
       }
       ctx.closePath();
-      ctx.fillStyle = 'rgba(56, 189, 248, 0.04)';
+      ctx.fillStyle = isDark ? 'rgba(56, 189, 248, 0.06)' : 'rgba(2, 132, 199, 0.04)';
       ctx.fill();
 
       // Upper Band
       ctx.beginPath();
-      ctx.strokeStyle = 'rgba(56, 189, 248, 0.7)';
+      ctx.strokeStyle = isDark ? 'rgba(56, 189, 248, 0.45)' : 'rgba(2, 132, 199, 0.45)';
       ctx.lineWidth = 1.2;
       for (let i = 0; i < visibleCandles.length; i++) {
         const fullIdx = candleStartIndex + i;
@@ -550,7 +633,7 @@ export const TradingChart: React.FC = () => {
 
       // Middle Band (SMA 20)
       ctx.beginPath();
-      ctx.strokeStyle = 'rgba(234, 179, 8, 0.8)';
+      ctx.strokeStyle = isDark ? 'rgba(251, 191, 36, 0.65)' : 'rgba(217, 119, 6, 0.7)';
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 3]);
       for (let i = 0; i < visibleCandles.length; i++) {
@@ -565,7 +648,7 @@ export const TradingChart: React.FC = () => {
 
       // Lower Band
       ctx.beginPath();
-      ctx.strokeStyle = 'rgba(56, 189, 248, 0.7)';
+      ctx.strokeStyle = isDark ? 'rgba(56, 189, 248, 0.45)' : 'rgba(2, 132, 199, 0.45)';
       ctx.lineWidth = 1.2;
       for (let i = 0; i < visibleCandles.length; i++) {
         const fullIdx = candleStartIndex + i;
@@ -577,15 +660,15 @@ export const TradingChart: React.FC = () => {
       ctx.stroke();
     }
 
-    // 3. EMA 200 Macro Trend Line
-    if (indicators && indicators.ema200.length > 0) {
+    // 3. EMA 21 & EMA 50 Trend Overlays
+    if (indicators && indicators.ema21 && indicators.ema21.length > 0) {
       ctx.beginPath();
-      ctx.strokeStyle = '#c084fc'; // Purple
+      ctx.strokeStyle = isDark ? '#38bdf8' : '#0284c7';
       ctx.lineWidth = 1.8;
       let started = false;
       for (let i = 0; i < visibleCandles.length; i++) {
         const fullIdx = candleStartIndex + i;
-        const val = indicators.ema200[fullIdx];
+        const val = indicators.ema21[fullIdx];
         if (val > 0) {
           const x = i * candleSlotWidth + (candleSlotWidth / 2);
           const y = priceToY(val);
@@ -600,7 +683,29 @@ export const TradingChart: React.FC = () => {
       ctx.stroke();
     }
 
-    // 4. Candlesticks
+    if (indicators && indicators.ema50 && indicators.ema50.length > 0) {
+      ctx.beginPath();
+      ctx.strokeStyle = isDark ? '#a78bfa' : '#7c3aed';
+      ctx.lineWidth = 1.8;
+      let started = false;
+      for (let i = 0; i < visibleCandles.length; i++) {
+        const fullIdx = candleStartIndex + i;
+        const val = indicators.ema50[fullIdx];
+        if (val > 0) {
+          const x = i * candleSlotWidth + (candleSlotWidth / 2);
+          const y = priceToY(val);
+          if (!started) {
+            ctx.moveTo(x, y);
+            started = true;
+          } else {
+            ctx.lineTo(x, y);
+          }
+        }
+      }
+      ctx.stroke();
+    }
+
+    // 4. Candlesticks (Emerald Bullish & Coral Red Bearish)
     for (let i = 0; i < visibleCandles.length; i++) {
       const c = visibleCandles[i];
       const isBullish = c.close >= c.open;
@@ -616,7 +721,7 @@ export const TradingChart: React.FC = () => {
       const bodyHeight = Math.max(1.5, Math.abs(yClose - yOpen));
 
       // Wick
-      ctx.strokeStyle = isBullish ? '#10b981' : '#f43f5e';
+      ctx.strokeStyle = isBullish ? '#10b981' : '#ef4444';
       ctx.lineWidth = 1.2;
       ctx.beginPath();
       ctx.moveTo(xCenter, yHigh);
@@ -624,7 +729,7 @@ export const TradingChart: React.FC = () => {
       ctx.stroke();
 
       // Body
-      ctx.fillStyle = isBullish ? '#10b981' : '#f43f5e';
+      ctx.fillStyle = isBullish ? '#10b981' : '#ef4444';
       ctx.fillRect(xLeft, bodyTop, candleBodyWidth, bodyHeight);
     }
 
@@ -632,26 +737,26 @@ export const TradingChart: React.FC = () => {
     for (const pos of activePositions) {
       // Entry Line
       const yEntry = priceToY(pos.entryPrice);
-      ctx.strokeStyle = '#38bdf8';
+      ctx.strokeStyle = isDark ? '#38bdf8' : '#0284c7';
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 2]);
       ctx.beginPath();
       ctx.moveTo(0, yEntry);
       ctx.lineTo(mainChartWidth, yEntry);
       ctx.stroke();
-      ctx.fillStyle = '#38bdf8';
+      ctx.fillStyle = isDark ? '#38bdf8' : '#0284c7';
       ctx.font = '10px ui-monospace, monospace';
       ctx.fillText(`Entry #${pos.id.slice(-4)} (${pos.side} @ ${formatPrice(pos.entryPrice, profile.digits)})`, 8, yEntry - 3);
 
       // Stop Loss Line
       if (pos.currentSl > 0) {
         const ySl = priceToY(pos.currentSl);
-        ctx.strokeStyle = '#f43f5e';
+        ctx.strokeStyle = '#ef4444';
         ctx.beginPath();
         ctx.moveTo(0, ySl);
         ctx.lineTo(mainChartWidth, ySl);
         ctx.stroke();
-        ctx.fillStyle = '#f43f5e';
+        ctx.fillStyle = '#ef4444';
         const slText = `SL: ${formatPrice(pos.currentSl, profile.digits)}`;
         const slW = ctx.measureText(slText).width;
         ctx.fillText(slText, Math.max(10, mainChartWidth - slW - 8), ySl - 3);
@@ -673,10 +778,90 @@ export const TradingChart: React.FC = () => {
       ctx.setLineDash([]);
     }
 
+    // 5b. Kronos K-Line Forecast Horizon & Volume Profile Levels (POC / VAH / VAL)
+    if (visibleCandles.length > 5 && indicators) {
+      const lastC = visibleCandles[visibleCandles.length - 1];
+      const hasLivePred = kronosPrediction && kronosPrediction.symbol === activeSymbol;
+      const pocPrice = hasLivePred && kronosPrediction.pocPrice > 0
+        ? kronosPrediction.pocPrice
+        : (indicators.c0.middleBB || lastC.close);
+      const atr = indicators.c0.atr14 || (lastC.high - lastC.low) || profile.pipValue * 10;
+      const rsiNow = indicators.c0.rsi ?? 50;
+      const bullPct = hasLivePred ? kronosPrediction.bullishPct : (lastC.close >= pocPrice && rsiNow >= 48 ? 64 : 38);
+      const isBullHorizon = bullPct >= 50;
+      const kronosTarget = hasLivePred && kronosPrediction.horizonPrice > 0
+        ? kronosPrediction.horizonPrice
+        : (isBullHorizon ? lastC.close + atr * 1.35 : lastC.close - atr * 1.35);
+      const activeSignal = hasLivePred ? kronosPrediction.signal : (isBullHorizon ? 'BUY' : 'SELL');
+
+      // Subtle VAH / VAL markers when live Kronos Volume Profile is available
+      if (hasLivePred && kronosPrediction.vahPrice && kronosPrediction.vahPrice > 0) {
+        const yVah = priceToY(kronosPrediction.vahPrice);
+        if (yVah > 14 && yVah < mainChartHeight - 8) {
+          ctx.strokeStyle = isDark ? 'rgba(99, 102, 241, 0.35)' : 'rgba(79, 70, 229, 0.28)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 5]);
+          ctx.beginPath();
+          ctx.moveTo(Math.max(0, mainChartWidth * 0.65), yVah);
+          ctx.lineTo(mainChartWidth, yVah);
+          ctx.stroke();
+          ctx.fillStyle = isDark ? '#818cf8' : '#6366f1';
+          ctx.font = '8px ui-monospace, monospace';
+          ctx.fillText(`VAH ${formatPrice(kronosPrediction.vahPrice, profile.digits)}`, Math.max(8, mainChartWidth * 0.65 + 4), yVah - 2);
+        }
+      }
+
+      if (hasLivePred && kronosPrediction.valPrice && kronosPrediction.valPrice > 0) {
+        const yVal = priceToY(kronosPrediction.valPrice);
+        if (yVal > 14 && yVal < mainChartHeight - 8) {
+          ctx.strokeStyle = isDark ? 'rgba(99, 102, 241, 0.35)' : 'rgba(79, 70, 229, 0.28)';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([2, 5]);
+          ctx.beginPath();
+          ctx.moveTo(Math.max(0, mainChartWidth * 0.65), yVal);
+          ctx.lineTo(mainChartWidth, yVal);
+          ctx.stroke();
+          ctx.fillStyle = isDark ? '#818cf8' : '#6366f1';
+          ctx.font = '8px ui-monospace, monospace';
+          ctx.fillText(`VAL ${formatPrice(kronosPrediction.valPrice, profile.digits)}`, Math.max(8, mainChartWidth * 0.65 + 4), yVal - 2);
+        }
+      }
+
+      const yPoc = priceToY(pocPrice);
+      ctx.strokeStyle = isDark ? 'rgba(148, 163, 184, 0.45)' : 'rgba(15, 23, 42, 0.35)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([2, 4]);
+      ctx.beginPath();
+      ctx.moveTo(Math.max(0, mainChartWidth * 0.45), yPoc);
+      ctx.lineTo(mainChartWidth, yPoc);
+      ctx.stroke();
+      ctx.fillStyle = isDark ? '#cbd5e1' : '#475569';
+      ctx.font = '9px ui-monospace, monospace';
+      ctx.fillText(`POC ${formatPrice(pocPrice, profile.digits)}`, Math.max(8, mainChartWidth * 0.45 + 4), yPoc - 3);
+
+      const yKronos = priceToY(kronosTarget);
+      if (yKronos > 14 && yKronos < mainChartHeight - 8) {
+        ctx.strokeStyle = isBullHorizon ? 'rgba(16, 185, 129, 0.65)' : 'rgba(244, 63, 94, 0.65)';
+        ctx.setLineDash([5, 3]);
+        ctx.beginPath();
+        ctx.moveTo(Math.max(0, mainChartWidth * 0.58), yKronos);
+        ctx.lineTo(mainChartWidth, yKronos);
+        ctx.stroke();
+        ctx.fillStyle = isBullHorizon ? (isDark ? '#34d399' : '#059669') : (isDark ? '#fb7185' : '#e11d48');
+        ctx.font = 'bold 9px ui-monospace, monospace';
+        ctx.fillText(
+          `KRONOS ${activeSignal} (${bullPct}% BULL): ${formatPrice(kronosTarget, profile.digits)}`,
+          Math.max(8, mainChartWidth * 0.58 + 4),
+          yKronos - 3
+        );
+      }
+      ctx.setLineDash([]);
+    }
+
     // 6. Live Quote Line & Axis Bubble
     if (currentQuote && currentQuote.bid > 0) {
       const yBid = priceToY(currentQuote.bid);
-      ctx.strokeStyle = '#f59e0b';
+      ctx.strokeStyle = '#d97706';
       ctx.lineWidth = 1;
       ctx.setLineDash([2, 2]);
       ctx.beginPath();
@@ -685,9 +870,9 @@ export const TradingChart: React.FC = () => {
       ctx.stroke();
       ctx.setLineDash([]);
 
-      ctx.fillStyle = '#f59e0b';
+      ctx.fillStyle = '#d97706';
       ctx.fillRect(mainChartWidth + 1, yBid - 8, rightAxisWidth - 2, 16);
-      ctx.fillStyle = '#020617';
+      ctx.fillStyle = '#ffffff';
       ctx.font = 'bold 9px ui-monospace, monospace';
       ctx.fillText(formatPrice(currentQuote.bid, profile.digits), mainChartWidth + 4, yBid + 4);
     }
@@ -699,9 +884,9 @@ export const TradingChart: React.FC = () => {
     const rsiBottom = rsiTop + rsiPaneHeight - 15;
     const rsiRange = rsiBottom - rsiTop;
 
-    ctx.fillStyle = '#090d16';
+    ctx.fillStyle = isDark ? '#020617' : '#F8FAFC';
     ctx.fillRect(0, rsiTop - 10, width, rsiPaneHeight);
-    ctx.strokeStyle = '#1e293b';
+    ctx.strokeStyle = isDark ? '#27272a' : '#E2E8F0';
     ctx.beginPath();
     ctx.moveTo(0, rsiTop - 10);
     ctx.lineTo(width, rsiTop - 10);
@@ -714,19 +899,19 @@ export const TradingChart: React.FC = () => {
 
     // RSI Threshold Overbought (from Volatility DNA preset)
     const yOverbought = rsiToY(profile.preset.rsiTrendOverbought);
-    ctx.strokeStyle = 'rgba(244, 63, 94, 0.4)';
+    ctx.strokeStyle = 'rgba(239, 68, 68, 0.4)';
     ctx.setLineDash([3, 3]);
     ctx.beginPath();
     ctx.moveTo(0, yOverbought);
     ctx.lineTo(mainChartWidth, yOverbought);
     ctx.stroke();
-    ctx.fillStyle = '#f43f5e';
+    ctx.fillStyle = '#ef4444';
     ctx.font = '9px ui-monospace, monospace';
     ctx.fillText(`${profile.preset.rsiTrendOverbought}`, mainChartWidth + 6, yOverbought + 3);
 
     // 50 Center
     const y50 = rsiToY(50);
-    ctx.strokeStyle = 'rgba(100, 116, 139, 0.25)';
+    ctx.strokeStyle = isDark ? 'rgba(148, 163, 184, 0.22)' : 'rgba(148, 163, 184, 0.35)';
     ctx.beginPath();
     ctx.moveTo(0, y50);
     ctx.lineTo(mainChartWidth, y50);
@@ -746,7 +931,7 @@ export const TradingChart: React.FC = () => {
     // RSI Curve
     if (indicators && indicators.rsi.length > 0) {
       ctx.beginPath();
-      ctx.strokeStyle = '#38bdf8';
+      ctx.strokeStyle = isDark ? '#38bdf8' : '#0284c7';
       ctx.lineWidth = 1.5;
       for (let i = 0; i < visibleCandles.length; i++) {
         const fullIdx = candleStartIndex + i;
@@ -757,18 +942,18 @@ export const TradingChart: React.FC = () => {
       }
       ctx.stroke();
 
-      const currentRsi = indicators.rsi[candleEndIndex - 1] ?? (indicators.rsi[candles.length - 1] || 50);
+      const currentRsi = indicators.rsi[indicators.rsi.length - 1] ?? (indicators.rsi[candles.length - 1] || 50);
       ctx.fillStyle = currentRsi >= profile.preset.rsiTrendOverbought
-        ? '#f43f5e'
+        ? '#ef4444'
         : currentRsi <= profile.preset.rsiTrendOversold
         ? '#10b981'
-        : '#38bdf8';
+        : (isDark ? '#cbd5e1' : '#334155');
       ctx.font = 'bold 10px ui-monospace, monospace';
-      ctx.fillText(`RSI(14): ${currentRsi.toFixed(1)}`, 10, rsiTop + 8);
+      ctx.fillText(`RSI(14): ${currentRsi.toFixed(1)}${safePan > 0 ? ' (Live)' : ''}`, 10, rsiTop + 8);
 
       // 15-Candle Divergence Indicator
       if (indicators.divergence && indicators.divergence.detected) {
-        ctx.fillStyle = indicators.divergence.bullishDivergence ? '#10b981' : '#f43f5e';
+        ctx.fillStyle = indicators.divergence.bullishDivergence ? '#10b981' : '#ef4444';
         ctx.fillText(`★ 15-Candle Divergence: ${indicators.divergence.type}`, 115, rsiTop + 8);
       }
     }
@@ -779,6 +964,7 @@ export const TradingChart: React.FC = () => {
     return () => cancelAnimationFrame(rafId);
   }, [
     isMounted,
+    isDark,
     activeSymbol,
     candles,
     currentQuote,
@@ -787,34 +973,35 @@ export const TradingChart: React.FC = () => {
     visibleCandleCount,
     safePan,
     indicators,
+    kronosPrediction,
   ]);
 
   if (!isMounted) {
     return (
-      <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden flex flex-col h-full shadow-lg items-center justify-center min-h-[440px]">
-        <div className="flex items-center gap-2 text-slate-500 font-mono text-xs">
-          <span className="w-2 h-2 rounded-full bg-indigo-500 animate-ping" />
-          Initializing Chart Canvas...
+      <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-xl overflow-hidden flex flex-col h-full shadow-sm items-center justify-center min-h-[440px]">
+        <div className="flex items-center gap-2 text-slate-500 dark:text-slate-400 font-mono text-xs">
+          <span className="w-2 h-2 rounded-full bg-indigo-600 animate-ping" />
+          Initializing Institutional Chart Canvas...
         </div>
       </div>
     );
   }
 
   return (
-    <div key={focusSymbol || activeSymbol} className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden flex flex-col h-full shadow-lg w-full max-w-full">
+    <div key={focusSymbol || activeSymbol} className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-xl overflow-hidden flex flex-col h-full shadow-sm w-full max-w-full transition-colors">
       {/* Chart Control Header - Two Mobile-Friendly Rows */}
-      <div className="bg-slate-950/90 px-3 py-2 sm:px-4 sm:py-2.5 border-b border-slate-800 flex flex-col gap-1.5 text-xs w-full max-w-full select-none">
+      <div className="bg-slate-50/80 dark:bg-zinc-950/80 px-3 py-2 sm:px-4 sm:py-2.5 border-b border-slate-200 dark:border-zinc-800 flex flex-col gap-1.5 text-xs w-full max-w-full select-none transition-colors">
         {/* Row 1: Symbol Title + Timeframe Pills (M1 M5 M15 H1) */}
         <div className="flex items-center justify-between gap-2 w-full">
           <div className="flex items-center gap-2 min-w-0">
-            <span className="font-bold text-white text-xs sm:text-sm tracking-wider flex items-center gap-1.5 truncate">
+            <span className="font-bold text-slate-900 dark:text-slate-100 text-xs sm:text-sm tracking-wider flex items-center gap-1.5 truncate">
               {profile.name} ({profile.symbol})
             </span>
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
             {/* Timeframe Pills */}
-            <div className="flex items-center rounded-lg bg-slate-900 border border-slate-800 p-0.5 font-mono">
+            <div className="flex items-center rounded-lg bg-slate-100 dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 p-0.5 font-mono">
               {(['M1', 'M5', 'M15', 'H1'] as const).map((tf) => {
                 const isActive = timeframe === tf;
                 return (
@@ -825,7 +1012,7 @@ export const TradingChart: React.FC = () => {
                     className={`px-2 py-0.5 rounded text-[10px] sm:text-[11px] font-medium transition-all cursor-pointer ${
                       isActive
                         ? 'bg-indigo-600 text-white shadow-sm font-semibold'
-                        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 hover:bg-slate-200/60 dark:hover:bg-zinc-800'
                     }`}
                     title={`Switch chart to ${tf} timeframe`}
                   >
@@ -836,15 +1023,15 @@ export const TradingChart: React.FC = () => {
             </div>
 
             {/* Indicator Legend (Desktop) */}
-            <div className="hidden md:flex items-center gap-2 text-[10px] font-mono text-slate-400">
+            <div className="hidden md:flex items-center gap-2 text-[10px] font-mono text-slate-500 dark:text-slate-400">
               <span className="flex items-center gap-1">
-                <span className="w-2 h-0.5 bg-sky-400 inline-block" /> BB(20,2)
+                <span className="w-2 h-0.5 bg-sky-500 inline-block" /> EMA21
               </span>
               <span className="flex items-center gap-1">
-                <span className="w-2 h-0.5 bg-purple-400 inline-block" /> EMA200
+                <span className="w-2 h-0.5 bg-purple-500 inline-block" /> EMA50
               </span>
               <span className="flex items-center gap-1">
-                <span className="w-2 h-0.5 bg-sky-400 inline-block" /> RSI(14)
+                <span className="w-2 h-0.5 bg-indigo-500 inline-block" /> RSI(14)
               </span>
             </div>
           </div>
@@ -855,30 +1042,30 @@ export const TradingChart: React.FC = () => {
           {/* Bid / Ask / Spread Badges */}
           <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap font-mono text-[10px] sm:text-[11px]">
             {currentQuote && currentQuote.symbol === activeSymbol ? (
-              <div className="flex items-center gap-1.5 sm:gap-2 px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-300">
-                <span className="text-slate-400">Bid:</span>
-                <span className="text-emerald-400 font-semibold">{formatPrice(currentQuote.bid, profile.digits)}</span>
-                <span className="text-slate-700">|</span>
-                <span className="text-slate-400">Ask:</span>
-                <span className="text-rose-400 font-semibold">{formatPrice(currentQuote.ask, profile.digits)}</span>
-                <span className="text-slate-700">|</span>
-                <span className="text-slate-400">Spread:</span>
-                <span className="text-amber-400 font-medium">{currentQuote.spreadPips} p</span>
+              <div className="flex items-center gap-1.5 sm:gap-2 px-2 py-0.5 rounded-lg bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 text-slate-700 dark:text-slate-200 shadow-sm">
+                <span className="text-slate-500 dark:text-slate-400">Bid:</span>
+                <span className="text-emerald-700 dark:text-emerald-400 font-semibold">{formatPrice(currentQuote.bid, profile.digits)}</span>
+                <span className="text-slate-300 dark:text-zinc-700">|</span>
+                <span className="text-slate-500 dark:text-slate-400">Ask:</span>
+                <span className="text-rose-700 dark:text-rose-400 font-semibold">{formatPrice(currentQuote.ask, profile.digits)}</span>
+                <span className="text-slate-300 dark:text-zinc-700">|</span>
+                <span className="text-slate-500 dark:text-slate-400">Spread:</span>
+                <span className="text-amber-700 dark:text-amber-400 font-medium">{currentQuote.spreadPips} p</span>
               </div>
             ) : (
-              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-800 text-slate-400">
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 text-slate-500 dark:text-slate-400 shadow-sm">
                 <span>Connecting live quote...</span>
               </div>
             )}
           </div>
 
           {/* Zoom and Pan Controls */}
-          <div className="flex items-center gap-1 bg-slate-900 border border-slate-800 rounded-lg p-0.5 shadow-sm">
+          <div className="flex items-center gap-1 bg-slate-100 dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-lg p-0.5 shadow-sm">
             {safePan > 0 && (
               <button
                 type="button"
-                onClick={() => setPanOffset(0)}
-                className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono text-[10px] font-bold flex items-center gap-1 hover:bg-amber-500/30 transition-colors animate-pulse cursor-pointer"
+                onClick={() => chart.timeScale().scrollToRealTime()}
+                className="px-2 py-0.5 rounded bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border border-amber-300 dark:border-amber-700/60 font-mono text-[10px] font-bold flex items-center gap-1 hover:bg-amber-100 dark:hover:bg-amber-900/60 transition-colors animate-pulse cursor-pointer shadow-sm"
                 title="Jump back to live candle"
               >
                 <span>Live ◀</span>
@@ -888,11 +1075,8 @@ export const TradingChart: React.FC = () => {
             {(visibleCandleCount !== 50 || safePan > 0) && safePan === 0 && (
               <button
                 type="button"
-                onClick={() => {
-                  setVisibleCandleCount(50);
-                  setPanOffset(0);
-                }}
-                className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 hover:text-white font-mono text-[10px] transition-colors cursor-pointer"
+                onClick={() => chart.timeScale().resetTimeScale()}
+                className="px-1.5 py-0.5 rounded bg-white dark:bg-zinc-800 text-slate-700 dark:text-slate-200 hover:text-slate-900 dark:hover:text-white border border-slate-200 dark:border-zinc-700 font-mono text-[10px] transition-colors cursor-pointer shadow-sm"
                 title="Reset zoom to default (50 candles)"
               >
                 Reset
@@ -901,7 +1085,7 @@ export const TradingChart: React.FC = () => {
             <button
               type="button"
               onClick={() => setVisibleCandleCount((prev) => Math.max(15, prev - 8))}
-              className="w-5 h-5 sm:w-6 sm:h-6 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs flex items-center justify-center transition-colors cursor-pointer"
+              className="w-5 h-5 sm:w-6 sm:h-6 rounded bg-white dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-zinc-700 font-bold text-xs flex items-center justify-center transition-colors cursor-pointer shadow-sm"
               title="Zoom In (+)"
             >
               +
@@ -909,12 +1093,12 @@ export const TradingChart: React.FC = () => {
             <button
               type="button"
               onClick={() => setVisibleCandleCount((prev) => Math.min(150, prev + 8))}
-              className="w-5 h-5 sm:w-6 sm:h-6 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs flex items-center justify-center transition-colors cursor-pointer"
+              className="w-5 h-5 sm:w-6 sm:h-6 rounded bg-white dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-zinc-700 font-bold text-xs flex items-center justify-center transition-colors cursor-pointer shadow-sm"
               title="Zoom Out (-)"
             >
               -
             </button>
-            <span className="px-1 text-[10px] font-mono text-slate-400 font-semibold">
+            <span className="px-1 text-[10px] font-mono text-slate-600 dark:text-slate-400 font-semibold">
               {visibleCandleCount}b
             </span>
           </div>
@@ -928,7 +1112,7 @@ export const TradingChart: React.FC = () => {
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
-        className="relative flex-1 min-h-[360px] sm:min-h-[400px] w-full max-w-full overflow-hidden bg-slate-950 cursor-grab active:cursor-grabbing select-none"
+        className="relative flex-1 min-h-[360px] sm:min-h-[400px] w-full max-w-full overflow-hidden bg-white dark:bg-zinc-950 cursor-grab active:cursor-grabbing select-none transition-colors"
       >
         {(candles.length < 2 || (candles.length > 0 && (
           (activeSymbol === 'XAUUSDm' && candles[0].close < 1000) ||

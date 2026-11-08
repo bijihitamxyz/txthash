@@ -8,9 +8,16 @@
 import { stateSync } from './stateSync';
 import { getActiveExnessCredentials } from './cryptoVault';
 import { ExnessClient } from '@/core/exnessClient';
+import { loadVaultCredentials } from '@/core/exnessVault';
 import { getPairProfile, SUPPORTED_SYMBOLS, calculatePnL, evaluatePositionPnL } from '@/core/pairConfig';
 import { evaluateSignalGates } from '@/core/signalGate';
-import { evaluateWithAi, AiConfig, DEFAULT_AI_CONFIG } from '@/core/aiJudge';
+import { evaluateMultiAiConsensus } from '@/core/aiJudge';
+import {
+  readCentralAiConfig,
+  getActiveAiProviders,
+  formatActiveAiSummaryLabel,
+} from '@/core/centralAiConfig';
+import { computeRealTimeKronosForecast } from '@/core/kronosService';
 import { evaluatePositionTrailing, ManagedPosition } from '@/core/trailingManager';
 import {
   evaluatePreTradeRisk,
@@ -122,12 +129,17 @@ class EngineScheduler {
         };
       }
 
-      const activeCreds = getActiveExnessCredentials(state.credentials);
-      const client = new ExnessClient({
-        accountId: activeCreds.accountId,
-        server: activeCreds.server,
-        token: activeCreds.apiKey,
-      });
+      const vaultCreds = await loadVaultCredentials();
+      if (!vaultCreds) {
+        return {
+          executed: false,
+          timestamp: Date.now(),
+          positions: [],
+          telemetryCount: state.telemetryLogs.length,
+          message: 'No Exness credentials configured in Vault (Engine Idle)',
+        };
+      }
+      const client = new ExnessClient(vaultCreds);
 
       // Target market symbols to evaluate
       let targetSymbols: string[] = ['XAUUSDm'];
@@ -141,15 +153,33 @@ class EngineScheduler {
         targetSymbols = state.scannedSymbols;
       }
 
-      const updatedPositions: ManagedPosition[] = [...state.positions];
+      let updatedPositions: ManagedPosition[];
+      try {
+        updatedPositions = await client.fetchOpenPositions();
+      } catch (err: any) {
+        return {
+          executed: false,
+          timestamp: Date.now(),
+          positions: state.positions || [],
+          telemetryCount: state.telemetryLogs.length,
+          message: `Failed to fetch Exness positions: ${err?.message || err}`,
+        };
+      }
       const riskConfig: RiskGuardConfig = { ...DEFAULT_RISK_CONFIG };
-      const aiConfig: AiConfig = {
-        ...DEFAULT_AI_CONFIG,
-        baseUrl: state.credentials.aiBaseUrl || DEFAULT_AI_CONFIG.baseUrl,
-        apiKey: state.credentials.aiApiKey || '',
-        model: state.credentials.aiModel || DEFAULT_AI_CONFIG.model,
-        confidenceThreshold: state.aiConfidenceThreshold || 70,
-      };
+      const centralAi = await readCentralAiConfig();
+      const activeAiProviders = getActiveAiProviders(centralAi);
+      const activeAiSummaryLabel = formatActiveAiSummaryLabel(centralAi);
+      const effectiveThreshold = centralAi.confidenceThreshold || state.aiConfidenceThreshold || 70;
+
+      if (centralAi.engineSwitches?.emergencyKillSwitch) {
+        return {
+          executed: false,
+          timestamp: Date.now(),
+          positions: updatedPositions,
+          telemetryCount: state.telemetryLogs.length,
+          message: 'Admin Emergency Kill-Switch active',
+        };
+      }
 
       const log = (symbol: string, category: any, message: string) => {
         stateSync.addTelemetry(symbol, category, message);
@@ -161,17 +191,12 @@ class EngineScheduler {
         const quote = await client.getSymbolQuote(pos.symbol);
         const curPrice = pos.side === 'BUY' ? quote.bid : quote.ask;
 
-        // Anomalous Tick Guard (>50 pips in 5s) & 2% Price Deviation Guard:
-        // Never evaluate SL, TP, Partial Close, or Trailing Stop if quote is anomalous or corrupted
+        // Extreme Price Deviation Guard (> 15% jump):
+        // Prevents corrupted 0/NaN or mismatched quotes from triggering SL/TP prematurely
         const previousValidPrice = pos.currentPrice || pos.entryPrice;
         if (previousValidPrice > 0) {
-          const pipsDiff = Math.abs(curPrice - previousValidPrice) / profile.pipValue;
-          if (pipsDiff > 50) {
-            log(pos.symbol, 'RISK', `[AnomalousTickGuard] Scheduler discarding tick for #${pos.id}: quote price ${curPrice} jumps ${pipsDiff.toFixed(1)} pips (> 50 pips) from previous ${previousValidPrice}. Skipping position update.`);
-            continue;
-          }
           const deviation = Math.abs(curPrice - previousValidPrice) / previousValidPrice;
-          if (deviation > 0.02) {
+          if (deviation > 0.15) {
             log(pos.symbol, 'RISK', `[PositionPriceGuard] Scheduler skipping trailing evaluation for #${pos.id}: quote price ${curPrice} differs by ${(deviation * 100).toFixed(1)}% from previous valid price ${previousValidPrice}`);
             continue;
           }
@@ -341,17 +366,41 @@ class EngineScheduler {
           continue;
         }
 
-        // AI Confluence Judge (Gate 3) with 6.0s Timeout & Deterministic Quant Fallback
-        log(symbolSnapshot, 'AI', `[AI JUDGE] Evaluating ${signalResult.setupName || signalResult.signalType} (${aiConfig.model}) [6.0s timeout]...`);
-        const aiVerdict = await evaluateWithAi(signalResult.technicalSnapshot, aiConfig);
+        // Multi-AI Consensus / Risk Governance (Gate 3) + Kronos Quant Metrics
+        const kronosForecast = computeRealTimeKronosForecast({
+          symbol: symbolSnapshot,
+          timeframe: 'M5',
+          candles,
+          aiModel: activeAiSummaryLabel,
+        });
+
+        if (activeAiProviders.length === 0) {
+          log(symbolSnapshot, 'AI', `[MULTI-AI CONSENSUS] Kronos Quantitative Engine active. Evaluating ${signalResult.setupName || signalResult.signalType}...`);
+        } else {
+          log(symbolSnapshot, 'AI', `[MULTI-AI CONSENSUS] Querying ${activeAiProviders.length} active provider(s) (${activeAiSummaryLabel})...`);
+        }
+        const aiVerdict = await evaluateMultiAiConsensus(
+          signalResult.technicalSnapshot,
+          activeAiProviders,
+          effectiveThreshold,
+          {
+            pocPrice: kronosForecast.pocPrice,
+            vahPrice: kronosForecast.vahPrice,
+            valPrice: kronosForecast.valPrice,
+            rsi: kronosForecast.rsi,
+            zScore: kronosForecast.zScore,
+            regime: kronosForecast.regime,
+            bullishPct: kronosForecast.bullishPct,
+          }
+        );
 
         log(
           symbolSnapshot,
           'AI',
-          `AI Verdict: ${aiVerdict.decision} (${aiVerdict.confidence_score}% via ${aiVerdict.source}). ${aiVerdict.reasoning}`
+          `Multi-AI Verdict: ${aiVerdict.decision} (${aiVerdict.confidence_score}% via ${aiVerdict.source}). ${aiVerdict.reasoning}`
         );
 
-        if (!aiVerdict.executionAllowed) {
+        if (!aiVerdict.executionAllowed || centralAi.engineSwitches?.localEaExecutor === false) {
           continue;
         }
 
@@ -372,7 +421,7 @@ class EngineScheduler {
         }
 
         // Execute Market Order strictly for symbolSnapshot
-        log(symbolSnapshot, 'ORDER', `Submitting ${activeCreds.mode} ${signalResult.side} ${state.lotSize} ${symbolSnapshot}...`);
+        log(symbolSnapshot, 'ORDER', `Submitting ${vaultCreds.mode} ${signalResult.side} ${state.lotSize} ${symbolSnapshot}...`);
 
         const orderResult = await client.placeMarketOrder({
           symbol: symbolSnapshot,
@@ -380,7 +429,7 @@ class EngineScheduler {
           volume: state.lotSize,
           stopLossPrice: signalResult.proposedSlPrice,
           takeProfitPrice: signalResult.proposedTpPrice,
-          comment: `EXN_${activeCreds.mode}_AI${aiVerdict.confidence_score}`,
+          comment: `EXN_${vaultCreds.mode}_AI${aiVerdict.confidence_score}`,
         });
 
         if (orderResult.success) {
@@ -418,12 +467,7 @@ class EngineScheduler {
       for (const p of updatedPositions) {
         const q = await client.getQuote(p.symbol);
         const curPrice = p.side === 'BUY' ? q.bid : q.ask;
-        const prevValid = p.currentPrice || p.entryPrice;
-        const posProfile = getPairProfile(p.symbol);
-        if (prevValid > 0 && Math.abs(curPrice - prevValid) / posProfile.pipValue > 50) {
-          // Discard anomalous tick > 50 pips jump
-          continue;
-        }
+        if (curPrice <= 0 || isNaN(curPrice)) continue;
         const res = evaluatePositionPnL(p, q);
         p.currentPrice = curPrice;
         p.unrealizedPnl = res.pnlUsd;

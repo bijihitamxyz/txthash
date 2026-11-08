@@ -33,6 +33,10 @@ export interface StoredCredentials {
   aiApiKey: string;
   aiModel: string;
 
+  // Kronos FastAPI VPS Configuration
+  kronosVpsUrl?: string;
+  kronosApiKey?: string;
+
   // Backwards compatibility aliases
   exnessAccountId?: string;
   exnessServer?: string;
@@ -48,18 +52,21 @@ export const DEFAULT_CREDENTIALS: StoredCredentials = {
   demoServer: 'Exness-Trial',
   demoApiKey: '',
   demoApiSecret: '',
-  demoInitialBalance: 100.00,
+  demoInitialBalance: undefined,
 
-  realAccountId: '30000143146',
+  realAccountId: '464129221',
   realServer: 'Exness-Real',
   realApiKey: '',
   realApiSecret: '',
-  realInitialBalance: 100.00,
+  realInitialBalance: undefined,
 
   aiProvider: 'openai',
   aiBaseUrl: 'https://api.openai.com/v1',
   aiApiKey: '',
   aiModel: 'gpt-4o-mini',
+
+  kronosVpsUrl: 'http://127.0.0.1:8000',
+  kronosApiKey: 'nmssx-kronos-secret-2026',
 
   updatedAt: Date.now(),
 };
@@ -90,8 +97,8 @@ export function getActiveExnessCredentials(creds: StoredCredentials): {
     ? (creds.realApiSecret || '')
     : (creds.demoApiSecret || '');
   const initialBalance = isReal
-    ? (typeof creds.realInitialBalance === 'number' && creds.realInitialBalance > 0 ? creds.realInitialBalance : 100.00)
-    : (typeof creds.demoInitialBalance === 'number' && creds.demoInitialBalance > 0 ? creds.demoInitialBalance : 100.00);
+    ? (typeof creds.realInitialBalance === 'number' && creds.realInitialBalance > 0 ? creds.realInitialBalance : 0)
+    : (typeof creds.demoInitialBalance === 'number' && creds.demoInitialBalance > 0 ? creds.demoInitialBalance : 0);
 
   return {
     accountId,
@@ -137,7 +144,7 @@ async function deriveKey(passphrase: string, salt: Uint8Array): Promise<CryptoKe
   return crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
-      salt: salt,
+      salt: salt as any,
       iterations: 100000,
       hash: 'SHA-256',
     },

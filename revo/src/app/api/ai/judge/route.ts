@@ -1,79 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
-import path from 'path';
 import { verifyAdminSecret } from '@/lib/licenseDb';
-import { testAiPing } from '@/core/aiJudge';
-import { readDataFileAsync, writeDataFileAsync, getDataDir } from '@/lib/dataStore';
+import { testAiPing, normalizeAiEndpoint, isReasoningModel } from '@/core/aiJudge';
+import {
+  DEFAULT_CENTRAL_AI_CONFIG,
+  AiProviderSlot,
+  readCentralAiConfig,
+  writeCentralAiConfig,
+  getActiveAiProviders,
+  formatActiveAiSummaryLabel,
+} from '@/core/centralAiConfig';
+import { DEFAULT_KRONOS_API_KEY } from '@/core/kronosService';
 
 export const dynamic = 'force-dynamic';
-
-export interface CentralAiConfig {
-  baseUrl: string;
-  model: string;
-  apiKey: string;
-  updatedAt: number;
-}
-
-const DEFAULT_CENTRAL_AI_CONFIG: CentralAiConfig = {
-  baseUrl: 'https://integrate.api.nvidia.com/v1',
-  model: 'nvidia/nemotron-3.5-super-vl-120b-a12b',
-  apiKey: '',
-  updatedAt: Date.now(),
-};
-
-export function getAiConfigPath(): string {
-  if (process.env.AI_CONFIG_FILE) {
-    return process.env.AI_CONFIG_FILE;
-  }
-  return path.join(getDataDir(), 'ai_config.json');
-}
-
-export async function readCentralAiConfig(): Promise<CentralAiConfig> {
-  try {
-    const raw = await readDataFileAsync('ai_config.json', JSON.stringify(DEFAULT_CENTRAL_AI_CONFIG, null, 2));
-    if (!raw.trim()) {
-      return { ...DEFAULT_CENTRAL_AI_CONFIG };
-    }
-    const parsed = JSON.parse(raw);
-    return {
-      baseUrl: parsed.baseUrl || DEFAULT_CENTRAL_AI_CONFIG.baseUrl,
-      model: parsed.model || DEFAULT_CENTRAL_AI_CONFIG.model,
-      apiKey: parsed.apiKey || '',
-      updatedAt: parsed.updatedAt || Date.now(),
-    };
-  } catch (err) {
-    console.error('[readCentralAiConfig] Error reading ai_config.json, returning defaults:', err);
-    return { ...DEFAULT_CENTRAL_AI_CONFIG };
-  }
-}
-
-export async function writeCentralAiConfig(config: Partial<CentralAiConfig>): Promise<CentralAiConfig> {
-  try {
-    const current = await readCentralAiConfig();
-
-    // If apiKey is masked with bullets, preserve the current real key
-    const isMasked = config.apiKey && config.apiKey.includes('••••••••');
-    const effectiveApiKey = isMasked
-      ? current.apiKey
-      : (config.apiKey !== undefined ? config.apiKey.trim() : current.apiKey);
-
-    const updated: CentralAiConfig = {
-      baseUrl: (config.baseUrl ?? current.baseUrl ?? DEFAULT_CENTRAL_AI_CONFIG.baseUrl).trim(),
-      model: (config.model ?? current.model ?? DEFAULT_CENTRAL_AI_CONFIG.model).trim(),
-      apiKey: effectiveApiKey,
-      updatedAt: Date.now(),
-    };
-
-    await writeDataFileAsync('ai_config.json', JSON.stringify(updated, null, 2));
-    return updated;
-  } catch (err) {
-    console.error('[writeCentralAiConfig] Error writing ai_config.json:', err);
-    return {
-      ...DEFAULT_CENTRAL_AI_CONFIG,
-      ...config,
-      updatedAt: Date.now(),
-    } as CentralAiConfig;
-  }
-}
 
 export interface AiJudgeVerdict {
   decision: 'EXECUTE' | 'REJECT';
@@ -85,14 +23,149 @@ export interface AiJudgeVerdict {
   reasoning: string;
   source: 'LLM' | 'HEURISTIC_QUANT_FALLBACK';
   modelUsed: string;
+  modelsUsed?: string[];
   latencyMs: number;
 }
 
+const judgeProviderCooldown = new Map<string, { until: number; status: number }>();
+
+async function querySingleSetupProvider(
+  slot: AiProviderSlot,
+  systemPrompt: string,
+  userPrompt: string
+): Promise<{ decision: 'EXECUTE' | 'REJECT'; confidence_score: number; reasoning: string; label: string }> {
+  const { chatEndpoint, isAnthropic, isLocal } = normalizeAiEndpoint(slot.baseUrl);
+  const effectiveKey = (slot.apiKey || '').trim() || (isLocal ? 'sk-local-9router' : '');
+  const model = (slot.model || '').trim() || 'gpt-4o-mini';
+  const label = `${slot.name.split(' ')[0]}:${model}`;
+  const cacheKey = `${slot.id}_${slot.baseUrl}_${model}`;
+
+  const cooldown = judgeProviderCooldown.get(cacheKey);
+  if (cooldown && Date.now() < cooldown.until) {
+    throw new Error(`Cooldown HTTP ${cooldown.status}`);
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    try {
+      controller.abort();
+    } catch {}
+  }, 6500);
+
+  const reasoning = isReasoningModel(model);
+
+  try {
+    let content = '';
+    if (isAnthropic) {
+      const res = await fetch(chatEndpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': effectiveKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: 512,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: userPrompt }],
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        const ttl = res.status === 429 || res.status === 402 ? 60000 : 20000;
+        judgeProviderCooldown.set(cacheKey, { until: Date.now() + ttl, status: res.status });
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      content = data.content?.[0]?.text || '';
+    } else {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${effectiveKey}`,
+        'HTTP-Referer': 'https://nmssx.xyz',
+        'X-Title': 'NEMESIS x Trade Multi-AI Consensus',
+      };
+      const payloadBody: any = {
+        model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+      };
+      if (reasoning) {
+        payloadBody.max_completion_tokens = 512;
+      } else {
+        payloadBody.max_tokens = 512;
+        payloadBody.temperature = 0.1;
+      }
+
+      let res = await fetch(chatEndpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payloadBody),
+        signal: controller.signal,
+      });
+
+      if (!res.ok && res.status === 400) {
+        try {
+          const fallbackBody = {
+            model,
+            messages: [{ role: 'user', content: `${systemPrompt}\n\n${userPrompt}` }],
+          };
+          res = await fetch(chatEndpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(fallbackBody),
+            signal: controller.signal,
+          });
+        } catch {}
+      }
+
+      clearTimeout(timeoutId);
+      if (!res.ok) {
+        const ttl = res.status === 429 || res.status === 402 ? 60000 : 20000;
+        judgeProviderCooldown.set(cacheKey, { until: Date.now() + ttl, status: res.status });
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const data = await res.json();
+      const choice = data?.choices?.[0];
+      content = choice?.message?.content || choice?.message?.reasoning_content || '';
+    }
+
+    content = content.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    const jsonMatch = content.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      throw new Error('Non-JSON output');
+    }
+    const parsed = JSON.parse(jsonMatch[0]);
+    const confidence_score =
+      typeof parsed.confidence_score === 'number'
+        ? Math.min(100, Math.max(0, parsed.confidence_score))
+        : 80;
+    const decision: 'EXECUTE' | 'REJECT' = parsed.decision === 'EXECUTE' ? 'EXECUTE' : 'REJECT';
+    return {
+      decision,
+      confidence_score,
+      reasoning: parsed.reasoning || 'Multi-AI Consensus verified setup.',
+      label,
+    };
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (!judgeProviderCooldown.has(cacheKey)) {
+      judgeProviderCooldown.set(cacheKey, { until: Date.now() + 20000, status: 500 });
+    }
+    throw err;
+  }
+}
+
 /**
- * Evaluates snapshot with central AI (NVIDIA Nemotron 120B or OpenAI-compatible)
- * Falls back immediately to quantitative institutional heuristic if offline or times out.
+ * Dynamic "Use What Is Connected" Multi-AI Consensus Engine + Kronos Quant Metrics
+ * Queries all active Admin AI providers in parallel via Promise.allSettled;
+ * automatically fails over on quota/rate-limits or zero connected LLMs so 24/7 execution never halts.
  */
-export async function evaluateSetupWithCentralAi(payload: {
+async function evaluateSetupWithCentralAi(payload: {
   symbol: string;
   side: 'BUY' | 'SELL';
   timeframe?: string;
@@ -101,6 +174,11 @@ export async function evaluateSetupWithCentralAi(payload: {
   bbWickSweepPct?: number;
   volumeRatio?: number;
   rsi?: number;
+  pocPrice?: number;
+  vahPrice?: number;
+  valPrice?: number;
+  zScore?: number;
+  regime?: string;
   vwapDistancePct?: number;
   fundingRate?: number;
   emaTrend?: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
@@ -109,36 +187,51 @@ export async function evaluateSetupWithCentralAi(payload: {
 }): Promise<AiJudgeVerdict> {
   const startTime = Date.now();
   const config = await readCentralAiConfig();
-  const apiKey = (config.apiKey || '').trim();
-  const baseUrl = (config.baseUrl || DEFAULT_CENTRAL_AI_CONFIG.baseUrl).trim();
-  const model = (config.model || DEFAULT_CENTRAL_AI_CONFIG.model).trim();
 
-  // If no API key configured, use high-precision heuristic quantitative fallback
-  if (!apiKey) {
-    const latencyMs = Date.now() - startTime;
-    const isApproved = payload.confluenceScore >= 80;
+  if (config.engineSwitches?.emergencyKillSwitch) {
     return {
-      decision: isApproved ? 'EXECUTE' : 'REJECT',
-      confidence_score: isApproved
-        ? Math.min(96, Math.max(80, Math.round(payload.confluenceScore * 0.95 + (payload.bbWickSweepPct || 0) * 0.1)))
-        : Math.round(payload.confluenceScore * 0.7),
-      reasoning: isApproved
-        ? `[QUANT HEURISTIC VERIFIED] Confluence Score ${payload.confluenceScore}/100 meets high-probability threshold. Wick sweep rejection confirmed with volume expansion.`
-        : `[QUANT HEURISTIC REJECTED] Confluence Score ${payload.confluenceScore}/100 insufficient (< 80 required).`,
+      decision: 'REJECT',
+      confidence_score: 0,
+      reasoning: '[ADMIN EMERGENCY KILL-SWITCH] Order execution halted globally by Administrator.',
       source: 'HEURISTIC_QUANT_FALLBACK',
-      modelUsed: 'Institutional-Quant-Engine-v2',
-      latencyMs,
+      modelUsed: 'Admin-Risk-Governance',
+      latencyMs: Math.max(1, Date.now() - startTime),
     };
   }
 
-  // Build clean LLM Prompt
-  let endpoint = baseUrl.replace(/\/+$/, '');
-  if (!endpoint.endsWith('/chat/completions')) {
-    endpoint = `${endpoint}/chat/completions`;
+  const activeProviders = getActiveAiProviders(config);
+  const threshold = Math.max(55, config.confidenceThreshold || 70);
+
+  const buildQuantFallback = (prefix: string): AiJudgeVerdict => {
+    const latencyMs = Math.max(1, Date.now() - startTime);
+    const isApproved = payload.confluenceScore >= threshold;
+    return {
+      decision: isApproved ? 'EXECUTE' : 'REJECT',
+      confidence_score: isApproved
+        ? Math.min(
+            96,
+            Math.max(
+              threshold,
+              Math.round(payload.confluenceScore * 0.95 + (payload.bbWickSweepPct || 0) * 0.1)
+            )
+          )
+        : Math.round(payload.confluenceScore * 0.7),
+      reasoning: isApproved
+        ? `${prefix} Confluence Score ${payload.confluenceScore}/100 meets ${threshold}% threshold.`
+        : `${prefix} Confluence Score ${payload.confluenceScore}/100 below ${threshold}% threshold.`,
+      source: 'HEURISTIC_QUANT_FALLBACK',
+      modelUsed: 'Kronos-Quant-Governance',
+      modelsUsed: ['Kronos-Quant-Governance'],
+      latencyMs,
+    };
+  };
+
+  if (activeProviders.length === 0) {
+    return buildQuantFallback('[KRONOS QUANT GOVERNANCE]');
   }
 
-  const systemPrompt = `You are an elite Institutional Quantitative Risk Judge verifying automated algorithmic setups for ${payload.room || 'CRYPTO_FUTURES'}.
-Evaluate whether to EXECUTE or REJECT this signal.
+  const systemPrompt = `You are an elite Institutional Multi-AI Consensus / Risk Governance Judge verifying automated algorithmic setups for ${payload.room || 'INSTITUTIONAL_TERMINAL'}.
+Evaluate whether to EXECUTE or REJECT this signal alongside Kronos quantitative metrics (POC, VAH, VAL, RSI, Z-Score, Regime).
 Only return strict JSON in this exact structure:
 {
   "decision": "EXECUTE" or "REJECT",
@@ -151,120 +244,109 @@ Proposed Side: ${payload.side}
 Timeframe: ${payload.timeframe || 'M5'}
 Current Price: ${payload.price}
 Confluence Score: ${payload.confluenceScore}/100
+Volume Profile POC: ${payload.pocPrice ?? payload.price} | VAH: ${payload.vahPrice ?? 'N/A'} | VAL: ${payload.valPrice ?? 'N/A'}
+RSI(14): ${payload.rsi ? payload.rsi.toFixed(1) : 'N/A'} | Z-Score: ${payload.zScore ?? 'N/A'} | Regime: ${payload.regime || payload.emaTrend || 'NEUTRAL'}
 Bollinger Wick Sweep: ${payload.bbWickSweepPct ? (payload.bbWickSweepPct * 100).toFixed(1) + '%' : 'N/A'}
 Volume vs SMA20: ${payload.volumeRatio ? payload.volumeRatio.toFixed(2) + 'x' : 'N/A'}
-RSI(14): ${payload.rsi ? payload.rsi.toFixed(1) : 'N/A'}
 Divergence: ${payload.divergence || 'NONE'}
 VWAP Fair Value Distance: ${payload.vwapDistancePct ? (payload.vwapDistancePct * 100).toFixed(2) + '%' : 'N/A'}
 Funding Rate: ${payload.fundingRate !== undefined ? (payload.fundingRate * 100).toFixed(4) + '%' : 'N/A'}
 Trend: ${payload.emaTrend || 'NEUTRAL'}`;
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => {
-    try {
-      controller.abort();
-    } catch {}
-  }, 5000);
+  const settled = await Promise.allSettled(
+    activeProviders.map((slot) => querySingleSetupProvider(slot, systemPrompt, userPrompt))
+  );
 
-  try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
-        temperature: 0.1,
-        max_tokens: 512,
-      }),
-      signal: controller.signal,
-    });
+  const succeeded = settled
+    .filter(
+      (
+        r
+      ): r is PromiseFulfilledResult<{
+        decision: 'EXECUTE' | 'REJECT';
+        confidence_score: number;
+        reasoning: string;
+        label: string;
+      }> => r.status === 'fulfilled'
+    )
+    .map((r) => r.value);
 
-    clearTimeout(timeoutId);
-    const latencyMs = Date.now() - startTime;
-
-    if (!res.ok) {
-      throw new Error(`AI Provider HTTP ${res.status}: ${res.statusText}`);
-    }
-
-    const data = await res.json();
-    const choice = data?.choices?.[0];
-    const content = choice?.message?.content || choice?.message?.reasoning_content || '';
-
-    // Parse JSON from response
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[0]);
-      const decision = parsed.decision === 'EXECUTE' ? 'EXECUTE' : 'REJECT';
-      const confidence_score = typeof parsed.confidence_score === 'number'
-        ? Math.min(100, Math.max(0, parsed.confidence_score))
-        : 85;
-      return {
-        decision,
-        confidence_score,
-        reasoning: parsed.reasoning || `AI Judge approved ${payload.side} on ${payload.symbol}`,
-        source: 'LLM',
-        modelUsed: model,
-        latencyMs,
-      };
-    }
-
-    throw new Error('Could not parse JSON verdict from AI model output');
-  } catch (err: any) {
-    const latencyMs = Date.now() - startTime;
-    console.warn(`[CentralAiJudge Fallback] (${err?.message || err}). Reverting to Quantitative Fallback.`);
-    const isApproved = payload.confluenceScore >= 80;
-    return {
-      decision: isApproved ? 'EXECUTE' : 'REJECT',
-      confidence_score: isApproved
-        ? Math.min(95, Math.max(80, Math.round(payload.confluenceScore * 0.95)))
-        : Math.round(payload.confluenceScore * 0.7),
-      reasoning: isApproved
-        ? `[FALLBACK APPROVED: ${err?.message || 'Timeout'}] Institutional technical confluence score ${payload.confluenceScore}/100 qualifies for execution.`
-        : `[FALLBACK REJECTED] Technical confluence ${payload.confluenceScore}/100 below 80 threshold.`,
-      source: 'HEURISTIC_QUANT_FALLBACK',
-      modelUsed: `${model} (Quant Fallback)`,
-      latencyMs,
-    };
+  if (succeeded.length === 0) {
+    return buildQuantFallback('[AUTO-FAILOVER -> KRONOS QUANT]');
   }
+
+  const latencyMs = Math.max(1, Date.now() - startTime);
+  const executeVotes = succeeded.filter((s) => s.decision === 'EXECUTE').length;
+  const rejectVotes = succeeded.length - executeVotes;
+  const avgScore = Math.round(
+    succeeded.reduce((acc, s) => acc + s.confidence_score, 0) / succeeded.length
+  );
+
+  let rawDecision: 'EXECUTE' | 'REJECT';
+  if (executeVotes > rejectVotes) rawDecision = 'EXECUTE';
+  else if (rejectVotes > executeVotes) rawDecision = 'REJECT';
+  else rawDecision = payload.confluenceScore >= threshold ? 'EXECUTE' : 'REJECT';
+
+  const finalDecision: 'EXECUTE' | 'REJECT' =
+    rawDecision === 'EXECUTE' && avgScore >= threshold ? 'EXECUTE' : 'REJECT';
+  const modelsUsed = succeeded.map((s) => s.label);
+  const modelUsedLabel =
+    succeeded.length === 1
+      ? succeeded[0].label
+      : `Multi-AI Consensus (${succeeded.length} Active)`;
+
+  return {
+    decision: finalDecision,
+    confidence_score: avgScore,
+    reasoning:
+      succeeded.length === 1
+        ? `[${succeeded[0].label}] ${succeeded[0].reasoning}`
+        : `[Multi-AI Consensus ${executeVotes}/${succeeded.length} (${modelsUsed.join(', ')})] ${succeeded[0].reasoning}`,
+    source: 'LLM',
+    modelUsed: modelUsedLabel,
+    modelsUsed,
+    latencyMs,
+  };
 }
 
-// GET: Returns AI config status (full config if admin key provided, masked otherwise)
+// GET: Returns full Multi-AI Provider Slots & Kronos VPS config to authenticated Admin ONLY; sanitized summary to clients
 export async function GET(req: NextRequest) {
   try {
     const config = await readCentralAiConfig();
     const isAdmin = verifyAdminSecret(req);
+    const activeProviders = getActiveAiProviders(config);
+    const isConfigured = activeProviders.length > 0;
+    const summaryLabel = formatActiveAiSummaryLabel(config);
 
     if (isAdmin) {
       return NextResponse.json({
         success: true,
         config: {
           baseUrl: config.baseUrl,
-          model: config.model,
+          model: summaryLabel,
           apiKey: config.apiKey,
+          providers: config.providers,
+          activeProviderCount: activeProviders.length,
+          activeModels: activeProviders.map((p) => `${p.name.split(' ')[0]}:${p.model}`),
+          confidenceThreshold: config.confidenceThreshold,
+          kronosVpsUrl: config.kronosVpsUrl,
+          kronosApiKey: config.kronosApiKey,
+          engineSwitches: config.engineSwitches,
           updatedAt: config.updatedAt,
-          isConfigured: Boolean(config.apiKey && config.apiKey.trim().length > 0),
+          isConfigured,
         },
       });
     }
 
-    // Mask API key for non-admin callers
-    const maskedKey = config.apiKey
-      ? `${config.apiKey.slice(0, 6)}••••••••${config.apiKey.slice(-4)}`
-      : '';
-
+    // Non-admin callers NEVER receive API keys, VPS URLs, or Kronos secrets
     return NextResponse.json({
       success: true,
       config: {
-        baseUrl: config.baseUrl,
-        model: config.model,
-        apiKey: maskedKey,
-        isConfigured: Boolean(config.apiKey && config.apiKey.trim().length > 0),
+        model: summaryLabel,
+        activeProviderCount: activeProviders.length,
+        activeModels: activeProviders.map((p) => `${p.name.split(' ')[0]}:${p.model}`),
+        confidenceThreshold: config.confidenceThreshold,
+        engineSwitches: config.engineSwitches,
+        isConfigured,
         updatedAt: config.updatedAt,
       },
     });
@@ -276,7 +358,7 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// POST: Save config, Test connection, or Judge evaluation
+// POST: Admin-only Save/Test Multi-AI & Kronos VPS config, or Judge evaluation
 export async function POST(req: NextRequest) {
   try {
     let body: any = {};
@@ -286,54 +368,222 @@ export async function POST(req: NextRequest) {
 
     const action = body.action || 'JUDGE';
 
-    // 1. SAVE CONFIG (Admin Only)
-    if (action === 'SAVE_CONFIG') {
+    // Admin-only actions
+    if (
+      action === 'SAVE_CONFIG' ||
+      action === 'TEST_PROVIDER' ||
+      action === 'TEST_CONNECTION' ||
+      action === 'TEST_CONFIG' ||
+      action === 'TEST_VPS'
+    ) {
       if (!verifyAdminSecret(req)) {
         return NextResponse.json(
-          { success: false, error: 'Unauthorized: Invalid Admin Master Key.' },
+          {
+            success: false,
+            error: 'Unauthorized: AI & Kronos VPS configuration is restricted to Administrators.',
+          },
           { status: 401 }
         );
       }
+    }
 
-      const { baseUrl, model, apiKey } = body;
+    // 1. SAVE CONFIG (Admin Only)
+    if (action === 'SAVE_CONFIG') {
+      const {
+        baseUrl,
+        model,
+        apiKey,
+        providers,
+        confidenceThreshold,
+        kronosVpsUrl,
+        kronosApiKey,
+        engineSwitches,
+      } = body;
       const updated = await writeCentralAiConfig({
-        baseUrl: baseUrl || DEFAULT_CENTRAL_AI_CONFIG.baseUrl,
-        model: model || DEFAULT_CENTRAL_AI_CONFIG.model,
+        baseUrl: baseUrl !== undefined ? baseUrl : undefined,
+        model: model !== undefined ? model : undefined,
         apiKey: apiKey !== undefined ? apiKey : undefined,
+        providers: Array.isArray(providers) ? providers : undefined,
+        confidenceThreshold:
+          typeof confidenceThreshold === 'number' ? confidenceThreshold : undefined,
+        kronosVpsUrl: kronosVpsUrl !== undefined ? kronosVpsUrl : undefined,
+        kronosApiKey: kronosApiKey !== undefined ? kronosApiKey : undefined,
+        engineSwitches: engineSwitches !== undefined ? engineSwitches : undefined,
       });
+
+      judgeProviderCooldown.clear();
+      const activeProviders = getActiveAiProviders(updated);
 
       return NextResponse.json({
         success: true,
-        message: '✅ Konfigurasi AI berhasil disimpan ke server!',
+        message: `Central Multi-AI (${activeProviders.length} active) & Oracle Kronos VPS configuration saved.`,
         config: {
           baseUrl: updated.baseUrl,
-          model: updated.model,
+          model: formatActiveAiSummaryLabel(updated),
           apiKey: updated.apiKey,
+          providers: updated.providers,
+          activeProviderCount: activeProviders.length,
+          activeModels: activeProviders.map((p) => `${p.name.split(' ')[0]}:${p.model}`),
+          confidenceThreshold: updated.confidenceThreshold,
+          kronosVpsUrl: updated.kronosVpsUrl,
+          kronosApiKey: updated.kronosApiKey,
+          engineSwitches: updated.engineSwitches,
           updatedAt: updated.updatedAt,
-          isConfigured: Boolean(updated.apiKey),
+          isConfigured: activeProviders.length > 0,
         },
       });
     }
 
-    // 2. TEST CONNECTION / CONFIG (Lightweight Ping)
-    if (action === 'TEST_CONNECTION' || action === 'TEST_CONFIG') {
+    // 2. TEST AI PROVIDER CONNECTION (Admin Only)
+    if (action === 'TEST_PROVIDER' || action === 'TEST_CONNECTION' || action === 'TEST_CONFIG') {
       const savedConfig = await readCentralAiConfig();
-      const baseUrl = (body.baseUrl || savedConfig.baseUrl || DEFAULT_CENTRAL_AI_CONFIG.baseUrl).trim();
-      const model = (body.model || savedConfig.model || DEFAULT_CENTRAL_AI_CONFIG.model).trim();
-      const apiKey = (body.apiKey !== undefined ? body.apiKey : savedConfig.apiKey).trim();
+      const providerId = body.providerId ? String(body.providerId).trim() : '';
+      const matchedSlot = providerId
+        ? savedConfig.providers.find((p) => p.id === providerId)
+        : undefined;
 
-      if (!apiKey) {
+      const baseUrl = String(
+        body.baseUrl || matchedSlot?.baseUrl || savedConfig.baseUrl || 'https://api.openai.com/v1'
+      ).trim();
+      const model = String(
+        body.model || matchedSlot?.model || savedConfig.model || 'gpt-4o'
+      ).trim();
+      const rawKey =
+        body.apiKey !== undefined
+          ? String(body.apiKey).trim()
+          : (matchedSlot?.apiKey ?? savedConfig.apiKey).trim();
+      const apiKey = rawKey.includes('••••••••')
+        ? matchedSlot?.apiKey || savedConfig.apiKey
+        : rawKey;
+
+      const { isLocal } = normalizeAiEndpoint(baseUrl);
+      if (!apiKey && !isLocal) {
         return NextResponse.json({
           success: false,
-          message: 'API Key is empty. Please enter your AI Master Key (e.g. nvapi-... or sk-...).',
+          statusText: 'FAILED (API Key is empty)',
+          message: 'FAILED (API Key is empty)',
         });
       }
 
       const pingResult = await testAiPing({ baseUrl, apiKey, model });
+
+      // Persist test result onto the provider slot if providerId was specified
+      if (providerId && matchedSlot) {
+        const nextProviders = savedConfig.providers.map((slot) =>
+          slot.id === providerId
+            ? {
+                ...slot,
+                baseUrl,
+                model,
+                ...(apiKey ? { apiKey } : {}),
+                lastTestedAt: Date.now(),
+                lastTestOk: pingResult.success,
+                lastLatencyMs: pingResult.latencyMs,
+                lastError: pingResult.success ? '' : pingResult.errorReason || pingResult.message,
+              }
+            : slot
+        );
+        await writeCentralAiConfig({ providers: nextProviders });
+      }
+
       return NextResponse.json(pingResult);
     }
 
-    // 3. JUDGE EVALUATION (Called by Room 1 or Room 2)
+    // 3. TEST ORACLE VPS KRONOS ENDPOINT (Admin Only)
+    if (action === 'TEST_VPS') {
+      const savedConfig = await readCentralAiConfig();
+      const vpsUrl = String(body.kronosVpsUrl || savedConfig.kronosVpsUrl || 'http://127.0.0.1:8000')
+        .trim()
+        .replace(/\/+$/, '');
+      const rawSecret =
+        body.kronosApiKey !== undefined ? String(body.kronosApiKey).trim() : savedConfig.kronosApiKey;
+      const kronosSecret =
+        rawSecret && !rawSecret.includes('••••••••')
+          ? rawSecret
+          : savedConfig.kronosApiKey || DEFAULT_KRONOS_API_KEY;
+
+      if (!vpsUrl.startsWith('http://') && !vpsUrl.startsWith('https://')) {
+        return NextResponse.json({
+          success: false,
+          vpsReady: false,
+          kronosReady: false,
+          engineStatus: 'invalid-url',
+          statusText: 'FAILED (Invalid VPS URL)',
+          message: 'FAILED (Invalid VPS URL — must start with http:// or https://)',
+        });
+      }
+
+      const start = Date.now();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => {
+        try {
+          controller.abort();
+        } catch {}
+      }, 3500);
+
+      try {
+        const res = await fetch(`${vpsUrl}/health`, {
+          method: 'GET',
+          headers: {
+            'X-API-Key': kronosSecret,
+          },
+          cache: 'no-store',
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        const latencyMs = Math.max(1, Date.now() - start);
+
+        if (!res.ok) {
+          return NextResponse.json({
+            success: false,
+            vpsReady: false,
+            kronosReady: false,
+            engineStatus: `http-${res.status}`,
+            statusText: `FAILED (HTTP ${res.status})`,
+            latencyMs,
+            message: `FAILED (HTTP ${res.status} ${res.statusText} at ${vpsUrl}/health)`,
+          });
+        }
+
+        let healthData: any = {};
+        try {
+          healthData = await res.json();
+        } catch {}
+
+        const engineStatus = String(
+          healthData?.engine || healthData?.engine_status || 'kronos-neural-ready'
+        );
+
+        return NextResponse.json({
+          success: true,
+          vpsReady: true,
+          kronosReady: healthData?.kronos_ready !== false,
+          engineStatus,
+          statusText: `CONNECTED · ${engineStatus} (${latencyMs}ms)`,
+          latencyMs,
+          healthData,
+          message: `CONNECTED · ${engineStatus} (${latencyMs}ms)`,
+        });
+      } catch (err: any) {
+        clearTimeout(timeoutId);
+        const latencyMs = Math.max(1, Date.now() - start);
+        const reason =
+          err?.name === 'AbortError'
+            ? 'Timeout > 3.5s'
+            : err?.message || 'Connection refused';
+        return NextResponse.json({
+          success: false,
+          vpsReady: false,
+          kronosReady: false,
+          engineStatus: 'offline',
+          statusText: `FAILED (${reason})`,
+          latencyMs,
+          message: `FAILED (${reason}) — Local Quant Engine fallback remains active.`,
+        });
+      }
+    }
+
+    // 4. JUDGE EVALUATION (Called by Forex or Crypto Execution Engine)
     const verdict = await evaluateSetupWithCentralAi({
       symbol: body.symbol || 'BTCUSDT',
       side: body.side || 'BUY',
@@ -343,6 +593,11 @@ export async function POST(req: NextRequest) {
       bbWickSweepPct: body.bbWickSweepPct,
       volumeRatio: body.volumeRatio,
       rsi: body.rsi,
+      pocPrice: body.pocPrice,
+      vahPrice: body.vahPrice,
+      valPrice: body.valPrice,
+      zScore: body.zScore,
+      regime: body.regime,
       vwapDistancePct: body.vwapDistancePct,
       fundingRate: body.fundingRate,
       emaTrend: body.emaTrend,

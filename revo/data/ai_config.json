@@ -1,6 +1,79 @@
 {
-  "baseUrl": "https://integrate.api.nvidia.com/v1",
-  "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
-  "apiKey": "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",
-  "updatedAt": 1792990022383
+  "baseUrl": "http://54.252.135.240:11434/v1",
+  "model": "qwen2.5:3b",
+  "apiKey": "nmssx-vps-key",
+  "providers": [
+    {
+      "id": "anthropic",
+      "name": "Anthropic (Claude Opus / Sonnet)",
+      "baseUrl": "https://api.anthropic.com/v1",
+      "apiKey": "",
+      "model": "claude-sonnet-4-20250514",
+      "enabled": true
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter Gateway",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "apiKey": "",
+      "model": "anthropic/claude-3.7-sonnet",
+      "enabled": true
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "",
+      "model": "gpt-4o",
+      "enabled": true
+    },
+    {
+      "id": "groq",
+      "name": "Groq LPU",
+      "baseUrl": "https://api.groq.com/openai/v1",
+      "apiKey": "",
+      "model": "llama-3.3-70b-versatile",
+      "enabled": true
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "",
+      "model": "deepseek-chat",
+      "enabled": true
+    },
+    {
+      "id": "gemini",
+      "name": "Google Gemini",
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "apiKey": "",
+      "model": "gemini-2.5-flash",
+      "enabled": true
+    },
+    {
+      "id": "custom",
+      "name": "Custom / OpenAI-Compatible Gateway",
+      "baseUrl": "http://54.252.135.240:11434/v1",
+      "apiKey": "nmssx-vps-key",
+      "model": "qwen2.5:3b",
+      "enabled": true,
+      "lastTestedAt": 1794111288180,
+      "lastTestOk": true,
+      "lastLatencyMs": 5575,
+      "lastError": ""
+    }
+  ],
+  "confidenceThreshold": 70,
+  "kronosVpsUrl": "http://129.225.13.35:8000",
+  "kronosApiKey": "nmssx-kronos-secret-2026",
+  "engineSwitches": {
+    "kronosForecaster": true,
+    "multiAiRiskJudge": true,
+    "localEaExecutor": true,
+    "exnessWebSocket": true,
+    "restMutexQueue": true,
+    "emergencyKillSwitch": false
+  },
+  "updatedAt": 1794111300301
 }

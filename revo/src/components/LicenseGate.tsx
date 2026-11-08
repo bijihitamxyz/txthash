@@ -1,17 +1,18 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import Link from 'next/link';
+import { InstitutionalFooter, ThemeToggle } from './InstitutionalChrome';
 import {
   ShieldCheck,
-  ShieldAlert,
-  Lock,
-  Key,
-  ExternalLink,
+  KeyRound,
   Loader2,
   AlertCircle,
-  Sparkles,
-  Send,
+  CheckCircle2,
+  UserPlus,
+  Copy,
+  Check,
+  ClipboardPaste,
+  ArrowRight,
   X,
 } from 'lucide-react';
 
@@ -54,61 +55,81 @@ export function calculateRemainingDays(expiresAt: string): number {
   return Math.ceil(diffMs / (1000 * 60 * 60 * 24));
 }
 
+function buildValidatedLicense(data: any, fallbackKey: string): LicenseInfo {
+  const teleHandle = data.telegram
+    ? data.telegram.startsWith('@')
+      ? data.telegram
+      : `@${data.telegram}`
+    : data.username?.startsWith('@')
+    ? data.username
+    : `@${data.username || 'trader'}`;
+
+  return {
+    valid: true,
+    licenseKey: data.licenseKey || fallbackKey,
+    username: data.username || teleHandle,
+    telegram: teleHandle,
+    email: data.email,
+    duration: data.duration === '30d' ? '30d' : '7d',
+    expiresAt: data.expiresAt,
+    createdAt: data.createdAt,
+    status: data.status || 'ACTIVE',
+  };
+}
+
 export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [license, setLicense] = useState<LicenseInfo | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [authTab, setAuthTab] = useState<'LOGIN' | 'REGISTER'>('LOGIN');
+
+  // Login via Key state
   const [inputKey, setInputKey] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [isContactModalOpen, setIsContactModalOpen] = useState(false);
 
-  const reverify = useCallback(async (keyToVerify?: string): Promise<boolean> => {
-    const key = keyToVerify || license?.licenseKey;
-    if (!key) return false;
+  // User Registration state
+  const [regUsername, setRegUsername] = useState('');
+  const [regTelegram, setRegTelegram] = useState('');
+  const [regEmail, setRegEmail] = useState('');
+  const [regDuration, setRegDuration] = useState<'7d' | '30d'>('30d');
+  const [registeredLicense, setRegisteredLicense] = useState<LicenseInfo | null>(null);
+  const [copiedKey, setCopiedKey] = useState(false);
 
-    try {
-      const res = await fetch('/api/license/verify', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ licenseKey: key }),
-      });
+  const reverify = useCallback(
+    async (keyToVerify?: string): Promise<boolean> => {
+      const key = keyToVerify || license?.licenseKey;
+      if (!key) return false;
 
-      const data = await res.json();
-      if (res.ok && data.valid) {
-        const teleHandle = data.telegram
-          ? (data.telegram.startsWith('@') ? data.telegram : `@${data.telegram}`)
-          : (data.username?.startsWith('@') ? data.username : `@${data.username || 'user'}`);
+      try {
+        const res = await fetch('/api/license/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ licenseKey: key }),
+        });
 
-        const validatedLicense: LicenseInfo = {
-          valid: true,
-          licenseKey: data.licenseKey || key,
-          username: teleHandle,
-          telegram: teleHandle,
-          email: data.email,
-          duration: data.duration || '7d',
-          expiresAt: data.expiresAt,
-          createdAt: data.createdAt,
-          status: data.status || 'ACTIVE',
-        };
-        setLicense(validatedLicense);
-        if (typeof window !== 'undefined') {
-          localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(validatedLicense));
+        const data = await res.json();
+        if (res.ok && data.valid) {
+          const validatedLicense = buildValidatedLicense(data, key);
+          setLicense(validatedLicense);
+          if (typeof window !== 'undefined') {
+            localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(validatedLicense));
+          }
+          return true;
+        } else {
+          if (typeof window !== 'undefined') {
+            localStorage.removeItem(LOCAL_STORAGE_KEY);
+          }
+          setLicense(null);
+          setErrorMessage(data.message || 'Access key is invalid, revoked, or expired.');
+          return false;
         }
-        return true;
-      } else {
-        // License invalid or expired
-        if (typeof window !== 'undefined') {
-          localStorage.removeItem(LOCAL_STORAGE_KEY);
-        }
-        setLicense(null);
-        setErrorMessage(data.message || 'Lisensi tidak valid atau telah kadaluarsa.');
+      } catch {
+        setErrorMessage('Unable to reach license verification service. Check connection.');
         return false;
       }
-    } catch {
-      setErrorMessage('Gagal menghubungi server lisensi. Silakan periksa koneksi.');
-      return false;
-    }
-  }, [license?.licenseKey]);
+    },
+    [license?.licenseKey]
+  );
 
   // Initial check on mount
   useEffect(() => {
@@ -130,7 +151,6 @@ export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children 
           return;
         }
 
-        // Verify with server
         const isValid = await reverify(parsed.licenseKey);
         if (!isValid && isMounted) {
           localStorage.removeItem(LOCAL_STORAGE_KEY);
@@ -153,12 +173,12 @@ export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [reverify]);
 
-  const handleActivate = async (e?: React.FormEvent) => {
+  const handleActivate = async (e?: React.FormEvent, explicitKey?: string) => {
     if (e) e.preventDefault();
-    const cleanKey = inputKey.trim().toUpperCase();
+    const cleanKey = (explicitKey ?? inputKey).trim().toUpperCase();
 
     if (!cleanKey) {
-      setErrorMessage('Masukkan License Key Anda.');
+      setErrorMessage('Please enter your NMSSx Access Key.');
       return;
     }
 
@@ -175,35 +195,86 @@ export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children 
       const data = await res.json();
 
       if (res.ok && data.valid) {
-        const teleHandle = data.telegram
-          ? (data.telegram.startsWith('@') ? data.telegram : `@${data.telegram}`)
-          : (data.username?.startsWith('@') ? data.username : `@${data.username || 'user'}`);
-
-        const newLicense: LicenseInfo = {
-          valid: true,
-          licenseKey: data.licenseKey || cleanKey,
-          username: teleHandle,
-          telegram: teleHandle,
-          email: data.email,
-          duration: data.duration || '7d',
-          expiresAt: data.expiresAt,
-          createdAt: data.createdAt,
-          status: data.status || 'ACTIVE',
-        };
-
+        const newLicense = buildValidatedLicense(data, cleanKey);
         setLicense(newLicense);
         if (typeof window !== 'undefined') {
           localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(newLicense));
         }
         setInputKey('');
       } else {
-        setErrorMessage(data.message || 'License Key tidak ditemukan atau tidak aktif.');
+        setErrorMessage(data.message || 'Access key was not found or is inactive.');
       }
     } catch {
-      setErrorMessage('Terjadi kesalahan koneksi server saat memverifikasi lisensi.');
+      setErrorMessage('Network error while verifying access key.');
     } finally {
       setIsSubmitting(false);
     }
+  };
+
+  const handleRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanUser = regUsername.trim();
+    if (cleanUser.length < 2) {
+      setErrorMessage('Username must be at least 2 characters.');
+      return;
+    }
+
+    setIsSubmitting(true);
+    setErrorMessage(null);
+
+    try {
+      const res = await fetch('/api/license/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'REGISTER',
+          username: cleanUser,
+          telegram: regTelegram.trim() || cleanUser,
+          email: regEmail.trim() || undefined,
+          duration: regDuration,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (res.ok && data.valid && data.licenseKey) {
+        const created = buildValidatedLicense(data, data.licenseKey);
+        setRegisteredLicense(created);
+        setInputKey(created.licenseKey);
+      } else {
+        setErrorMessage(data.message || 'Failed to register new access key.');
+      }
+    } catch {
+      setErrorMessage('Network error while registering access key.');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleEnterWithRegisteredKey = () => {
+    if (!registeredLicense) return;
+    setLicense(registeredLicense);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(registeredLicense));
+    }
+  };
+
+  const handleCopyKey = async (keyText: string) => {
+    try {
+      await navigator.clipboard.writeText(keyText);
+      setCopiedKey(true);
+      setTimeout(() => setCopiedKey(false), 2000);
+    } catch {}
+  };
+
+  const handlePasteKey = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        setInputKey(text.trim().toUpperCase());
+        setErrorMessage(null);
+      }
+    } catch {}
   };
 
   const handleLogout = () => {
@@ -211,31 +282,35 @@ export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children 
       localStorage.removeItem(LOCAL_STORAGE_KEY);
     }
     setLicense(null);
+    setRegisteredLicense(null);
     setErrorMessage(null);
   };
 
   const remainingDays = license?.expiresAt ? calculateRemainingDays(license.expiresAt) : 0;
 
-  // Initial loading splash screen
+  // Loading splash screen adapting cleanly to Dark & Light themes
   if (isLoading) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-4">
-        <div className="flex flex-col items-center gap-3 text-slate-400">
-          <div className="relative">
-            <div className="w-12 h-12 rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400">
-              <Key className="w-6 h-6 animate-pulse" />
-            </div>
-            <span className="absolute -top-1 -right-1 w-3 h-3 rounded-full bg-indigo-500 animate-ping" />
+      <div className="min-h-screen bg-[#F8FAFC] dark:bg-slate-950 flex flex-col items-center justify-center p-4 text-[#0F172A] dark:text-slate-100 transition-colors">
+        <div className="bg-white dark:bg-zinc-900 border border-slate-200/90 dark:border-zinc-800 rounded-2xl px-6 py-5 shadow-[0_2px_12px_rgba(15,23,42,0.04)] flex items-center gap-3.5">
+          <div className="w-10 h-10 rounded-xl bg-[#0F172A] dark:bg-zinc-800 dark:border dark:border-zinc-700 text-white dark:text-emerald-400 flex items-center justify-center font-sans font-bold text-xs shrink-0">
+            NX
           </div>
-          <span className="font-mono text-xs tracking-wider text-slate-400 animate-pulse">
-            MEMERIKSA OTENTIKASI LISENSI QUANT...
-          </span>
+          <div className="space-y-0.5">
+            <div className="font-sans font-bold text-sm text-[#0F172A] dark:text-slate-100 flex items-center gap-2">
+              <span>NEMESIS x Trade</span>
+              <Loader2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 animate-spin" />
+            </div>
+            <div className="font-mono text-[11px] text-slate-500 dark:text-slate-400">
+              Verifying institutional terminal access key...
+            </div>
+          </div>
         </div>
       </div>
     );
   }
 
-  // If authenticated, render children with Context
+  // Authenticated: unlock Client Terminal
   if (license && license.valid) {
     return (
       <LicenseContext.Provider
@@ -251,218 +326,350 @@ export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children 
     );
   }
 
-  // Not authenticated: Sleek Dark-Mode Institutional Login Gateway
+  // Unauthenticated: Institutional Login (via Key) & User Registration Gateway
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between selection:bg-indigo-500/30 selection:text-indigo-200">
-      {/* Background Ambient Glows */}
-      <div className="fixed inset-0 pointer-events-none overflow-hidden z-0">
-        <div className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[400px] bg-indigo-600/10 rounded-full blur-[140px]" />
-        <div className="absolute bottom-1/4 left-1/3 w-[500px] h-[300px] bg-emerald-600/5 rounded-full blur-[120px]" />
-      </div>
-
-      {/* Top Bar Branding */}
-      <header className="relative z-10 max-w-7xl mx-auto w-full px-4 py-6 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 to-indigo-400 flex items-center justify-center text-white shadow-lg shadow-indigo-600/20">
-            <Sparkles className="w-5 h-5" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-black text-sm sm:text-base tracking-wider text-slate-100">
-                QUANT AI
-              </span>
-              <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                PRO v3.8
-              </span>
+    <div className="min-h-screen flex flex-col justify-between bg-[#F8FAFC] dark:bg-slate-950 text-[#0F172A] dark:text-slate-100 transition-colors">
+      {/* Top Bar */}
+      <header className="bg-white/95 dark:bg-slate-950/95 backdrop-blur-md border-b border-slate-200/90 dark:border-zinc-800 sticky top-0 z-40">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-[#0F172A] dark:bg-zinc-900 dark:border dark:border-zinc-700 text-white dark:text-emerald-400 flex items-center justify-center font-sans font-bold text-sm shadow-2xs">
+              NX
             </div>
-            <p className="text-[11px] text-slate-400 font-mono">
-              INSTITUTIONAL QUANT TERMINAL (FOREX & CRYPTO)
-            </p>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-sans font-bold text-[#0F172A] dark:text-slate-100 text-sm sm:text-base tracking-tight">
+                  NEMESIS x Trade
+                </span>
+                <span className="font-mono text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-200/80 dark:border-emerald-500/30 font-semibold">
+                  CLIENT ACCESS
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 font-mono hidden sm:block">
+                Exness Forex &amp; Binance Futures Multi-AI Consensus / Risk Governance Terminal
+              </p>
+            </div>
           </div>
-        </div>
 
-        <div className="flex items-center gap-2">
-          <Link
-            href="/admin"
-            className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-slate-200 bg-slate-900/60 hover:bg-slate-800 border border-slate-800 rounded-lg px-3 py-1.5 transition-colors font-mono"
-          >
-            <Lock className="w-3.5 h-3.5 text-slate-400" />
-            <span>Admin Panel</span>
-          </Link>
+          <div className="flex items-center gap-2">
+            <ThemeToggle showLabel />
+          </div>
         </div>
       </header>
 
-      {/* Main Login Card Section */}
-      <main className="relative z-10 flex-1 flex items-center justify-center px-4 py-8">
-        <div className="w-full max-w-md">
-          <div className="bg-slate-900/90 border border-slate-800/80 rounded-2xl p-6 sm:p-8 shadow-2xl backdrop-blur-xl">
-            {/* Card Emblem & Title */}
-            <div className="flex flex-col items-center text-center mb-6">
-              <div className="w-14 h-14 rounded-2xl bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center text-indigo-400 mb-4 shadow-inner">
-                <Key className="w-7 h-7 text-indigo-400" />
+      {/* Main Authentication Card */}
+      <main className="flex-1 flex items-center justify-center px-4 py-10">
+        <div className="w-full max-w-md bg-white dark:bg-zinc-900/95 border border-slate-200/90 dark:border-zinc-800 rounded-2xl p-6 sm:p-7 shadow-[0_4px_24px_rgba(15,23,42,0.05)] dark:shadow-black/40 space-y-5">
+          {/* Header */}
+          <div className="flex items-start justify-between gap-3">
+            <div className="space-y-1">
+              <div className="inline-flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider px-2 py-0.5 rounded bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-slate-300 font-semibold">
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                <span>ZERO-TRUST KEY AUTHENTICATION</span>
               </div>
-              <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-white mb-1.5">
-                License Key Activation
+              <h1 className="font-sans font-bold text-xl text-[#0F172A] dark:text-slate-100 tracking-tight">
+                {authTab === 'LOGIN' ? 'Client Terminal Login' : 'Register Access Key'}
               </h1>
-              <p className="text-xs sm:text-sm text-slate-400 max-w-xs leading-relaxed">
-                Masukkan kunci lisensi Quant AI Anda untuk membuka workspace Forex &amp; Crypto.
+              <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+                {authTab === 'LOGIN'
+                  ? 'Enter your provisioned access key to unlock Forex (Exness) & Crypto (Binance) execution.'
+                  : 'Register your trader profile to generate an instant terminal access key.'}
               </p>
             </div>
+            <div className="w-11 h-11 rounded-2xl bg-slate-50 dark:bg-zinc-800 border border-slate-200/90 dark:border-zinc-700 flex items-center justify-center text-[#0F172A] shrink-0">
+              {authTab === 'LOGIN' ? (
+                <KeyRound className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
+              ) : (
+                <UserPlus className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
+              )}
+            </div>
+          </div>
 
-            {/* Error Alert Box */}
-            {errorMessage && (
-              <div className="mb-5 p-3.5 rounded-xl bg-rose-950/60 border border-rose-800/80 flex items-start gap-2.5 text-rose-300 text-xs sm:text-sm animate-in fade-in duration-200">
-                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-                <div className="flex-1">
-                  <p className="font-medium">{errorMessage}</p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setErrorMessage(null)}
-                  className="text-rose-400 hover:text-rose-200"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            )}
+          {/* Mode Tabs: Login via Key | Register Access Key */}
+          <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-slate-100 dark:bg-slate-950 border border-slate-200/80 dark:border-zinc-800 font-mono text-xs">
+            <button
+              type="button"
+              onClick={() => {
+                setAuthTab('LOGIN');
+                setErrorMessage(null);
+              }}
+              className={`py-2 px-3 rounded-lg font-semibold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                authTab === 'LOGIN'
+                  ? 'bg-[#0F172A] dark:bg-emerald-600 text-white shadow-2xs'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100'
+              }`}
+            >
+              <KeyRound className="w-3.5 h-3.5" />
+              <span>Login via Key</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAuthTab('REGISTER');
+                setErrorMessage(null);
+              }}
+              className={`py-2 px-3 rounded-lg font-semibold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                authTab === 'REGISTER'
+                  ? 'bg-[#0F172A] dark:bg-emerald-600 text-white shadow-2xs'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100'
+              }`}
+            >
+              <UserPlus className="w-3.5 h-3.5" />
+              <span>Register</span>
+            </button>
+          </div>
 
-            {/* License Activation Form */}
-            <form onSubmit={handleActivate} className="space-y-4">
-              <div>
-                <label className="block text-xs font-mono font-medium text-slate-300 mb-2">
-                  LICENSE KEY <span className="text-indigo-400">*</span>
-                </label>
-                <div className="relative">
-                  <input
-                    type="text"
-                    value={inputKey}
-                    onChange={(e) => setInputKey(e.target.value.toUpperCase())}
-                    placeholder="EQ-7D-XXXX-XXXX atau EQ-30D-XXXX-XXXX"
-                    disabled={isSubmitting}
-                    className="w-full bg-slate-950/90 border border-slate-700/80 rounded-xl px-4 py-3 font-mono text-center text-sm sm:text-base tracking-widest text-indigo-300 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition-all uppercase"
-                    autoFocus
-                  />
-                  <div className="absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none text-slate-600">
-                    <ShieldCheck className="w-4 h-4" />
-                  </div>
+          {/* Error Banner */}
+          {errorMessage && (
+            <div className="p-3 rounded-xl bg-rose-50 dark:bg-rose-500/15 border border-rose-200 dark:border-rose-500/30 flex items-start gap-2.5 text-rose-700 dark:text-rose-300 text-xs">
+              <AlertCircle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+              <span className="flex-1 font-medium">{errorMessage}</span>
+              <button
+                type="button"
+                onClick={() => setErrorMessage(null)}
+                className="text-rose-400 hover:text-rose-700 dark:hover:text-rose-200 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          {/* TAB 1: LOGIN VIA KEY */}
+          {authTab === 'LOGIN' && (
+            <form onSubmit={(e) => handleActivate(e)} className="space-y-4">
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="font-mono text-[11px] uppercase tracking-wider font-semibold text-slate-600 dark:text-slate-300">
+                    ACCESS KEY <span className="text-emerald-600 dark:text-emerald-400">*</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handlePasteKey}
+                    className="inline-flex items-center gap-1 font-mono text-[11px] text-slate-500 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer"
+                  >
+                    <ClipboardPaste className="w-3 h-3" />
+                    <span>Paste</span>
+                  </button>
                 </div>
-                <p className="mt-1.5 text-[11px] text-slate-500 font-mono">
-                  Format: EQ-7D-XXXX-XXXX / EQ-30D-XXXX-XXXX
+                <input
+                  type="text"
+                  value={inputKey}
+                  onChange={(e) => setInputKey(e.target.value.toUpperCase())}
+                  placeholder="EQ-30D-XXXX-XXXX"
+                  disabled={isSubmitting}
+                  className="w-full bg-[#F8FAFC] dark:bg-slate-950 border border-slate-200 dark:border-zinc-700 rounded-xl px-4 py-3 font-mono text-center text-sm tracking-widest font-bold text-[#0F172A] dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-zinc-500 focus:outline-none focus:bg-white dark:focus:bg-slate-950 focus:border-[#0F172A] dark:focus:border-emerald-500 transition-all uppercase"
+                  autoFocus
+                />
+                <p className="text-[11px] text-slate-400 dark:text-zinc-500 font-mono">
+                  Format: EQ-7D-XXXX-XXXX or EQ-30D-XXXX-XXXX
                 </p>
               </div>
 
               <button
                 type="submit"
                 disabled={isSubmitting || !inputKey.trim()}
-                className="w-full bg-gradient-to-r from-indigo-600 via-indigo-500 to-indigo-600 hover:from-indigo-500 hover:to-indigo-400 text-white font-semibold text-sm py-3.5 px-4 rounded-xl shadow-lg shadow-indigo-600/25 transition-all duration-150 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                className="w-full bg-[#0F172A] dark:bg-emerald-600 hover:bg-[#1E293B] dark:hover:bg-emerald-500 text-white font-sans font-bold text-xs sm:text-sm py-3.5 px-4 rounded-xl shadow-xs transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
               >
                 {isSubmitting ? (
                   <>
-                    <Loader2 className="w-4 h-4 animate-spin text-white" />
-                    <span>Memverifikasi Lisensi...</span>
+                    <Loader2 className="w-4 h-4 animate-spin text-emerald-400 dark:text-white" />
+                    <span>Verifying Key...</span>
                   </>
                 ) : (
                   <>
-                    <ShieldCheck className="w-4 h-4" />
-                    <span>Activate & Enter Terminal</span>
+                    <ShieldCheck className="w-4 h-4 text-emerald-400 dark:text-white" />
+                    <span>Unlock Client Terminal</span>
                   </>
                 )}
               </button>
-            </form>
 
-            {/* Quick Demo Key Helper Note */}
-            <div className="mt-5 pt-5 border-t border-slate-800/80 flex flex-col gap-2 text-center">
-              <button
-                type="button"
-                onClick={() => setIsContactModalOpen(true)}
-                className="text-xs text-indigo-400 hover:text-indigo-300 transition-colors font-medium cursor-pointer inline-flex items-center justify-center gap-1.5"
-              >
-                <Send className="w-3.5 h-3.5" />
-                <span>Belum punya lisensi? Hubungi Admin / Beli Lisensi</span>
-              </button>
+              <div className="pt-2 border-t border-slate-100 dark:border-zinc-800 text-center">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthTab('REGISTER');
+                    setErrorMessage(null);
+                  }}
+                  className="text-xs font-mono text-slate-500 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-200 cursor-pointer"
+                >
+                  Need an access key?{' '}
+                  <strong className="text-emerald-700 dark:text-emerald-400 underline underline-offset-4">
+                    Register new key
+                  </strong>
+                </button>
+              </div>
+            </form>
+          )}
+
+          {/* TAB 2: USER REGISTRATION */}
+          {authTab === 'REGISTER' && (
+            <div className="space-y-4">
+              {registeredLicense ? (
+                <div className="space-y-4">
+                  <div className="p-4 rounded-xl bg-emerald-50/80 dark:bg-emerald-500/15 border border-emerald-200 dark:border-emerald-500/30 space-y-3">
+                    <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-300 font-sans font-bold text-xs">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                      <span>Access Key Registered &amp; Stored</span>
+                    </div>
+
+                    <div className="bg-white dark:bg-slate-950 border border-emerald-200 dark:border-emerald-500/30 rounded-xl p-3 flex items-center justify-between gap-2">
+                      <span className="font-mono text-sm font-bold tracking-wider text-[#0F172A] dark:text-slate-100 select-all">
+                        {registeredLicense.licenseKey}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleCopyKey(registeredLicense.licenseKey)}
+                        className="px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 text-xs font-mono font-semibold text-[#0F172A] dark:text-slate-100 flex items-center gap-1 cursor-pointer shrink-0"
+                      >
+                        {copiedKey ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                            <span>Copied</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>Copy</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2 text-[11px] font-mono text-slate-600 dark:text-slate-300">
+                      <div>
+                        Trader:{' '}
+                        <strong className="text-[#0F172A] dark:text-white">
+                          {registeredLicense.username}
+                        </strong>
+                      </div>
+                      <div className="text-right">
+                        Tier:{' '}
+                        <strong className="text-emerald-700 dark:text-emerald-400">
+                          {registeredLicense.duration.toUpperCase()}
+                        </strong>
+                      </div>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleEnterWithRegisteredKey}
+                    className="w-full bg-[#0F172A] dark:bg-emerald-600 hover:bg-[#1E293B] dark:hover:bg-emerald-500 text-white font-sans font-bold text-xs sm:text-sm py-3.5 px-4 rounded-xl shadow-xs transition-all flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <span>Activate &amp; Enter Client Terminal</span>
+                    <ArrowRight className="w-4 h-4 text-emerald-400 dark:text-white" />
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setRegisteredLicense(null)}
+                    className="w-full text-xs font-mono text-slate-500 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100 py-1 cursor-pointer"
+                  >
+                    Register another key
+                  </button>
+                </div>
+              ) : (
+                <form onSubmit={handleRegister} className="space-y-3.5">
+                  <div className="space-y-1">
+                    <label className="block font-mono text-[11px] uppercase tracking-wider font-semibold text-slate-600 dark:text-slate-300">
+                      USERNAME <span className="text-emerald-600 dark:text-emerald-400">*</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={regUsername}
+                      onChange={(e) => setRegUsername(e.target.value)}
+                      placeholder="e.g. quant_trader"
+                      required
+                      disabled={isSubmitting}
+                      className="w-full bg-[#F8FAFC] dark:bg-slate-950 border border-slate-200 dark:border-zinc-700 rounded-xl px-3.5 py-2.5 font-mono text-xs text-[#0F172A] dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-zinc-500 focus:outline-none focus:bg-white dark:focus:bg-slate-950 focus:border-[#0F172A] dark:focus:border-emerald-500"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <label className="block font-mono text-[11px] uppercase tracking-wider font-semibold text-slate-600 dark:text-slate-300">
+                        TELEGRAM HANDLE
+                      </label>
+                      <input
+                        type="text"
+                        value={regTelegram}
+                        onChange={(e) => setRegTelegram(e.target.value)}
+                        placeholder="@username"
+                        disabled={isSubmitting}
+                        className="w-full bg-[#F8FAFC] dark:bg-slate-950 border border-slate-200 dark:border-zinc-700 rounded-xl px-3.5 py-2.5 font-mono text-xs text-[#0F172A] dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-zinc-500 focus:outline-none focus:bg-white dark:focus:bg-slate-950 focus:border-[#0F172A] dark:focus:border-emerald-500"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="block font-mono text-[11px] uppercase tracking-wider font-semibold text-slate-600 dark:text-slate-300">
+                        EMAIL (OPTIONAL)
+                      </label>
+                      <input
+                        type="email"
+                        value={regEmail}
+                        onChange={(e) => setRegEmail(e.target.value)}
+                        placeholder="trader@domain.com"
+                        disabled={isSubmitting}
+                        className="w-full bg-[#F8FAFC] dark:bg-slate-950 border border-slate-200 dark:border-zinc-700 rounded-xl px-3.5 py-2.5 font-mono text-xs text-[#0F172A] dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-zinc-500 focus:outline-none focus:bg-white dark:focus:bg-slate-950 focus:border-[#0F172A] dark:focus:border-emerald-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="block font-mono text-[11px] uppercase tracking-wider font-semibold text-slate-600 dark:text-slate-300">
+                      ACCESS KEY DURATION
+                    </label>
+                    <div className="grid grid-cols-2 gap-2 font-mono text-xs">
+                      <button
+                        type="button"
+                        onClick={() => setRegDuration('7d')}
+                        className={`py-2.5 px-3 rounded-xl border font-semibold transition-all cursor-pointer ${
+                          regDuration === '7d'
+                            ? 'bg-[#0F172A] dark:bg-emerald-600 text-white border-[#0F172A] dark:border-emerald-600'
+                            : 'bg-[#F8FAFC] dark:bg-slate-950 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800'
+                        }`}
+                      >
+                        7 Days (EQ-7D)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRegDuration('30d')}
+                        className={`py-2.5 px-3 rounded-xl border font-semibold transition-all cursor-pointer ${
+                          regDuration === '30d'
+                            ? 'bg-[#0F172A] dark:bg-emerald-600 text-white border-[#0F172A] dark:border-emerald-600'
+                            : 'bg-[#F8FAFC] dark:bg-slate-950 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700 hover:bg-slate-100 dark:hover:bg-zinc-800'
+                        }`}
+                      >
+                        30 Days (EQ-30D)
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={isSubmitting || regUsername.trim().length < 2}
+                    className="w-full bg-[#0F172A] dark:bg-emerald-600 hover:bg-[#1E293B] dark:hover:bg-emerald-500 text-white font-sans font-bold text-xs sm:text-sm py-3.5 px-4 rounded-xl shadow-xs transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer"
+                  >
+                    {isSubmitting ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin text-emerald-400 dark:text-white" />
+                        <span>Provisioning Access Key...</span>
+                      </>
+                    ) : (
+                      <>
+                        <UserPlus className="w-4 h-4 text-emerald-400 dark:text-white" />
+                        <span>Generate &amp; Register Access Key</span>
+                      </>
+                    )}
+                  </button>
+                </form>
+              )}
             </div>
-          </div>
+          )}
         </div>
       </main>
 
-      {/* Footer Details */}
-      <footer className="relative z-10 max-w-7xl mx-auto w-full px-4 py-5 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500 font-mono">
-        <div>
-          <span>Exness Quant AI Trading System • Enterprise Edition</span>
-        </div>
-        <div className="flex items-center gap-4">
-          <Link href="/admin" className="hover:text-indigo-400 transition-colors">
-            Admin Management (/admin)
-          </Link>
-          <span>•</span>
-          <span className="text-emerald-500/80 flex items-center gap-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-            Gateway Online
-          </span>
-        </div>
-      </footer>
-
-      {/* Modal: Contact Admin / Buy License */}
-      {isContactModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-150">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl relative">
-            <button
-              onClick={() => setIsContactModalOpen(false)}
-              className="absolute top-4 right-4 text-slate-400 hover:text-white p-1 rounded-lg hover:bg-slate-800"
-            >
-              <X className="w-5 h-5" />
-            </button>
-
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-10 h-10 rounded-xl bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
-                <Send className="w-5 h-5" />
-              </div>
-              <div>
-                <h3 className="text-base font-bold text-white">Hubungi Admin Lisensi</h3>
-                <p className="text-xs text-slate-400">Dapatkan lisensi instan 7 Hari atau 30 Hari</p>
-              </div>
-            </div>
-
-            <div className="space-y-3 my-4 text-xs sm:text-sm text-slate-300 leading-relaxed bg-slate-950/60 p-4 rounded-xl border border-slate-800/80">
-              <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-                <span className="text-slate-400 font-mono">Telegram Official:</span>
-                <span className="font-bold text-indigo-300 font-mono">@viptrader_pro</span>
-              </div>
-              <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-                <span className="text-slate-400 font-mono">Paket 7 Hari:</span>
-                <span className="font-semibold text-emerald-400">Trial / Scalper Pass</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-slate-400 font-mono">Paket 30 Hari:</span>
-                <span className="font-semibold text-indigo-400">Enterprise VIP Pass</span>
-              </div>
-            </div>
-
-            <p className="text-xs text-slate-400 mb-5">
-              Hubungi Telegram kami dengan menyebutkan username Anda untuk aktivasi instan tanpa menunggu.
-            </p>
-
-            <div className="flex items-center gap-2">
-              <a
-                href="https://t.me"
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs sm:text-sm py-2.5 px-4 rounded-xl text-center flex items-center justify-center gap-2 transition-colors"
-              >
-                <Send className="w-4 h-4" />
-                <span>Buka Telegram Admin</span>
-              </a>
-              <button
-                type="button"
-                onClick={() => setIsContactModalOpen(false)}
-                className="px-4 py-2.5 text-xs text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-xl transition-colors"
-              >
-                Tutup
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <InstitutionalFooter />
     </div>
   );
 };

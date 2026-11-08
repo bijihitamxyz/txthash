@@ -1,4 +1,4 @@
-# Exness Quant AI Auto-Trader (Forex & Gold)
+# NEMESIS X — Quant AI Auto-Trader (Forex, Gold & Crypto)
 
 A production-ready, modular **Forex & Gold Automated Trading Web Application** built with **Next.js (App Router), TypeScript, TailwindCSS, and Zustand**.
 

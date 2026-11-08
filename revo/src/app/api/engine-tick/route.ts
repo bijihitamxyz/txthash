@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { ExnessClient, realTimeFeed } from '@/core/exnessClient';
 import { getPairProfile, SUPPORTED_SYMBOLS, calculatePnL, evaluatePositionPnL } from '@/core/pairConfig';
 import { evaluateSignalGates } from '@/core/signalGate';
-import { evaluateWithAi, AiConfig, DEFAULT_AI_CONFIG } from '@/core/aiJudge';
+import { evaluateMultiAiConsensus, AiConfig } from '@/core/aiJudge';
 import { evaluatePositionTrailing, ManagedPosition } from '@/core/trailingManager';
 import {
   evaluatePreTradeRisk,
@@ -15,7 +15,14 @@ import {
 import { stateSync, TargetMarket } from '@/lib/stateSync';
 import { ensureSchedulerStarted } from '@/lib/engineScheduler';
 import { getActiveExnessCredentials } from '@/lib/cryptoVault';
-import { readCentralAiConfig } from '@/app/api/ai/judge/route';
+import {
+  readCentralAiConfig,
+  getActiveAiProviders,
+  formatActiveAiSummaryLabel,
+} from '@/core/centralAiConfig';
+import { loadVaultCredentials } from '@/core/exnessVault';
+import { computeRealTimeKronosForecast } from '@/core/kronosService';
+import { Timeframe } from '@/core/indicatorEngine';
 
 export const dynamic = 'force-dynamic';
 
@@ -28,11 +35,11 @@ function sanitizeRuntimeState(state: any) {
       demoAccountId: state.credentials.demoAccountId,
       demoServer: state.credentials.demoServer,
       demoApiKey: state.credentials.demoApiKey ? '••••••••' : '',
-      demoInitialBalance: state.credentials.demoInitialBalance ?? 100.0,
+      demoInitialBalance: state.credentials.demoInitialBalance ?? 0,
       realAccountId: state.credentials.realAccountId,
       realServer: state.credentials.realServer,
       realApiKey: state.credentials.realApiKey ? '••••••••' : '',
-      realInitialBalance: state.credentials.realInitialBalance ?? 100.0,
+      realInitialBalance: state.credentials.realInitialBalance ?? 0,
       aiProvider: state.credentials.aiProvider,
       aiBaseUrl: state.credentials.aiBaseUrl,
       aiModel: state.credentials.aiModel,
@@ -99,13 +106,8 @@ export async function POST(req: NextRequest) {
     const runtimeState = await stateSync.getRuntimeState();
     const activeCreds = getActiveExnessCredentials(runtimeState.credentials);
 
-    const credentials = body.credentials || {
-      accountId: activeCreds.accountId,
-      server: activeCreds.server,
-      token: activeCreds.apiKey,
-      password: activeCreds.password || activeCreds.apiKey,
-      initialBalance: activeCreds.initialBalance,
-    };
+    // Exness credentials are ALWAYS loaded from the server-side AES vault (contains Ed25519 private key).
+    const vaultCreds = await loadVaultCredentials();
 
     const effectiveMarket = body.targetMarket || runtimeState.targetMarket || 'GOLD';
     let symbols: string[];
@@ -118,11 +120,12 @@ export async function POST(req: NextRequest) {
     }
 
     // Immediately synchronize client configuration changes to runtime state
-    if (body.targetMarket || body.orderVolume !== undefined || body.symbols) {
+    if (body.targetMarket || body.orderVolume !== undefined || body.enablePartialClose !== undefined || body.symbols) {
       await stateSync.updateRuntimeState({
         targetMarket: effectiveMarket,
         scannedSymbols: symbols,
         ...(body.orderVolume !== undefined ? { lotSize: body.orderVolume } : {}),
+        ...(body.enablePartialClose !== undefined ? { enablePartialClose: body.enablePartialClose } : {}),
       });
     }
 
@@ -132,46 +135,75 @@ export async function POST(req: NextRequest) {
 
     const mergedRisk: RiskGuardConfig = { ...DEFAULT_RISK_CONFIG, ...body.riskConfig };
     const centralAi = await readCentralAiConfig();
-    const mergedAi: AiConfig = {
-      ...DEFAULT_AI_CONFIG,
-      baseUrl: body.aiConfig?.baseUrl || centralAi.baseUrl || runtimeState.credentials.aiBaseUrl || DEFAULT_AI_CONFIG.baseUrl,
-      apiKey: body.aiConfig?.apiKey || centralAi.apiKey || runtimeState.credentials.aiApiKey || '',
-      model: body.aiConfig?.model || centralAi.model || runtimeState.credentials.aiModel || DEFAULT_AI_CONFIG.model,
-      confidenceThreshold: runtimeState.aiConfidenceThreshold || 70,
-      ...body.aiConfig,
-    };
+    const activeAiProviders = getActiveAiProviders(centralAi);
+    const activeAiSummaryLabel = formatActiveAiSummaryLabel(centralAi);
+    const effectiveAiThreshold = centralAi.confidenceThreshold ?? runtimeState.aiConfidenceThreshold ?? 70;
 
-    const client = new ExnessClient(credentials);
+    if (centralAi.engineSwitches?.emergencyKillSwitch) {
+      log('SYSTEM', 'RISK', '[ADMIN KILL-SWITCH] Emergency Halt is active in Admin Dashboard. Skipping execution cycle.');
+      return NextResponse.json({
+        ok: false,
+        success: false,
+        circuitBreakerTriggered: true,
+        error: 'Emergency Kill-Switch active via Admin Governance.',
+        telemetry: telemetryLogs,
+        positions: runtimeState.positions || [],
+        orders: [],
+      }, { status: 200 });
+    }
+
+    if (!vaultCreds) {
+      return NextResponse.json({
+        ok: false,
+        success: false,
+        error: 'Akun Exness belum terhubung. Engine tidak akan trading tanpa kredensial Exness asli.',
+        telemetry: telemetryLogs,
+        positions: [],
+        orders: [],
+      }, { status: 200 });
+    }
+    const client = new ExnessClient(vaultCreds);
 
     let validSymbols = symbols.filter((s) => SUPPORTED_SYMBOLS.includes(s));
     if (validSymbols.length === 0) {
       validSymbols = ['XAUUSDm'];
     }
 
+    // Authoritative open positions are ALWAYS read from Exness (never from the browser / local cache).
+    let currentPositions: ManagedPosition[];
+    try {
+      currentPositions = await client.fetchOpenPositions();
+    } catch (err: any) {
+      log('SYSTEM', 'RISK', `Gagal membaca posisi dari Exness: ${err?.message || err}. Tick dilewati.`);
+      return NextResponse.json({
+        ok: false,
+        success: false,
+        error: String(err?.message || err),
+        telemetry: telemetryLogs,
+        positions: [],
+        orders: [],
+      }, { status: 200 });
+    }
+
     // When auto-trading is stopped, HALT scanning but NEVER purge active open positions!
-    // Existing positions remain active and managed by trailing stop/TP/SL.
     if (!runtimeState.isAutoTrading) {
-      const retainedPositions = Array.isArray(body.activePositions) ? body.activePositions : (runtimeState.positions || []);
       return NextResponse.json({
         ok: true,
         success: true,
         circuitBreakerTriggered: false,
         telemetry: telemetryLogs,
-        positions: retainedPositions,
+        positions: currentPositions,
         orders: [],
       }, { status: 200 });
     }
 
-    // Client-side Zustand store is the single source of truth for active positions in Demo mode.
-    // If client passes activePositions (including empty array []), respect it and NEVER resurrect stale server positions!
-    const currentPositions: ManagedPosition[] = Array.isArray(body.activePositions)
-      ? body.activePositions
-      : (runtimeState.positions || []);
-
     const updatedPositions: ManagedPosition[] = [...currentPositions];
     const newOrdersPlaced: any[] = [];
     const closedTrades: { id: string; symbol: string; pnl: number; reason: string }[] = [];
-    const dailyLoss = body.dailyRealizedLossUsd ?? runtimeState.dailyRealizedLossUsd ?? 0;
+    const dailyLoss = Math.max(
+      Number(runtimeState.dailyRealizedLossUsd || 0),
+      Math.max(0, -realTimeFeed.getDailyRealizedPnL())
+    );
 
     for (const symbol of validSymbols) {
       // Enforce targetMarket strictly: if targetMarket === 'GOLD', restricted to XAUUSDm only
@@ -181,12 +213,6 @@ export async function POST(req: NextRequest) {
       // In Both Simultaneously mode, capture symbolSnapshot scoped to this specific pair
       const symbolSnapshot = symbol;
       const profile = getPairProfile(symbolSnapshot);
-
-      // Diagnostic synthetic signal injection
-      if (body.syntheticSignal && body.syntheticSignal.symbol === symbolSnapshot) {
-        realTimeFeed.injectSyntheticSignal(symbolSnapshot, body.syntheticSignal.side);
-        log(symbolSnapshot, 'INFO', `Synthetic ${body.syntheticSignal.side} snap-back candle injected for diagnosis`);
-      }
 
       // Read pre-AI quote strictly scoped to symbolSnapshot
       const quote = await client.getSymbolQuote(symbolSnapshot);
@@ -213,17 +239,12 @@ export async function POST(req: NextRequest) {
         const isBuy = pos.side === 'BUY';
         const curPrice = isBuy ? quote.bid : quote.ask;
 
-        // Anomalous Tick Guard (>50 pips in 5s) & 2% Price Deviation Guard:
-        // Never evaluate SL, TP, Partial Close, or Trailing Stop if quote is anomalous or corrupted
+        // Extreme Price Deviation Guard (> 15% jump):
+        // Prevents corrupted 0/NaN or mismatched quotes from triggering SL/TP prematurely
         const previousValidPrice = pos.currentPrice || pos.entryPrice;
         if (previousValidPrice > 0) {
-          const pipsDiff = Math.abs(curPrice - previousValidPrice) / profile.pipValue;
-          if (pipsDiff > 50) {
-            log(symbolSnapshot, 'RISK', `[AnomalousTickGuard] Discarding tick for #${pos.id}: quote price ${curPrice} jumps ${pipsDiff.toFixed(1)} pips (> 50 pips) from previous ${previousValidPrice}. Skipping position update.`);
-            continue;
-          }
           const deviation = Math.abs(curPrice - previousValidPrice) / previousValidPrice;
-          if (deviation > 0.02) {
+          if (deviation > 0.15) {
             log(symbolSnapshot, 'RISK', `[PositionPriceGuard] Skipping SL/TP/Trailing evaluation for #${pos.id}: quote price ${curPrice} differs by ${(deviation * 100).toFixed(1)}% from previous valid price ${previousValidPrice}`);
             continue;
           }
@@ -393,22 +414,52 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // 6. Gate 3: AI Confluence Judge with 6.0s Quantitative Fallback
+      // 6. Gate 3: Multi-AI Confluence Judge + Kronos VPS Forecast with 6.0s Quantitative Fallback
       if (!signalResult.technicalSnapshot) {
         continue;
       }
 
-      log(symbolSnapshot, 'AI', `[AI JUDGE] Evaluating ${signalResult.setupName || signalResult.signalType} (${mergedAi.model}) [6.0s timeout]...`);
-      const aiVerdict = await evaluateWithAi(signalResult.technicalSnapshot, mergedAi);
+      const kronosForecast = computeRealTimeKronosForecast({
+        symbol: symbolSnapshot,
+        timeframe: (timeframe as Timeframe) || 'M5',
+        candles,
+        aiModel: activeAiSummaryLabel,
+      });
+
+      log(
+        symbolSnapshot,
+        'SIGNAL',
+        `[KRONOS VPS] ${symbolSnapshot} (${timeframe}) Bullish: ${kronosForecast.bullishPct}% | POC: ${kronosForecast.pocPrice} | VAH: ${kronosForecast.vahPrice} | VAL: ${kronosForecast.valPrice} | Z: ${kronosForecast.zScore} (${kronosForecast.regime})`
+      );
+
+      if (activeAiProviders.length === 0) {
+        log(symbolSnapshot, 'AI', `[MULTI-AI CONSENSUS] Kronos Quantitative Engine active. Evaluating ${signalResult.setupName || signalResult.signalType}...`);
+      } else {
+        log(symbolSnapshot, 'AI', `[MULTI-AI CONSENSUS] Querying ${activeAiProviders.length} active provider(s) (${activeAiSummaryLabel}) in parallel...`);
+      }
+      const aiVerdict = await evaluateMultiAiConsensus(
+        signalResult.technicalSnapshot,
+        activeAiProviders,
+        effectiveAiThreshold,
+        {
+          pocPrice: kronosForecast.pocPrice,
+          vahPrice: kronosForecast.vahPrice,
+          valPrice: kronosForecast.valPrice,
+          rsi: kronosForecast.rsi,
+          zScore: kronosForecast.zScore,
+          regime: kronosForecast.regime,
+          bullishPct: kronosForecast.bullishPct,
+        }
+      );
 
       log(
         symbolSnapshot,
         'AI',
-        `AI Verdict: ${aiVerdict.decision} (${aiVerdict.confidence_score}% via ${aiVerdict.source}). ${aiVerdict.reasoning}`
+        `Multi-AI Verdict: ${aiVerdict.decision} (${aiVerdict.confidence_score}% via ${aiVerdict.source}). ${aiVerdict.reasoning}`
       );
 
       if (!aiVerdict.executionAllowed) {
-        log(symbolSnapshot, 'AI', `Order REJECTED by AI: Score ${aiVerdict.confidence_score}% < Threshold ${mergedAi.confidenceThreshold}%`);
+        log(symbolSnapshot, 'AI', `Order REJECTED by Multi-AI Consensus: Score ${aiVerdict.confidence_score}% < Threshold ${effectiveAiThreshold}%`);
         continue;
       }
 
@@ -429,6 +480,11 @@ export async function POST(req: NextRequest) {
       }
 
       // 7. Order Execution on Exness strictly scoped to symbolSnapshot
+      if (centralAi.engineSwitches?.localEaExecutor === false) {
+        log(symbolSnapshot, 'RISK', `[ADMIN GOVERNANCE] Local EA Executor switch is disabled by Admin. Order skipped.`);
+        continue;
+      }
+
       log(symbolSnapshot, 'ORDER', `Placing ${activeCreds.mode} ${signalResult.side} order for ${orderVolume} lots on ${symbolSnapshot}...`);
 
       const orderResult = await client.placeMarketOrder({
@@ -472,12 +528,7 @@ export async function POST(req: NextRequest) {
     for (const p of updatedPositions) {
       const q = await client.getQuote(p.symbol);
       const curPrice = p.side === 'BUY' ? q.bid : q.ask;
-      const prevValid = p.currentPrice || p.entryPrice;
-      const posProfile = getPairProfile(p.symbol);
-      if (prevValid > 0 && Math.abs(curPrice - prevValid) / posProfile.pipValue > 50) {
-        // Discard anomalous tick > 50 pips jump
-        continue;
-      }
+      if (curPrice <= 0 || isNaN(curPrice)) continue;
       const res = evaluatePositionPnL(p, q);
       p.currentPrice = curPrice;
       p.unrealizedPnl = res.pnlUsd;

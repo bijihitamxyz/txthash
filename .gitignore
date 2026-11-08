@@ -5,3 +5,6 @@ out/
 .env.local
 data/ai_config.json
 *.log
+.data/
+*.enc
+

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { evaluateWithAi, AiConfig, DEFAULT_AI_CONFIG } from '@/core/aiJudge';
+import { evaluateMultiAiConsensus } from '@/core/aiJudge';
+import { readCentralAiConfig, getActiveAiProviders } from '@/core/centralAiConfig';
 import { TechnicalSnapshotPayload } from '@/core/signalGate';
 
 export const dynamic = 'force-dynamic';
@@ -7,9 +8,8 @@ export const dynamic = 'force-dynamic';
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { snapshot, aiConfig } = body as {
+    const { snapshot } = body as {
       snapshot: TechnicalSnapshotPayload;
-      aiConfig?: Partial<AiConfig>;
     };
 
     if (!snapshot || !snapshot.symbol || !snapshot.side) {
@@ -19,12 +19,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const mergedConfig: AiConfig = {
-      ...DEFAULT_AI_CONFIG,
-      ...aiConfig,
-    };
-
-    const verdict = await evaluateWithAi(snapshot, mergedConfig);
+    const centralAi = await readCentralAiConfig();
+    const activeProviders = getActiveAiProviders(centralAi);
+    const verdict = await evaluateMultiAiConsensus(
+      snapshot,
+      activeProviders,
+      centralAi.confidenceThreshold || 70
+    );
 
     return NextResponse.json({
       success: true,

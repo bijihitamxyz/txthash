@@ -139,7 +139,7 @@ export const PAIR_PROFILES = EXNESS_PAIR_PROFILES;
 export const SUPPORTED_SYMBOLS = Object.keys(EXNESS_PAIR_PROFILES);
 
 /**
- * Retrieves the pair profile for any symbol, with graceful fallback to matching profile or XAUUSDm
+ * Retrieves the pair profile for any symbol, with graceful fallback to matching profile or dynamic profile
  */
 export function getPairProfile(symbol?: string): PairProfile {
   if (!symbol) return EXNESS_PAIR_PROFILES.XAUUSDm;
@@ -158,7 +158,24 @@ export function getPairProfile(symbol?: string): PairProfile {
     }
   }
 
-  return EXNESS_PAIR_PROFILES[raw] || EXNESS_PAIR_PROFILES.XAUUSDm;
+  // If not a predefined forex profile, return a dynamic profile preserving the exact symbol name
+  const isJpy = upper.includes('JPY');
+  const isUsdt = upper.endsWith('USDT') || upper.endsWith('BUSD') || upper.endsWith('USDC');
+  const isMajorCrypto = upper.includes('BTC') || upper.includes('ETH') || upper.includes('BNB') || upper.includes('SOL');
+  const isCrypto = isUsdt || isMajorCrypto;
+  const cryptoDigits = upper.includes('BTC') || upper.includes('ETH') || upper.includes('BNB') || upper.includes('SOL') ? 2 : 4;
+  const cryptoPip = upper.includes('BTC') ? 10.0 : upper.includes('ETH') ? 1.0 : 0.01;
+  return {
+    symbol: raw,
+    name: raw,
+    category: isCrypto ? 'FOREX_VOLATILE' : 'FOREX_MAJOR',
+    digits: isCrypto ? cryptoDigits : isJpy ? 3 : 5,
+    pipValue: isCrypto ? cryptoPip : isJpy ? 0.01 : 0.0001,
+    minLot: 0.01,
+    lotStep: 0.01,
+    contractSize: isCrypto ? 1 : 100000,
+    preset: EXNESS_PAIR_PROFILES.EURUSDm.preset,
+  };
 }
 
 /**

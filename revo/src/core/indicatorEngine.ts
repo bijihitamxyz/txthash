@@ -47,6 +47,8 @@ export interface DivergenceResult {
 export interface IndicatorSnapshot {
   rsi: number[];
   bb: BollingerBandsResult;
+  ema21: number[];
+  ema50: number[];
   ema200: number[];
   atr14: number[];
   bbwExpansionPct: number;
@@ -420,6 +422,8 @@ export function computeIndicatorSnapshot(
   const closes = candles.map((c) => c.close);
   const rsi = calculateRSI(closes, rsiPeriod);
   const bb = calculateBollingerBands(closes, bbPeriod, bbStdDev);
+  const ema21 = calculateEMA(closes, 21);
+  const ema50 = calculateEMA(closes, 50);
   const ema200 = calculateEMA(closes, 200);
   const atr14 = calculateATR(candles, 14);
   const divergence = detectDivergence(candles, rsi, 15);
@@ -483,6 +487,8 @@ export function computeIndicatorSnapshot(
   return {
     rsi,
     bb,
+    ema21,
+    ema50,
     ema200,
     atr14,
     bbwExpansionPct,

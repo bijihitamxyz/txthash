@@ -101,6 +101,7 @@ export interface BinanceStoreState {
   openVaultModal: () => void;
   closeVaultModal: () => void;
   saveCredentials: (apiKey: string, apiSecret: string, isTestnet: boolean) => Promise<void>;
+  clearCredentials: () => Promise<void>;
   loadSavedCredentials: () => Promise<void>;
 
   // 6. Account & Daily PnL
@@ -122,6 +123,7 @@ export interface BinanceStoreState {
   lastVerdict: Record<string, CryptoSignalVerdict>;
   telemetryLogs: BinanceTelemetryItem[];
   addTelemetryLog: (symbol: string, category: BinanceTelemetryItem['category'], message: string) => void;
+  clearTelemetry: () => void;
 
   // Action Methods
   fetchSymbolsAndTickers: () => Promise<void>;
@@ -172,13 +174,13 @@ export const useBinanceStore = create<BinanceStoreState>()(
       setSelectedCategory: (selectedCategory) => set({ selectedCategory }),
       searchQuery: '',
       setSearchQuery: (searchQuery) => set({ searchQuery }),
-      customWatchlist: ['ARBUSDT', 'OPUSDT', 'SUIUSDT', 'SEIUSDT', 'FETUSDT', 'SOLUSDT', '1000PEPEUSDT'],
+      customWatchlist: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'ARBUSDT', 'SUIUSDT', 'OPUSDT'],
       toggleWatchlistCoin: (sym) => {
         const list = get().customWatchlist;
         const next = list.includes(sym) ? list.filter((s) => s !== sym) : [...list, sym];
         set({ customWatchlist: next });
       },
-      selectedSymbol: 'ARBUSDT',
+      selectedSymbol: 'BTCUSDT',
       setSelectedSymbol: (selectedSymbol) => {
         set({ selectedSymbol });
         get().fetchKlines(selectedSymbol);
@@ -216,6 +218,16 @@ export const useBinanceStore = create<BinanceStoreState>()(
             console.warn('Failed to encrypt credentials to localStorage:', e);
           }
         }
+      },
+
+      clearCredentials: async () => {
+        set({ apiKey: '', apiSecret: '', isVaultConfigured: false });
+        if (typeof window !== 'undefined') {
+          try {
+            localStorage.removeItem(VAULT_STORAGE_KEY);
+          } catch {}
+        }
+        get().addTelemetryLog('VAULT', 'INFO', '[SECURITY] Binance AES-256 API credentials cleared from vault.');
       },
 
       loadSavedCredentials: async () => {
@@ -297,6 +309,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
           telemetryLogs: [item, ...state.telemetryLogs.slice(0, 99)],
         }));
       },
+      clearTelemetry: () => set({ telemetryLogs: [] }),
 
       // Methods
       fetchSymbolsAndTickers: async () => {
@@ -533,6 +546,14 @@ export const useBinanceStore = create<BinanceStoreState>()(
             });
 
             set((s) => ({ lastVerdict: { ...s.lastVerdict, [sym]: verdict } }));
+
+            if (verdict.aiVerdict) {
+              state.addTelemetryLog(
+                sym,
+                'AI',
+                `Multi-AI Consensus [${verdict.aiVerdict.modelUsed}]: ${verdict.aiVerdict.decision} (${verdict.aiVerdict.confidence}%) — ${verdict.aiVerdict.reasoning}`
+              );
+            }
 
             if (verdict.approved && (verdict.score >= 80)) {
               state.addTelemetryLog(

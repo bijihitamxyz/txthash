@@ -16,7 +16,7 @@ let isRunning = true;
 let tickCount = 0;
 
 console.log('=============================================================');
-console.log('🤖 EXNESS QUANT AI SMART HYBRID AUTO-TRADER | 24/7 DAEMON');
+console.log('🤖 NEMESIS X SMART HYBRID AUTO-TRADER | 24/7 DAEMON');
 console.log(`🌐 Target Endpoint: ${BASE_URL}/api/engine-tick`);
 console.log(`⏱️ Heartbeat Frequency: ${TICK_INTERVAL_MS}ms`);
 console.log(`💼 Server / Gateway: ${EXNESS_SERVER}`);

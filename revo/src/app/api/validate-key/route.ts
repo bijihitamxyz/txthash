@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { testAiPing } from '@/core/aiJudge';
 import { ExnessClient } from '@/core/exnessClient';
+import { verifyAdminSecret } from '@/lib/licenseDb';
 
 export const dynamic = 'force-dynamic';
 
@@ -32,6 +33,16 @@ export async function POST(req: NextRequest) {
       Boolean(baseUrl || (payload && payload.baseUrl) || (credentials && credentials.aiApiKey));
 
     if (isAi) {
+      if (!verifyAdminSecret(req)) {
+        return NextResponse.json(
+          {
+            ok: false,
+            success: false,
+            message: 'Unauthorized: AI provider configuration is restricted to Admin Dashboard.',
+          },
+          { status: 401 }
+        );
+      }
       const targetBaseUrl =
         baseUrl || payload?.baseUrl || payload?.aiBaseUrl || credentials?.aiBaseUrl || 'https://api.openai.com/v1';
       const targetApiKey =
@@ -58,12 +69,10 @@ export async function POST(req: NextRequest) {
 
     // Exness credentials validation request
     const exnessCreds = credentials || payload || {
-      accountId: body.accountId || '30000143146',
-      server: body.server || 'Exness-Real',
+      accountId: body.accountId,
+      server: body.server || 'Exness-MT5Trial',
       apiKey: body.apiKey || body.token || body.password,
-      password: body.password || body.token || body.apiKey,
-      token: body.token || body.password || body.apiKey,
-      initialBalance: body.initialBalance,
+      privateKey: body.privateKey || body.apiKey || body.token || body.password,
     };
 
     const client = new ExnessClient(exnessCreds);

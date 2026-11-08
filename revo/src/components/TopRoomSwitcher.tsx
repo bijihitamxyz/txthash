@@ -25,46 +25,44 @@ export const TopRoomSwitcher: React.FC<TopRoomSwitcherProps> = ({
   };
 
   return (
-    <div className="bg-[#0B0E11] border-b border-slate-800/80 px-3 py-1.5 sm:px-4 select-none shrink-0">
+    <div className="bg-white border-b border-slate-200 px-3 py-1.5 sm:px-4 select-none shrink-0">
       <div className="max-w-[1920px] mx-auto flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5 sm:gap-2">
           <span className="text-[10px] font-mono text-slate-500 uppercase tracking-wider hidden sm:inline">
-            WORKSPACE:
+            MARKET:
           </span>
-          <div className="flex items-center bg-slate-950 p-0.5 rounded-xl border border-slate-800 shadow-inner">
-            {/* FOREX Button */}
+          <div className="flex items-center bg-slate-100 p-0.5 rounded-xl border border-slate-200">
             <button
               type="button"
               onClick={() => handleSelect('FOREX')}
               className={`px-3 py-1 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer flex items-center gap-1.5 ${
                 isForex
-                  ? 'bg-indigo-600 text-white shadow-md shadow-indigo-900/40 border border-indigo-400/40'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                  ? 'bg-[#0F172A] text-white shadow-xs'
+                  : 'text-slate-600 hover:text-[#0F172A]'
               }`}
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${isForex ? 'bg-emerald-400' : 'bg-slate-600'}`} />
-              <span>FOREX</span>
+              <span className={`w-1.5 h-1.5 rounded-full ${isForex ? 'bg-emerald-400' : 'bg-slate-400'}`} />
+              <span>FOREX · Exness</span>
             </button>
 
-            {/* CRYPTO Button */}
             <button
               type="button"
               onClick={() => handleSelect('CRYPTO')}
               className={`px-3 py-1 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer flex items-center gap-1.5 ${
                 !isForex
-                  ? 'bg-[#F3BA2F] text-slate-950 shadow-md shadow-[#F3BA2F]/20 border border-[#F3BA2F]'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                  ? 'bg-[#0F172A] text-white shadow-xs'
+                  : 'text-slate-600 hover:text-[#0F172A]'
               }`}
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${!isForex ? 'bg-amber-900' : 'bg-slate-600'}`} />
-              <span>CRYPTO</span>
+              <span className={`w-1.5 h-1.5 rounded-full ${!isForex ? 'bg-emerald-400' : 'bg-slate-400'}`} />
+              <span>CRYPTO · Binance</span>
             </button>
           </div>
         </div>
 
-        <div className="flex items-center gap-2 text-[10px] font-mono text-slate-400">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-          <span className="hidden xs:inline">Centralized AI Verification Active</span>
+        <div className="flex items-center gap-2 text-[10px] font-mono text-slate-500">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+          <span className="hidden sm:inline">Multi-AI Risk Governance + Kronos Pipeline</span>
         </div>
       </div>
     </div>

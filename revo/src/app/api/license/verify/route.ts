@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { verifyLicenseKey } from '@/lib/licenseDb';
+import {
+  verifyLicenseKey,
+  createLicenseRecord,
+  LicenseDuration,
+} from '@/lib/licenseDb';
 
 export const dynamic = 'force-dynamic';
 
@@ -12,6 +16,61 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         { valid: false, message: 'Invalid JSON payload in request body.' },
         { status: 400 }
+      );
+    }
+
+    // User Registration flow: generates & persists a new license access key
+    if (body.action === 'REGISTER') {
+      const rawUsername = typeof body.username === 'string' ? body.username.trim() : '';
+      const rawTelegram = typeof body.telegram === 'string' ? body.telegram.trim() : '';
+      const rawEmail = typeof body.email === 'string' ? body.email.trim() : '';
+      const validDuration: LicenseDuration = body.duration === '30d' ? '30d' : '7d';
+
+      const effectiveUsername = rawUsername || rawTelegram.replace(/^@/, '');
+      const effectiveTelegram = rawTelegram || rawUsername;
+
+      if (!effectiveUsername || effectiveUsername.length < 2) {
+        return NextResponse.json(
+          {
+            valid: false,
+            message: 'Username minimal 2 karakter wajib diisi untuk registrasi key.',
+          },
+          { status: 400 }
+        );
+      }
+
+      if (rawEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawEmail)) {
+        return NextResponse.json(
+          {
+            valid: false,
+            message: 'Format alamat email tidak valid.',
+          },
+          { status: 400 }
+        );
+      }
+
+      const created = await createLicenseRecord({
+        username: effectiveUsername,
+        telegram: effectiveTelegram || effectiveUsername,
+        email: rawEmail || undefined,
+        duration: validDuration,
+      });
+
+      return NextResponse.json(
+        {
+          valid: true,
+          registered: true,
+          licenseKey: created.licenseKey,
+          username: created.username,
+          telegram: created.telegram,
+          email: created.email,
+          duration: created.duration,
+          expiresAt: created.expiresAt,
+          createdAt: created.createdAt,
+          status: created.status,
+          message: `Access Key ${created.licenseKey} berhasil diregistrasi (${created.duration.toUpperCase()}).`,
+        },
+        { status: 201 }
       );
     }
 

@@ -73,15 +73,16 @@ export async function POST(req: NextRequest) {
       case 'CREATE': {
         const { username, telegram, email, duration } = body;
 
+        const cleanUsername = typeof username === 'string' && username.trim() ? username.trim() : '';
         const effectiveTelegram = typeof telegram === 'string' && telegram.trim()
           ? (telegram.trim().startsWith('@') ? telegram.trim() : `@${telegram.trim()}`)
-          : (typeof username === 'string' && username.trim()
-              ? (username.trim().startsWith('@') ? username.trim() : `@${username.trim()}`)
+          : (cleanUsername
+              ? (cleanUsername.startsWith('@') ? cleanUsername : `@${cleanUsername}`)
               : '');
 
         if (!effectiveTelegram) {
           return NextResponse.json(
-            { success: false, error: 'Telegram handle (@username) is required.' },
+            { success: false, error: 'Username or Telegram handle (@username) is required.' },
             { status: 400 }
           );
         }
@@ -90,7 +91,7 @@ export async function POST(req: NextRequest) {
           duration === '30d' ? '30d' : '7d';
 
         const newLicense = await createLicenseRecord({
-          username: effectiveTelegram,
+          username: cleanUsername || effectiveTelegram,
           telegram: effectiveTelegram,
           email: typeof email === 'string' && email.trim() ? email.trim() : undefined,
           duration: validDuration,

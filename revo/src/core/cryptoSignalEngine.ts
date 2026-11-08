@@ -481,9 +481,28 @@ export async function evaluateCryptoSignal(params: {
 
   let aiVerdict: CryptoSignalVerdict['aiVerdict'] | undefined;
 
-  // If score >= 80 and not blocked by BTC, call AI Judge
+  // If score >= 80 and not blocked by BTC, call Multi-AI Consensus / Risk Governance Judge with Kronos quant metrics
   if (isApproved && enableAiJudge && typeof window !== 'undefined') {
     try {
+      const digits = price < 1 ? 5 : price < 10 ? 3 : 2;
+      const recent20 = closes.slice(-20);
+      const mean20 = recent20.reduce((s, v) => s + v, 0) / Math.max(1, recent20.length);
+      const std20 = Math.sqrt(
+        recent20.reduce((s, v) => s + Math.pow(v - mean20, 2), 0) / Math.max(1, recent20.length)
+      );
+      const zScore = std20 > 0 ? Number(((price - mean20) / std20).toFixed(2)) : 0;
+      const vahPrice = Number((curMiddleBB + (curUpperBB - curMiddleBB) * 0.7).toFixed(digits));
+      const valPrice = Number((curMiddleBB - (curMiddleBB - curLowerBB) * 0.7).toFixed(digits));
+      const pocPrice = Number((curVwap || curMiddleBB).toFixed(digits));
+      const regime =
+        Math.abs(zScore) >= 2.0
+          ? 'VOLATILE_EXPANSION'
+          : curEma50 > curEma200 && curRsi >= 54
+          ? 'TRENDING_BULL'
+          : curEma50 < curEma200 && curRsi <= 46
+          ? 'TRENDING_BEAR'
+          : 'MEAN_REVERTING';
+
       const res = await fetch('/api/ai/judge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -496,6 +515,11 @@ export async function evaluateCryptoSignal(params: {
           bbWickSweepPct: candidateSide === 'LONG' ? lowerWickRatio : upperWickRatio,
           volumeRatio,
           rsi: curRsi,
+          pocPrice,
+          vahPrice,
+          valPrice,
+          zScore,
+          regime,
           vwapDistancePct: Math.abs(price - curVwap) / price,
           fundingRate,
           emaTrend: curEma50 >= curEma200 ? 'BULLISH' : 'BEARISH',

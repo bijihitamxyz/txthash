@@ -16,7 +16,7 @@
  *   - Only send PATCH SL update when new SL advances by at least 0.25 * ATR_14 (min 2 pips).
  */
 
-import { PairProfile, roundLotVolume, priceDiffToPips, formatPrice, calculatePnL } from './pairConfig';
+import { PairProfile, roundLotVolume, priceDiffToPips, formatPrice, calculatePnL, getPairProfile } from './pairConfig';
 
 export type PositionTrailingStatus = 'INITIAL' | 'PARTIAL_CLOSED_BE' | 'BREAKEVEN_LOCKED' | 'ATR_TRAILING';
 

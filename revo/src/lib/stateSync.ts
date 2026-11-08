@@ -55,7 +55,7 @@ export const DEFAULT_STATE: BotRuntimeState = {
   selectedSymbol: 'XAUUSDm',
   isMultiPairMode: false,
   scannedSymbols: ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'],
-  lotSize: 0.01,
+  lotSize: 0.05,
   aiConfidenceThreshold: 70,
   enablePartialClose: true,
   positions: [],
@@ -97,15 +97,7 @@ class StateSyncManager {
           fs.mkdirSync(dir, { recursive: true });
         } catch {}
       }
-      if (fs.existsSync(targetFile)) {
-        try {
-          fs.unlinkSync(targetFile);
-        } catch {}
-      }
     } catch {}
-    if (globalThis.__EXNESS_BOT_STATE__) {
-      globalThis.__EXNESS_BOT_STATE__.positions = [];
-    }
   }
 
   public async getRuntimeState(): Promise<BotRuntimeState> {
@@ -159,7 +151,9 @@ class StateSyncManager {
     }
 
     if (partial.positions !== undefined) {
-      this.inMemoryState.positions = Array.isArray(partial.positions) ? partial.positions : [];
+      this.inMemoryState.positions = Array.isArray(partial.positions)
+        ? partial.positions.filter((p: any) => p && p.id !== 'F-637' && p.id !== '#F-637')
+        : [];
     }
 
     // Always keep in-memory singleton updated
@@ -273,4 +267,10 @@ const globalForStateSync = globalThis as unknown as {
 export const stateSync = globalForStateSync.__exnessStateSyncManager ?? new StateSyncManager();
 if (process.env.NODE_ENV !== 'production') {
   globalForStateSync.__exnessStateSyncManager = stateSync;
+}
+
+if (typeof globalThis !== 'undefined') {
+  (globalThis as any).__emitVaultTelemetry = (category: string, message: string) => {
+    stateSync.addTelemetry('VAULT', 'INFO', message);
+  };
 }

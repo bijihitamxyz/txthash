@@ -23,6 +23,10 @@ export interface LicenseDbData {
 }
 
 export interface LicenseStats {
+  total: number;
+  active: number;
+  expired: number;
+  revoked: number;
   totalKeys: number;
   activeKeys: number;
   expiredKeys: number;
@@ -205,6 +209,10 @@ export function computeLicenseStats(licenses: LicenseRecord[]): LicenseStats {
   }
 
   return {
+    total: licenses.length,
+    active: activeKeys,
+    expired: expiredKeys,
+    revoked: revokedKeys,
     totalKeys: licenses.length,
     activeKeys,
     expiredKeys,
@@ -355,7 +363,7 @@ export async function deleteLicenseRecord(keyOrId: string): Promise<boolean> {
   const clean = keyOrId.trim().toUpperCase();
   const initialLength = licenses.length;
   const filtered = licenses.filter(
-    (l) => l.id !== keyOrId && l.licenseKey.toUpperCase() === clean
+    (l) => l.id !== keyOrId && l.licenseKey.toUpperCase() !== clean
   );
 
   if (filtered.length === initialLength) {
