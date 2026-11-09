@@ -10,6 +10,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { getDataDir, safeMkdirSync, getNemesisMemoryStore } from './dataStore';
 import {
   encryptCredential,
   decryptCredential,
@@ -84,7 +85,7 @@ declare global {
 
 function getStateFilePath(): string {
   try {
-    const dataDir = process.env.VERCEL ? '/tmp/quant-data' : (os.tmpdir() || '/tmp');
+    const dataDir = getDataDir();
     return path.join(dataDir, 'exness-bot-state.enc');
   } catch {
     return '/tmp/exness-bot-state.enc';
@@ -102,11 +103,7 @@ class StateSyncManager {
     try {
       const targetFile = getStateFilePath();
       const dir = path.dirname(targetFile);
-      if (!fs.existsSync(dir)) {
-        try {
-          fs.mkdirSync(dir, { recursive: true });
-        } catch {}
-      }
+      safeMkdirSync(dir);
     } catch {}
   }
 
@@ -194,31 +191,36 @@ class StateSyncManager {
 
   private async loadFromDisk(): Promise<void> {
     try {
+      const nemesis = getNemesisMemoryStore();
       const targetFile = getStateFilePath();
+      let encrypted: string | null = null;
       if (fs.existsSync(targetFile)) {
-        const encrypted = await fs.promises.readFile(targetFile, 'utf8');
-        if (encrypted && encrypted.trim().length > 0) {
-          const decrypted = await decryptCredential(encrypted);
-          const parsed = JSON.parse(decrypted);
-          this.inMemoryState = {
-            ...DEFAULT_STATE,
-            ...parsed,
-            isAutoTrading: Boolean(parsed.isAutoTrading),
-            cryptoIsAutoTrading: false, // strictly default to false on server startup to prevent ghost trades
-            cryptoMarginUsdt: typeof parsed.cryptoMarginUsdt === 'number' ? parsed.cryptoMarginUsdt : 25.0,
-            cryptoLeverage: typeof parsed.cryptoLeverage === 'number' ? parsed.cryptoLeverage : 10,
-            cryptoMarginMode: parsed.cryptoMarginMode || 'ISOLATED',
-            cryptoMaxConcurrentCoins: typeof parsed.cryptoMaxConcurrentCoins === 'number' ? parsed.cryptoMaxConcurrentCoins : 5,
-            positions: Array.isArray(parsed.positions) ? parsed.positions : [],
-            credentials: {
-              ...DEFAULT_CREDENTIALS,
-              ...(parsed.credentials || {}),
-            },
-          };
-          globalThis.__EXNESS_BOT_STATE__ = { ...this.inMemoryState };
-          this.isLoadedFromDisk = true;
-          return;
-        }
+        encrypted = await fs.promises.readFile(targetFile, 'utf8');
+      } else if (nemesis['exness-bot-state.enc']) {
+        encrypted = nemesis['exness-bot-state.enc'];
+      }
+      if (encrypted && encrypted.trim().length > 0) {
+        const decrypted = await decryptCredential(encrypted);
+        const parsed = JSON.parse(decrypted);
+        this.inMemoryState = {
+          ...DEFAULT_STATE,
+          ...parsed,
+          isAutoTrading: Boolean(parsed.isAutoTrading),
+          cryptoIsAutoTrading: false, // strictly default to false on server startup to prevent ghost trades
+          cryptoMarginUsdt: typeof parsed.cryptoMarginUsdt === 'number' ? parsed.cryptoMarginUsdt : 25.0,
+          cryptoLeverage: typeof parsed.cryptoLeverage === 'number' ? parsed.cryptoLeverage : 10,
+          cryptoMarginMode: parsed.cryptoMarginMode || 'ISOLATED',
+          cryptoMaxConcurrentCoins: typeof parsed.cryptoMaxConcurrentCoins === 'number' ? parsed.cryptoMaxConcurrentCoins : 5,
+          positions: Array.isArray(parsed.positions) ? parsed.positions : [],
+          credentials: {
+            ...DEFAULT_CREDENTIALS,
+            ...(parsed.credentials || {}),
+          },
+        };
+        globalThis.__EXNESS_BOT_STATE__ = { ...this.inMemoryState };
+        nemesis['exness-bot-state.enc'] = encrypted;
+        this.isLoadedFromDisk = true;
+        return;
       }
     } catch {
       // Silently fall back to in-memory globalThis.__EXNESS_BOT_STATE__ singleton without throwing any error
@@ -243,15 +245,16 @@ class StateSyncManager {
     // Keep in-memory singleton up to date
     globalThis.__EXNESS_BOT_STATE__ = { ...this.inMemoryState };
     try {
-      const targetFile = getStateFilePath();
-      const dir = path.dirname(targetFile);
-      if (!fs.existsSync(dir)) {
-        try {
-          fs.mkdirSync(dir, { recursive: true });
-        } catch {}
-      }
       const json = JSON.stringify(this.inMemoryState);
       const encrypted = await encryptCredential(json);
+      try {
+        const nemesis = getNemesisMemoryStore();
+        nemesis['exness-bot-state.enc'] = encrypted;
+      } catch {}
+
+      const targetFile = getStateFilePath();
+      const dir = path.dirname(targetFile);
+      safeMkdirSync(dir);
       await fs.promises.writeFile(targetFile, encrypted, 'utf8');
     } catch {
       // Silently fall back to in-memory globalThis.__EXNESS_BOT_STATE__ singleton without throwing any error
@@ -261,6 +264,10 @@ class StateSyncManager {
   public resetState(): void {
     this.inMemoryState = { ...DEFAULT_STATE };
     globalThis.__EXNESS_BOT_STATE__ = { ...DEFAULT_STATE };
+    try {
+      const nemesis = getNemesisMemoryStore();
+      delete nemesis['exness-bot-state.enc'];
+    } catch {}
     try {
       const targetFile = getStateFilePath();
       if (fs.existsSync(targetFile)) {

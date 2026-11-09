@@ -18,6 +18,7 @@ import { Candle } from './indicatorEngine';
 import { PairProfile, getPairProfile, formatPrice, roundLotVolume, calculatePnL, evaluatePositionPnL } from './pairConfig';
 import { ManagedPosition } from './trailingManager';
 import { ExnessVaultCredentials } from './exnessVault';
+import { getDataDir, safeMkdirSync, getNemesisMemoryStore } from '@/lib/dataStore';
 
 // ==========================================
 // MANDATED EXPORT: computeBodyHash
@@ -138,14 +139,38 @@ export function getPersistedRealPrice(symbol: string): number {
   if (lastKnownPrice[symbol] && lastKnownPrice[symbol].price > 0) {
     return lastKnownPrice[symbol].price;
   }
+  const filename = `${LAST_KNOWN_PRICE_KEY}.json`;
   try {
-    const dataDir = path.resolve(process.cwd(), '.data');
-    const cacheFile = path.resolve(dataDir, `${LAST_KNOWN_PRICE_KEY}.json`);
+    const nemesis = getNemesisMemoryStore();
+    if (filename in nemesis) {
+      const data = nemesis[filename];
+      if (data && typeof data[symbol] === 'number' && data[symbol] > 0) {
+        lastKnownPrice[symbol] = { price: data[symbol], timestamp: Date.now(), source: 'memory-cache' };
+        return data[symbol];
+      }
+    }
+  } catch {}
+
+  try {
+    const dataDir = getDataDir();
+    const cacheFile = path.resolve(dataDir, filename);
+    let content: string | null = null;
     if (fs.existsSync(cacheFile)) {
-      const content = fs.readFileSync(cacheFile, 'utf8');
+      content = fs.readFileSync(cacheFile, 'utf8');
+    } else {
+      const seedFile = path.resolve(process.cwd(), '.data', filename);
+      if (fs.existsSync(seedFile)) {
+        content = fs.readFileSync(seedFile, 'utf8');
+      }
+    }
+    if (content) {
       const data = JSON.parse(content);
       if (data && typeof data[symbol] === 'number' && data[symbol] > 0) {
         lastKnownPrice[symbol] = { price: data[symbol], timestamp: Date.now(), source: 'disk-cache' };
+        try {
+          const nemesis = getNemesisMemoryStore();
+          nemesis[filename] = data;
+        } catch {}
         return data[symbol];
       }
     }
@@ -154,20 +179,29 @@ export function getPersistedRealPrice(symbol: string): number {
 }
 
 export function savePersistedRealPrice(symbol: string, price: number): void {
+  const filename = `${LAST_KNOWN_PRICE_KEY}.json`;
   try {
-    const dataDir = path.resolve(process.cwd(), '.data');
-    if (!fs.existsSync(dataDir)) {
-      fs.mkdirSync(dataDir, { recursive: true });
-    }
-    const cacheFile = path.resolve(dataDir, `${LAST_KNOWN_PRICE_KEY}.json`);
+    const nemesis = getNemesisMemoryStore();
     let data: Record<string, number> = {};
+    if (filename in nemesis && typeof nemesis[filename] === 'object') {
+      data = { ...nemesis[filename] };
+    }
+    const dataDir = getDataDir();
+    safeMkdirSync(dataDir);
+    const cacheFile = path.resolve(dataDir, filename);
     if (fs.existsSync(cacheFile)) {
       try {
-        data = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+        const fileContent = fs.readFileSync(cacheFile, 'utf8');
+        data = { ...data, ...JSON.parse(fileContent) };
       } catch {}
     }
     data[symbol] = price;
-    fs.writeFileSync(cacheFile, JSON.stringify(data, null, 2), 'utf8');
+    nemesis[filename] = data;
+    try {
+      fs.writeFileSync(cacheFile, JSON.stringify(data, null, 2), 'utf8');
+    } catch (writeErr) {
+      console.warn('[exnessClient] savePersistedRealPrice write warning:', writeErr);
+    }
   } catch {}
 }
 

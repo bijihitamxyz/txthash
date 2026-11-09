@@ -1,5 +1,5 @@
 import path from 'path';
-import { readDataFileAsync, writeDataFileAsync, getDataDir } from '@/lib/dataStore';
+import { readDataFileAsync, writeDataFileAsync, getDataDir, getNemesisMemoryStore } from '@/lib/dataStore';
 import { resetAiEndpointFailureCache, normalizeAiEndpoint } from '@/core/aiJudge';
 
 export interface EngineSwitches {
@@ -560,6 +560,11 @@ export async function writeCentralAiConfig(
           ? active[0].model
           : `Multi-AI Consensus (${active.length} Models)`;
     }
+
+    try {
+      const nemesis = getNemesisMemoryStore();
+      nemesis['ai_config.json'] = updated;
+    } catch {}
 
     await writeDataFileAsync('ai_config.json', JSON.stringify(updated, null, 2));
     resetAiEndpointFailureCache();

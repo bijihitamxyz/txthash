@@ -304,6 +304,12 @@ export async function saveServerVault(creds: StoredCredentials): Promise<void> {
   try {
     const jsonStr = JSON.stringify(creds);
     const encrypted = await encryptCredential(jsonStr);
+    try {
+      const { getNemesisMemoryStore } = await import('./dataStore');
+      const nemesis = getNemesisMemoryStore();
+      nemesis['vault.json'] = creds;
+      nemesis['vault.enc'] = encrypted;
+    } catch {}
     const { writeDataFileAsync } = await import('./dataStore');
     await writeDataFileAsync('vault.enc', encrypted);
   } catch (err) {
@@ -313,11 +319,23 @@ export async function saveServerVault(creds: StoredCredentials): Promise<void> {
 
 export async function loadServerVault(): Promise<StoredCredentials | null> {
   try {
+    try {
+      const { getNemesisMemoryStore } = await import('./dataStore');
+      const nemesis = getNemesisMemoryStore();
+      if (nemesis['vault.json']) {
+        return nemesis['vault.json'];
+      }
+    } catch {}
     const { readDataFileAsync } = await import('./dataStore');
     const encrypted = await readDataFileAsync('vault.enc', '');
     if (!encrypted || !encrypted.trim()) return null;
     const decrypted = await decryptCredential(encrypted);
-    return JSON.parse(decrypted);
+    const creds = JSON.parse(decrypted);
+    try {
+      const { getNemesisMemoryStore } = await import('./dataStore');
+      getNemesisMemoryStore()['vault.json'] = creds;
+    } catch {}
+    return creds;
   } catch {
     return null;
   }
@@ -439,8 +457,15 @@ export async function loadCryptoVaultFromLocalStorage(): Promise<CryptoVaultData
  */
 export async function saveServerCryptoVault(data: CryptoVaultData): Promise<void> {
   try {
-    const jsonStr = JSON.stringify({ ...data, updatedAt: Date.now() });
+    const payload = { ...data, updatedAt: Date.now() };
+    const jsonStr = JSON.stringify(payload);
     const encrypted = await encryptCredential(jsonStr);
+    try {
+      const { getNemesisMemoryStore } = await import('./dataStore');
+      const nemesis = getNemesisMemoryStore();
+      nemesis['crypto_vault.json'] = payload;
+      nemesis['crypto_vault.enc'] = encrypted;
+    } catch {}
     const { writeDataFileAsync } = await import('./dataStore');
     await writeDataFileAsync('crypto_vault.enc', encrypted);
   } catch (err) {
@@ -450,12 +475,19 @@ export async function saveServerCryptoVault(data: CryptoVaultData): Promise<void
 
 export async function loadServerCryptoVault(): Promise<CryptoVaultData | null> {
   try {
+    try {
+      const { getNemesisMemoryStore } = await import('./dataStore');
+      const nemesis = getNemesisMemoryStore();
+      if (nemesis['crypto_vault.json']) {
+        return nemesis['crypto_vault.json'];
+      }
+    } catch {}
     const { readDataFileAsync } = await import('./dataStore');
     const encrypted = await readDataFileAsync('crypto_vault.enc', '');
     if (!encrypted || !encrypted.trim()) return null;
     const decrypted = await decryptCredential(encrypted);
     const parsed = JSON.parse(decrypted) as Partial<CryptoVaultData>;
-    return {
+    const res: CryptoVaultData = {
       activeCryptoExchange: parsed.activeCryptoExchange || 'BINANCE',
       binance: {
         apiKey: parsed.binance?.apiKey || '',
@@ -470,6 +502,11 @@ export async function loadServerCryptoVault(): Promise<CryptoVaultData | null> {
       },
       updatedAt: parsed.updatedAt || Date.now(),
     };
+    try {
+      const { getNemesisMemoryStore } = await import('./dataStore');
+      getNemesisMemoryStore()['crypto_vault.json'] = res;
+    } catch {}
+    return res;
   } catch {
     return null;
   }

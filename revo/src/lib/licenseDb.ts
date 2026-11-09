@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { readDataFileAsync, writeDataFileAsync, getDataDir } from './dataStore';
+import { readDataFileAsync, writeDataFileAsync, getDataDir, safeMkdirSync, getNemesisMemoryStore } from './dataStore';
 
 export type LicenseDuration = '7d' | '30d';
 export type LicenseStatus = 'ACTIVE' | 'REVOKED' | 'EXPIRED';
@@ -63,13 +63,7 @@ function withFileLock<T>(taskFn: () => Promise<T>): Promise<T> {
 function ensureDbFileExists(filePath: string): void {
   try {
     const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) {
-      try {
-        fs.mkdirSync(dir, { recursive: true });
-      } catch (err) {
-        console.warn('[LICENSE DB] ensureDbFileExists mkdirSync warning:', err);
-      }
-    }
+    safeMkdirSync(dir);
 
     if (!fs.existsSync(filePath)) {
       // Check seed file first
@@ -99,11 +93,20 @@ function ensureDbFileExists(filePath: string): void {
 
 /**
  * Safely reads the license records, automatically updating status to EXPIRED
- * if expiresAt has passed. Backed by /tmp/quant-data, seed file fallback,
- * and globalThis.__QUANT_MEMORY_STORE__.
+ * if expiresAt has passed. Backed by /tmp/revo-data, seed file fallback,
+ * and globalThis.__NEMESIS_MEMORY_STORE__.
  */
 export async function readLicenses(): Promise<LicenseRecord[]> {
   try {
+    try {
+      const nemesis = getNemesisMemoryStore();
+      if (nemesis['licenses_db.json']) {
+        const cached = nemesis['licenses_db.json'];
+        const list = Array.isArray(cached) ? cached : (Array.isArray(cached?.licenses) ? cached.licenses : null);
+        if (list) return list;
+      }
+    } catch {}
+
     const content = await readDataFileAsync('licenses_db.json', JSON.stringify({ licenses: [] }, null, 2));
     if (!content.trim()) {
       return [];
@@ -141,13 +144,17 @@ export async function readLicenses(): Promise<LicenseRecord[]> {
 
 /**
  * Safely writes the license records atomically using a temp file.
- * Backed by globalThis.__QUANT_MEMORY_STORE__ so EROFS never throws.
+ * Backed by globalThis.__NEMESIS_MEMORY_STORE__ so EROFS never throws.
  */
 export async function writeLicenses(licenses: LicenseRecord[]): Promise<void> {
   return withFileLock(async () => {
     try {
       const payload: LicenseDbData = { licenses };
       const jsonStr = JSON.stringify(payload, null, 2);
+      try {
+        const nemesis = getNemesisMemoryStore();
+        nemesis['licenses_db.json'] = payload;
+      } catch {}
       await writeDataFileAsync('licenses_db.json', jsonStr);
     } catch (err) {
       console.error('[LICENSE DB] Error writing licenses:', err);
