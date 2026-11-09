@@ -11,6 +11,8 @@ import {
   validateConsecutiveEntryRules,
   RiskGuardConfig,
   DEFAULT_RISK_CONFIG,
+  calculateForexLotSize,
+  dualRoomProtections,
 } from '@/core/riskGuard';
 import { stateSync, TargetMarket } from '@/lib/stateSync';
 import { ensureSchedulerStarted } from '@/lib/engineScheduler';
@@ -19,6 +21,7 @@ import {
   readCentralAiConfig,
   getActiveAiProviders,
   formatActiveAiSummaryLabel,
+  calculateDynamicThreshold,
 } from '@/core/centralAiConfig';
 import { loadVaultCredentials } from '@/core/exnessVault';
 import { computeRealTimeKronosForecast } from '@/core/kronosService';
@@ -432,6 +435,31 @@ export async function POST(req: NextRequest) {
         `[KRONOS VPS] ${symbolSnapshot} (${timeframe}) Bullish: ${kronosForecast.bullishPct}% | POC: ${kronosForecast.pocPrice} | VAH: ${kronosForecast.vahPrice} | VAL: ${kronosForecast.valPrice} | Z: ${kronosForecast.zScore} (${kronosForecast.regime})`
       );
 
+      const recentSlForex = dualRoomProtections.hasRecentStopLoss(symbolSnapshot, 'forex');
+      const latestPrice = candles[candles.length - 1]?.close || quote.bid;
+      const pocPrice = kronosForecast.pocPrice || latestPrice;
+      let pocMagnetAligned = false;
+      if (signalResult.side === 'BUY') {
+        pocMagnetAligned = latestPrice < pocPrice && pocPrice <= middleBB;
+      } else if (signalResult.side === 'SELL') {
+        pocMagnetAligned = latestPrice > pocPrice && pocPrice >= middleBB;
+      }
+      signalResult.technicalSnapshot.pocMagnetAligned = pocMagnetAligned;
+
+      const dynamicThresholdRes = calculateDynamicThreshold({
+        efficiencyRatio: signalResult.indicators.efficiencyRatio,
+        pocMagnetAligned,
+        kronosProbability: kronosForecast.bullishPct || 50,
+        bbwExpandingRapidly: signalResult.indicators.bbwExpansionPct > 15,
+        recentStopLoss: recentSlForex,
+        symbol: symbolSnapshot,
+        marketType: 'FOREX',
+      });
+
+      const symbolThreshold = centralAi.autoAdaptiveThreshold !== false
+        ? dynamicThresholdRes.threshold
+        : effectiveAiThreshold;
+
       if (activeAiProviders.length === 0) {
         log(symbolSnapshot, 'AI', `[MULTI-AI CONSENSUS] Kronos Quantitative Engine active. Evaluating ${signalResult.setupName || signalResult.signalType}...`);
       } else {
@@ -440,7 +468,7 @@ export async function POST(req: NextRequest) {
       const aiVerdict = await evaluateMultiAiConsensus(
         signalResult.technicalSnapshot,
         activeAiProviders,
-        effectiveAiThreshold,
+        symbolThreshold,
         {
           pocPrice: kronosForecast.pocPrice,
           vahPrice: kronosForecast.vahPrice,
@@ -452,6 +480,13 @@ export async function POST(req: NextRequest) {
         }
       );
 
+      const autoGovDecision = aiVerdict.executionAllowed ? 'EXECUTE' : 'REJECT';
+      log(
+        symbolSnapshot,
+        'AI',
+        `[AUTO-GOVERNANCE] AI Score: ${aiVerdict.confidence_score}% vs Dynamic Threshold: ${dynamicThresholdRes.threshold}% (${dynamicThresholdRes.reasons.join(', ')}) -> ${autoGovDecision}`
+      );
+
       log(
         symbolSnapshot,
         'AI',
@@ -459,7 +494,7 @@ export async function POST(req: NextRequest) {
       );
 
       if (!aiVerdict.executionAllowed) {
-        log(symbolSnapshot, 'AI', `Order REJECTED by Multi-AI Consensus: Score ${aiVerdict.confidence_score}% < Threshold ${effectiveAiThreshold}%`);
+        log(symbolSnapshot, 'AI', `Order REJECTED by Multi-AI Consensus: Score ${aiVerdict.confidence_score}% < Dynamic Threshold ${dynamicThresholdRes.threshold}%`);
         continue;
       }
 
@@ -485,12 +520,22 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      log(symbolSnapshot, 'ORDER', `Placing ${activeCreds.mode} ${signalResult.side} order for ${orderVolume} lots on ${symbolSnapshot}...`);
+      // Calculate 0.75% Equity Risk Capped Lot Size
+      const slDist = Math.abs(signalResult.signalTriggerPrice - signalResult.proposedSlPrice);
+      const safeVolume = calculateForexLotSize({
+        equity: 1000,
+        slDistancePrice: slDist,
+        pairProfile: profile,
+        maxRiskPct: mergedRisk.perTradeRiskPercent || 0.75,
+        defaultLot: orderVolume,
+      });
+
+      log(symbolSnapshot, 'ORDER', `Placing ${activeCreds.mode} ${signalResult.side} order for ${safeVolume} lots on ${symbolSnapshot} (0.75% equity risk cap)...`);
 
       const orderResult = await client.placeMarketOrder({
         symbol: symbolSnapshot,
         side: signalResult.side,
-        volume: orderVolume,
+        volume: safeVolume,
         stopLossPrice: signalResult.proposedSlPrice,
         takeProfitPrice: signalResult.proposedTpPrice,
         comment: `EXN_${activeCreds.mode}_AI${aiVerdict.confidence_score}`,

@@ -52,6 +52,7 @@ export interface BinancePosition {
   trailingStopPrice?: number;
   highestPriceSinceEntry?: number;
   lowestPriceSinceEntry?: number;
+  openTime?: number;
 }
 
 export interface BinanceAccountInfo {
@@ -81,7 +82,9 @@ const CACHE_TICKERS_TTL = 3 * 1000; // 3 seconds
 export const FALLBACK_SYMBOLS: BinanceSymbolFilter[] = [
   { symbol: 'BTCUSDT', baseAsset: 'BTC', quoteAsset: 'USDT', status: 'TRADING', pricePrecision: 2, quantityPrecision: 3, tickSize: '0.10', stepSize: '0.001', minQty: '0.001', maxQty: '1000', minNotional: '5' },
   { symbol: 'ETHUSDT', baseAsset: 'ETH', quoteAsset: 'USDT', status: 'TRADING', pricePrecision: 2, quantityPrecision: 3, tickSize: '0.01', stepSize: '0.001', minQty: '0.001', maxQty: '10000', minNotional: '5' },
+  { symbol: 'BNBUSDT', baseAsset: 'BNB', quoteAsset: 'USDT', status: 'TRADING', pricePrecision: 2, quantityPrecision: 2, tickSize: '0.01', stepSize: '0.01', minQty: '0.01', maxQty: '10000', minNotional: '5' },
   { symbol: 'SOLUSDT', baseAsset: 'SOL', quoteAsset: 'USDT', status: 'TRADING', pricePrecision: 2, quantityPrecision: 2, tickSize: '0.01', stepSize: '0.01', minQty: '0.01', maxQty: '100000', minNotional: '5' },
+  { symbol: 'XRPUSDT', baseAsset: 'XRP', quoteAsset: 'USDT', status: 'TRADING', pricePrecision: 4, quantityPrecision: 1, tickSize: '0.0001', stepSize: '0.1', minQty: '0.1', maxQty: '1000000', minNotional: '5' },
   { symbol: 'ARBUSDT', baseAsset: 'ARB', quoteAsset: 'USDT', status: 'TRADING', pricePrecision: 4, quantityPrecision: 1, tickSize: '0.0001', stepSize: '0.1', minQty: '0.1', maxQty: '1000000', minNotional: '5' },
   { symbol: 'OPUSDT', baseAsset: 'OP', quoteAsset: 'USDT', status: 'TRADING', pricePrecision: 4, quantityPrecision: 1, tickSize: '0.0001', stepSize: '0.1', minQty: '0.1', maxQty: '1000000', minNotional: '5' },
   { symbol: 'SUIUSDT', baseAsset: 'SUI', quoteAsset: 'USDT', status: 'TRADING', pricePrecision: 4, quantityPrecision: 1, tickSize: '0.0001', stepSize: '0.1', minQty: '0.1', maxQty: '1000000', minNotional: '5' },

@@ -9,6 +9,42 @@ const DEFAULT_SALT = 'EXNESS_AI_QUANT_TRADER_VAULT_2026_MASTER';
 
 export type AccountMode = 'DEMO' | 'REAL';
 
+export type CryptoExchange = 'BINANCE' | 'BITGET';
+export type CryptoAccountType = 'REAL' | 'DEMO';
+
+export interface CryptoExchangeCredentials {
+  apiKey: string;
+  secretKey: string;
+  passphrase?: string; // required for Bitget V2 API
+  accountType: CryptoAccountType;
+}
+
+export interface CryptoVaultData {
+  activeCryptoExchange: CryptoExchange;
+  binance: CryptoExchangeCredentials;
+  bitget: CryptoExchangeCredentials;
+  updatedAt: number;
+}
+
+export const DEFAULT_CRYPTO_VAULT: CryptoVaultData = {
+  activeCryptoExchange: 'BINANCE',
+  binance: {
+    apiKey: '',
+    secretKey: '',
+    accountType: 'DEMO',
+  },
+  bitget: {
+    apiKey: '',
+    secretKey: '',
+    passphrase: '',
+    accountType: 'DEMO',
+  },
+  updatedAt: Date.now(),
+};
+
+export const CRYPTO_VAULT_STORAGE_KEY = 'CRYPTO_EXCHANGE_ENCRYPTED_VAULT_V3';
+export const LEGACY_BINANCE_STORAGE_KEY = 'binance_vault_enc_v2';
+
 export interface StoredCredentials {
   // Active Account Mode
   accountMode: AccountMode;
@@ -282,6 +318,158 @@ export async function loadServerVault(): Promise<StoredCredentials | null> {
     if (!encrypted || !encrypted.trim()) return null;
     const decrypted = await decryptCredential(encrypted);
     return JSON.parse(decrypted);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns active Crypto account credentials based on current activeCryptoExchange
+ */
+export function getActiveCryptoCredentials(vault?: CryptoVaultData | null): {
+  exchange: CryptoExchange;
+  apiKey: string;
+  secretKey: string;
+  passphrase?: string;
+  accountType: CryptoAccountType;
+  isTestnet: boolean;
+} {
+  const v = vault || DEFAULT_CRYPTO_VAULT;
+  const exchange = v.activeCryptoExchange || 'BINANCE';
+  const creds = exchange === 'BITGET' ? v.bitget : v.binance;
+  const isTestnet = creds.accountType === 'DEMO';
+  return {
+    exchange,
+    apiKey: creds.apiKey || '',
+    secretKey: creds.secretKey || '',
+    passphrase: creds.passphrase || '',
+    accountType: creds.accountType || 'DEMO',
+    isTestnet,
+  };
+}
+
+/**
+ * Checks whether valid credentials have been configured for the specified crypto exchange
+ */
+export function isCryptoVaultConfigured(vault?: CryptoVaultData | null, exchange?: CryptoExchange): boolean {
+  if (!vault) return false;
+  const target = exchange || vault.activeCryptoExchange || 'BINANCE';
+  if (target === 'BITGET') {
+    return Boolean(
+      vault.bitget?.apiKey?.trim() &&
+      vault.bitget?.secretKey?.trim() &&
+      vault.bitget?.passphrase?.trim()
+    );
+  }
+  return Boolean(
+    vault.binance?.apiKey?.trim() &&
+    vault.binance?.secretKey?.trim()
+  );
+}
+
+/**
+ * Browser LocalStorage Crypto Vault (AES-256-GCM encrypted)
+ */
+export async function saveCryptoVaultToLocalStorage(data: CryptoVaultData): Promise<void> {
+  if (typeof window === 'undefined') return;
+  try {
+    const jsonStr = JSON.stringify({ ...data, updatedAt: Date.now() });
+    const encrypted = await encryptCredential(jsonStr);
+    localStorage.setItem(CRYPTO_VAULT_STORAGE_KEY, encrypted);
+  } catch (err) {
+    console.warn('[cryptoVault] saveCryptoVaultToLocalStorage error:', err);
+  }
+}
+
+export async function loadCryptoVaultFromLocalStorage(): Promise<CryptoVaultData | null> {
+  if (typeof window === 'undefined') return null;
+  try {
+    let encrypted = localStorage.getItem(CRYPTO_VAULT_STORAGE_KEY);
+
+    // If new crypto vault key not found, check legacy Binance storage key
+    if (!encrypted) {
+      const legacy = localStorage.getItem(LEGACY_BINANCE_STORAGE_KEY);
+      if (legacy) {
+        try {
+          const decLegacy = await decryptCredential(legacy);
+          if (decLegacy) {
+            const parsedLegacy = JSON.parse(decLegacy);
+            const migrated: CryptoVaultData = {
+              ...DEFAULT_CRYPTO_VAULT,
+              activeCryptoExchange: 'BINANCE',
+              binance: {
+                apiKey: parsedLegacy.apiKey || '',
+                secretKey: parsedLegacy.apiSecret || parsedLegacy.secretKey || '',
+                accountType: parsedLegacy.isTestnet === false ? 'REAL' : 'DEMO',
+              },
+            };
+            await saveCryptoVaultToLocalStorage(migrated);
+            return migrated;
+          }
+        } catch {}
+      }
+      return null;
+    }
+
+    const decryptedJson = await decryptCredential(encrypted);
+    const parsed = JSON.parse(decryptedJson) as Partial<CryptoVaultData>;
+    return {
+      activeCryptoExchange: parsed.activeCryptoExchange || 'BINANCE',
+      binance: {
+        apiKey: parsed.binance?.apiKey || '',
+        secretKey: parsed.binance?.secretKey || '',
+        accountType: parsed.binance?.accountType || 'DEMO',
+      },
+      bitget: {
+        apiKey: parsed.bitget?.apiKey || '',
+        secretKey: parsed.bitget?.secretKey || '',
+        passphrase: parsed.bitget?.passphrase || '',
+        accountType: parsed.bitget?.accountType || 'DEMO',
+      },
+      updatedAt: parsed.updatedAt || Date.now(),
+    };
+  } catch (err) {
+    console.error('[cryptoVault] Failed to decrypt crypto credentials vault:', err);
+    return null;
+  }
+}
+
+/**
+ * Server-Side Persistent Crypto Vault (backed by safe dataStore)
+ */
+export async function saveServerCryptoVault(data: CryptoVaultData): Promise<void> {
+  try {
+    const jsonStr = JSON.stringify({ ...data, updatedAt: Date.now() });
+    const encrypted = await encryptCredential(jsonStr);
+    const { writeDataFileAsync } = await import('./dataStore');
+    await writeDataFileAsync('crypto_vault.enc', encrypted);
+  } catch (err) {
+    console.warn('[cryptoVault] saveServerCryptoVault error (ignored):', err);
+  }
+}
+
+export async function loadServerCryptoVault(): Promise<CryptoVaultData | null> {
+  try {
+    const { readDataFileAsync } = await import('./dataStore');
+    const encrypted = await readDataFileAsync('crypto_vault.enc', '');
+    if (!encrypted || !encrypted.trim()) return null;
+    const decrypted = await decryptCredential(encrypted);
+    const parsed = JSON.parse(decrypted) as Partial<CryptoVaultData>;
+    return {
+      activeCryptoExchange: parsed.activeCryptoExchange || 'BINANCE',
+      binance: {
+        apiKey: parsed.binance?.apiKey || '',
+        secretKey: parsed.binance?.secretKey || '',
+        accountType: parsed.binance?.accountType || 'DEMO',
+      },
+      bitget: {
+        apiKey: parsed.bitget?.apiKey || '',
+        secretKey: parsed.bitget?.secretKey || '',
+        passphrase: parsed.bitget?.passphrase || '',
+        accountType: parsed.bitget?.accountType || 'DEMO',
+      },
+      updatedAt: parsed.updatedAt || Date.now(),
+    };
   } catch {
     return null;
   }

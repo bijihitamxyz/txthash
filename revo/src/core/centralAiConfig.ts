@@ -30,6 +30,7 @@ export interface CentralAiConfig {
   apiKey: string;
   providers: AiProviderSlot[];
   confidenceThreshold: number;
+  autoAdaptiveThreshold?: boolean;
   kronosVpsUrl: string;
   kronosApiKey: string;
   engineSwitches: EngineSwitches;
@@ -109,7 +110,8 @@ export const DEFAULT_CENTRAL_AI_CONFIG: CentralAiConfig = {
   model: 'Multi-AI Consensus / Risk Governance',
   apiKey: '',
   providers: DEFAULT_AI_PROVIDER_SLOTS.map((s) => ({ ...s })),
-  confidenceThreshold: 70,
+  confidenceThreshold: 56,
+  autoAdaptiveThreshold: true,
   kronosVpsUrl: process.env.NEXT_PUBLIC_KRONOS_VPS_URL || process.env.KRONOS_VPS_URL || 'http://127.0.0.1:8000',
   kronosApiKey: process.env.NEXT_PUBLIC_KRONOS_API_KEY || process.env.KRONOS_API_KEY || 'nmssx-kronos-secret-2026',
   engineSwitches: { ...DEFAULT_ENGINE_SWITCHES },
@@ -207,25 +209,202 @@ export function normalizeProviderSlots(
 }
 
 /**
- * Returns all AI provider slots that are enabled and have valid credentials (or tested local gateway).
- * Dynamically supports 0, 1, or N connected LLMs without hardcoding any mandatory default LLM.
+ * Detects if a provider ID or base URL represents a commercial cloud LLM provider
+ * (Anthropic, OpenAI, OpenRouter, Groq, DeepSeek, Google Gemini).
+ */
+export function isCloudProvider(slotId: string, baseUrl: string): boolean {
+  const id = (slotId || '').toLowerCase().trim();
+  const url = (baseUrl || '').toLowerCase().trim();
+  const cloudIds = ['anthropic', 'openai', 'openrouter', 'groq', 'deepseek', 'gemini'];
+  if (cloudIds.includes(id)) return true;
+  if (
+    url.includes('api.anthropic.com') ||
+    url.includes('api.openai.com') ||
+    url.includes('openrouter.ai') ||
+    url.includes('api.groq.com') ||
+    url.includes('api.deepseek.com') ||
+    url.includes('googleapis.com')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Smart Active-Only AI Consensus Filter:
+ * Automatically prunes unconfigured cloud providers with empty keys,
+ * ensuring only genuinely configured/reachable nodes (e.g. VPS Ollama qwen2.5:3b or valid cloud keys)
+ * participate in Multi-AI Consensus.
+ */
+export function isProviderGenuinelyConfigured(slot: {
+  id?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  enabled?: boolean;
+  lastTestOk?: boolean;
+}): boolean {
+  if (!slot || slot.enabled === false) return false;
+  const cleanUrl = (slot.baseUrl || '').trim();
+  if (!cleanUrl) return false;
+  const cleanKey = (slot.apiKey || '').trim();
+
+  // 1. Cloud Providers MUST have a real, non-empty, non-masked API key (>= 5 chars)
+  if (isCloudProvider(slot.id || '', cleanUrl)) {
+    if (!cleanKey || cleanKey.length < 5 || cleanKey.includes('••••••••')) {
+      return false;
+    }
+    return true;
+  }
+
+  // 2. Local / VPS / Custom Ollama Gateway (e.g. http://172.235.254.157:11434/v1)
+  const { isLocal } = normalizeAiEndpoint(cleanUrl);
+  if (isLocal) {
+    return cleanKey.length > 0 || slot.lastTestOk === true || cleanUrl.length > 0;
+  }
+
+  // Custom / Self-hosted endpoint: active if key is set, or test passed, or explicit custom endpoint is populated
+  return cleanKey.length > 0 || slot.lastTestOk === true || (slot.id === 'custom' && cleanUrl.length > 0);
+}
+
+/**
+ * Returns all AI provider slots that are genuinely configured and active.
+ * Automatically prunes unconfigured cloud providers even if default state was enabled.
  */
 export function getActiveAiProviders(config: CentralAiConfig): AiProviderSlot[] {
   if (!config || config.engineSwitches?.multiAiRiskJudge === false) {
     return [];
   }
   const slots = Array.isArray(config.providers) ? config.providers : [];
-  return slots.filter((slot) => {
-    if (!slot || slot.enabled === false) return false;
-    const cleanUrl = (slot.baseUrl || '').trim();
-    if (!cleanUrl) return false;
-    const cleanKey = (slot.apiKey || '').trim();
-    const { isLocal } = normalizeAiEndpoint(cleanUrl);
-    if (isLocal) {
-      return cleanKey.length > 0 || slot.lastTestOk === true;
-    }
-    return cleanKey.length >= 5 && !cleanKey.includes('••••••••');
-  });
+  return slots.filter((slot) => isProviderGenuinelyConfigured(slot));
+}
+
+export interface DynamicThresholdContext {
+  efficiencyRatio?: number;
+  pocMagnetAligned?: boolean;
+  kronosProbability?: number; // 0 to 100 or 0.0 to 1.0
+  bbwExpandingRapidly?: boolean;
+  bbwExpansionPct?: number;
+  isFundingWindow?: boolean;
+  recentStopLoss?: boolean;
+  symbol?: string;
+  marketType?: 'FOREX' | 'CRYPTO';
+}
+
+export interface DynamicThresholdResult {
+  threshold: number;
+  baseThreshold: number;
+  breakdown: {
+    regimeDelta: number;
+    regimeLabel: string;
+    pocDelta: number;
+    volatilityDelta: number;
+    recoveryDelta: number;
+  };
+  reasons: string[];
+  telemetryLog: string;
+}
+
+/**
+ * Pure Quantitative Autonomous Dynamic Confidence Threshold Engine (Zero Manual Tuning):
+ * - Base Institutional Threshold: 65%
+ * - Regime Adjustment (Kaufman Efficiency Ratio ER):
+ *   - ER <= 0.42 (Ideal Mean-Reverting / Ranging Regime): -5% (Threshold lowers to 60%)
+ *   - 0.42 < ER <= 0.58 (Normal Regime): +0% (65%)
+ *   - 0.58 < ER <= 0.68 (Trending / High Momentum): +7% (72%)
+ *   - ER > 0.68 (Runaway Institutional Cascade): +13% (78%)
+ * - Kronos Volume Profile Alignment:
+ *   - pocMagnetAligned === true && Kronos directional probability >= 58%: -3% bonus discount
+ * - Volatility & Session Guard Adjustment:
+ *   - Rapid BBW expansion OR Crypto near funding window: +4% stricter requirement
+ *   - Recent Stop Loss within last 2 hours (Sniper Recovery Mode): +5%
+ * - Clamped strictly between 58% (minimum floor) and 82% (maximum ceiling)
+ */
+export function calculateDynamicThreshold(context: DynamicThresholdContext): DynamicThresholdResult {
+  const baseThreshold = 65;
+  let delta = 0;
+  const reasons: string[] = [];
+
+  // 1. Regime Adjustment (Kaufman Efficiency Ratio ER)
+  const er = typeof context.efficiencyRatio === 'number' && !isNaN(context.efficiencyRatio)
+    ? context.efficiencyRatio
+    : 0.50;
+
+  let regimeDelta = 0;
+  let regimeLabel = 'Normal Regime';
+  if (er <= 0.42) {
+    regimeDelta = -5;
+    regimeLabel = 'Ideal Mean-Reversion';
+    reasons.push(`Regime ER=${er.toFixed(2)} <= 0.42 (-5%)`);
+  } else if (er <= 0.58) {
+    regimeDelta = 0;
+    regimeLabel = 'Normal Regime';
+    reasons.push(`Regime ER=${er.toFixed(2)} (+0%)`);
+  } else if (er <= 0.68) {
+    regimeDelta = 7;
+    regimeLabel = 'Trending/Momentum';
+    reasons.push(`Regime ER=${er.toFixed(2)} trending (+7%)`);
+  } else {
+    regimeDelta = 13;
+    regimeLabel = 'Runaway Cascade';
+    reasons.push(`Regime ER=${er.toFixed(2)} runaway cascade (+13%)`);
+  }
+  delta += regimeDelta;
+
+  // 2. Kronos Volume Profile Alignment
+  let pocDelta = 0;
+  const rawProb = typeof context.kronosProbability === 'number' ? context.kronosProbability : 50;
+  const prob = rawProb <= 1.0 ? rawProb * 100 : rawProb;
+  if (context.pocMagnetAligned === true && prob >= 58) {
+    pocDelta = -3;
+    delta += pocDelta;
+    reasons.push(`Kronos POC Aligned & Prob ${prob.toFixed(0)}% >= 58% (-3%)`);
+  }
+
+  // 3. Volatility & Session Guard Adjustment
+  let volatilityDelta = 0;
+  const isRapidBbw = context.bbwExpandingRapidly === true || (typeof context.bbwExpansionPct === 'number' && context.bbwExpansionPct > 15);
+  if (isRapidBbw || context.isFundingWindow === true) {
+    volatilityDelta = 4;
+    delta += volatilityDelta;
+    const volReason = isRapidBbw ? 'Rapid BBW Expansion' : 'Funding Settlement Window';
+    reasons.push(`${volReason} (+4%)`);
+  }
+
+  // 4. Sniper Recovery Mode (recent Stop Loss within last 2 hours)
+  let recoveryDelta = 0;
+  if (context.recentStopLoss === true) {
+    recoveryDelta = 5;
+    delta += recoveryDelta;
+    reasons.push(`Recent Stop Loss < 2h Sniper Recovery (+5%)`);
+  }
+
+  // 5. Clamp between 58% (minimum floor) and 82% (maximum ceiling)
+  const rawThreshold = baseThreshold + delta;
+  const threshold = Math.min(82, Math.max(58, Math.round(rawThreshold)));
+
+  const telemetryLog = `[AUTO-GOVERNANCE] Dynamic Threshold: ${threshold}% (Base 65% | ${reasons.join(', ')})`;
+
+  return {
+    threshold,
+    baseThreshold,
+    breakdown: {
+      regimeDelta,
+      regimeLabel,
+      pocDelta,
+      volatilityDelta,
+      recoveryDelta,
+    },
+    reasons,
+    telemetryLog,
+  };
+}
+
+export function formatAutoGovernanceTelemetry(
+  score: number,
+  dynamicResult: DynamicThresholdResult,
+  decision: 'EXECUTE' | 'REJECT'
+): string {
+  return `[AUTO-GOVERNANCE] AI Score: ${score}% vs Dynamic Threshold: ${dynamicResult.threshold}% (${dynamicResult.reasons.join(', ')}) -> ${decision}`;
 }
 
 export function formatActiveAiSummaryLabel(config: CentralAiConfig): string {
@@ -265,6 +444,10 @@ export async function readCentralAiConfig(): Promise<CentralAiConfig> {
         typeof parsed.confidenceThreshold === 'number'
           ? parsed.confidenceThreshold
           : DEFAULT_CENTRAL_AI_CONFIG.confidenceThreshold,
+      autoAdaptiveThreshold:
+        typeof parsed.autoAdaptiveThreshold === 'boolean'
+          ? parsed.autoAdaptiveThreshold
+          : true,
       kronosVpsUrl: parsed.kronosVpsUrl || DEFAULT_CENTRAL_AI_CONFIG.kronosVpsUrl,
       kronosApiKey: parsed.kronosApiKey || DEFAULT_CENTRAL_AI_CONFIG.kronosApiKey,
       engineSwitches: normalizeEngineSwitches(parsed.engineSwitches),
@@ -354,6 +537,10 @@ export async function writeCentralAiConfig(
         typeof config.confidenceThreshold === 'number'
           ? config.confidenceThreshold
           : current.confidenceThreshold ?? DEFAULT_CENTRAL_AI_CONFIG.confidenceThreshold,
+      autoAdaptiveThreshold:
+        typeof config.autoAdaptiveThreshold === 'boolean'
+          ? config.autoAdaptiveThreshold
+          : current.autoAdaptiveThreshold ?? true,
       kronosVpsUrl: (
         config.kronosVpsUrl ??
         current.kronosVpsUrl ??

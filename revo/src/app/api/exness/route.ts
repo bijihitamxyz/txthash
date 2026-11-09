@@ -5,6 +5,7 @@ import {
   coalesceSnapshotRequest,
   LiveQuote,
   validateExnessCredentials,
+  normalizeGatewayHost,
 } from '@/core/exnessClient';
 import {
   loadVaultCredentials,
@@ -206,10 +207,7 @@ export async function POST(req: NextRequest) {
       const apiKey = String(incomingCreds.apiKey || '').trim();
       const privateKey = String(incomingCreds.privateKey || '').trim();
       const mode = incomingCreds.mode === 'REAL' ? 'REAL' : 'DEMO';
-      let server = String(incomingCreds.server || '').trim();
-      if (!server) {
-        server = 'https://api.exness-api.com';
-      }
+      let server = normalizeGatewayHost(incomingCreds.server);
 
       // 1. accountId validation (must be valid numeric login e.g. 464129221 or 30000143146)
       if (!accountId || !/^\d+$/.test(accountId)) {

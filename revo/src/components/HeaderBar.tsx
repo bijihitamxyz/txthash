@@ -68,6 +68,7 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
   const cryptoDailyPnl = useBinanceStore((s) => s.dailyPnl);
   const cryptoDailyPnlPercent = useBinanceStore((s) => s.dailyPnlPercent);
   const isTestnet = useBinanceStore((s) => s.isTestnet);
+  const activeCryptoExchange = useBinanceStore((s) => s.activeExchange);
   const isCryptoVaultConfigured = useBinanceStore((s) => s.isVaultConfigured);
   const openCryptoVaultModal = useBinanceStore((s) => s.openVaultModal);
   const openCryptoPnlCalendar = useBinanceStore((s) => s.openPnlCalendar);
@@ -347,7 +348,7 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
             </span>
             {isLiveConnected && (
               <span className="hidden sm:inline text-[10px] text-emerald-600 font-normal">
-                ({isForex ? (activeCreds.server || 'Exness') : (isTestnet ? 'Binance Testnet' : 'Binance Live')})
+                ({isForex ? (activeCreds.server || 'Exness') : (activeCryptoExchange === 'BITGET' ? (isTestnet ? 'Bitget Demo' : 'Bitget Live') : (isTestnet ? 'Binance Testnet' : 'Binance Live'))})
               </span>
             )}
           </div>
@@ -365,7 +366,7 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
               }`}
             >
               <Key className="w-3.5 h-3.5" />
-              <span>{isForex ? 'Exness Vault' : 'Binance API'}</span>
+              <span>{isForex ? 'Exness Vault' : (activeCryptoExchange === 'BITGET' ? 'Bitget API' : 'Binance API')}</span>
             </button>
 
             {/* Active License pill */}

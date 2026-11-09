@@ -32,7 +32,6 @@ import {
   KeyRound,
   ArrowUpRight,
   ArrowDownRight,
-  AlertOctagon,
 } from 'lucide-react';
 import {
   calculateBollingerBands,
@@ -84,6 +83,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   const setTimeframe = useBinanceStore((s) => s.setTimeframe);
 
   // Account & Vault
+  const activeExchange = useBinanceStore((s) => s.activeExchange || 'BINANCE');
   const walletBalance = useBinanceStore((s) => s.walletBalance);
   const isTestnet = useBinanceStore((s) => s.isTestnet);
   const isVaultConfigured = useBinanceStore((s) => s.isVaultConfigured);
@@ -108,6 +108,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
 
   // Positions & Telemetry
   const positions = useBinanceStore((s) => s.positions);
+  const lastVerdict = useBinanceStore((s) => s.lastVerdict);
   const telemetryLogs = useBinanceStore((s) => s.telemetryLogs);
   const clearTelemetry = useBinanceStore((s) => s.clearTelemetry);
   const closePosition = useBinanceStore((s) => s.closePosition);
@@ -124,32 +125,71 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   // Mount & Polling Effects
   useEffect(() => {
     setIsMounted(true);
-    useBinanceStore.setState({ isAutoTrading: false });
     useBinanceStore.getState().loadSavedCredentials();
-    useBinanceStore.getState().fetchSymbolsAndTickers();
+    useBinanceStore.getState().fetchSymbolsAndTickers(true);
     useBinanceStore.getState().fetchKlines(useBinanceStore.getState().selectedSymbol);
     useBinanceStore.getState().fetchAccountInfo();
 
-    const tickerInterval = setInterval(() => {
-      useBinanceStore.getState().fetchSymbolsAndTickers();
-    }, 2500);
+    let tickerInterval: NodeJS.Timeout | null = null;
+    let klineInterval: NodeJS.Timeout | null = null;
+    let accountInterval: NodeJS.Timeout | null = null;
 
-    const klineInterval = setInterval(() => {
-      const sym = useBinanceStore.getState().selectedSymbol;
-      useBinanceStore.getState().fetchKlines(sym);
-    }, 3500);
+    const startIntervals = () => {
+      if (tickerInterval) clearInterval(tickerInterval);
+      if (klineInterval) clearInterval(klineInterval);
+      if (accountInterval) clearInterval(accountInterval);
 
-    const accountInterval = setInterval(() => {
-      useBinanceStore.getState().fetchAccountInfo();
-    }, 4500);
+      tickerInterval = setInterval(() => {
+        if (typeof document !== 'undefined' && document.hidden) return;
+        useBinanceStore.getState().fetchSymbolsAndTickers();
+      }, 2500);
+
+      klineInterval = setInterval(() => {
+        if (typeof document !== 'undefined' && document.hidden) return;
+        const sym = useBinanceStore.getState().selectedSymbol;
+        useBinanceStore.getState().fetchKlines(sym);
+      }, 3500);
+
+      accountInterval = setInterval(() => {
+        if (typeof document !== 'undefined' && document.hidden) return;
+        useBinanceStore.getState().fetchAccountInfo();
+      }, 4500);
+    };
+
+    const stopIntervals = () => {
+      if (tickerInterval) clearInterval(tickerInterval);
+      if (klineInterval) clearInterval(klineInterval);
+      if (accountInterval) clearInterval(accountInterval);
+      tickerInterval = null;
+      klineInterval = null;
+      accountInterval = null;
+    };
+
+    startIntervals();
+
+    const handleVisibilityChange = () => {
+      if (typeof document === 'undefined') return;
+      if (document.hidden) {
+        stopIntervals();
+      } else {
+        // Tab / app regained focus: fetch fresh snapshot once and restart background intervals
+        const sym = useBinanceStore.getState().selectedSymbol;
+        useBinanceStore.getState().fetchSymbolsAndTickers();
+        useBinanceStore.getState().fetchKlines(sym);
+        useBinanceStore.getState().fetchAccountInfo();
+        setCanvasWidthTick((v) => v + 1);
+        startIntervals();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     const handleResize = () => setCanvasWidthTick((v) => v + 1);
     window.addEventListener('resize', handleResize);
 
     return () => {
-      clearInterval(tickerInterval);
-      clearInterval(klineInterval);
-      clearInterval(accountInterval);
+      stopIntervals();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('resize', handleResize);
     };
   }, []);
@@ -159,6 +199,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   useEffect(() => {
     let cancelled = false;
     const syncCryptoKronos = async () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       try {
         const mappedCandles = klines.slice(-60).map((k) => ({
           time: k.timestamp > 1e11 ? Math.floor(k.timestamp / 1000) : k.timestamp,
@@ -212,12 +253,28 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   useEffect(() => {
     if (!isMounted || !isAutoTrading) return;
 
-    useBinanceStore.getState().executeScannerTick();
-    const scanInterval = setInterval(() => {
-      useBinanceStore.getState().executeScannerTick();
-    }, 4000);
+    let scanInterval: NodeJS.Timeout | null = null;
+    const runScanTick = () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      if (useBinanceStore.getState().isAutoTrading) {
+        useBinanceStore.getState().executeScannerTick();
+      }
+    };
 
-    return () => clearInterval(scanInterval);
+    runScanTick();
+    scanInterval = setInterval(runScanTick, 4000);
+
+    const handleVisibility = () => {
+      if (typeof document !== 'undefined' && !document.hidden && useBinanceStore.getState().isAutoTrading) {
+        runScanTick();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+
+    return () => {
+      if (scanInterval) clearInterval(scanInterval);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, [isMounted, isAutoTrading]);
 
   // Current ticker for selected coin
@@ -296,13 +353,16 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
 
   // Institutional Dark / Light Adaptive HTML5 Canvas Candlestick Renderer
   useEffect(() => {
+    if (typeof document !== 'undefined' && document.hidden) return;
     const canvas = canvasRef.current;
     if (!canvas || klines.length === 0) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const width = canvas.parentElement?.clientWidth || 800;
-    const height = canvas.parentElement?.clientHeight || 440;
+    const width = canvas.parentElement?.clientWidth || 0;
+    const height = canvas.parentElement?.clientHeight || 0;
+    if (width <= 0 || height <= 0) return;
+
     const dpr = window.devicePixelRatio || 1;
     canvas.width = width * dpr;
     canvas.height = height * dpr;
@@ -496,7 +556,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
             <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-zinc-800 mb-3">
               <div className="flex items-center gap-2">
                 <span className="font-sans font-bold text-sm text-[#0F172A] dark:text-slate-100">
-                  Select Binance USDⓈ-M Perpetual Pair
+                  Select {activeExchange === 'BITGET' ? 'Bitget' : 'Binance'} USDⓈ-M Perpetual Pair
                 </span>
                 <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/60 font-semibold">
                   300+ PAIRS
@@ -644,7 +704,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
           <div className="space-y-2 pt-4 border-t border-slate-100 dark:border-zinc-800">
             <div className="flex items-center justify-between px-2">
               <span className="font-mono text-[10px] uppercase tracking-wider text-slate-400 dark:text-zinc-500">
-                LIVE BINANCE FEED
+                LIVE {activeExchange} FEED
               </span>
               <button
                 type="button"
@@ -699,7 +759,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
         <div className="p-3.5 rounded-2xl bg-[#F8FAFC] dark:bg-zinc-950 border border-slate-200/90 dark:border-zinc-800 space-y-2">
           <div className="flex items-center justify-between">
             <span className="font-mono text-[10px] uppercase tracking-wider text-slate-500 dark:text-slate-400 font-semibold">
-              HMAC-SHA256 SIGNING
+              {activeExchange === 'BITGET' ? 'BITGET V2 SIGNING' : 'BINANCE SIGNING'}
             </span>
             <span
               className={`w-2 h-2 rounded-full ${
@@ -709,13 +769,15 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
           </div>
           <div className="font-mono text-xs font-bold text-[#0F172A] dark:text-slate-100 truncate">
             {isVaultConfigured
-              ? isTestnet
-                ? 'Binance Testnet Bound'
-                : 'Binance Live Bound'
+              ? activeExchange === 'BITGET'
+                ? isTestnet ? 'Bitget Demo Bound' : 'Bitget Live Bound'
+                : isTestnet ? 'Binance Testnet Bound' : 'Binance Live Bound'
               : 'Public Feed (Unbound)'}
           </div>
           <div className="font-mono text-[10px] text-slate-500 dark:text-slate-400 truncate">
-            {isTestnet ? 'testnet.binancefuture.com' : 'fapi.binance.com'}
+            {activeExchange === 'BITGET'
+              ? 'api.bitget.com (V2)'
+              : isTestnet ? 'testnet.binancefuture.com' : 'fapi.binance.com'}
           </div>
         </div>
       </aside>
@@ -752,7 +814,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                 type="button"
                 onClick={() => fetchAccountInfo()}
                 className="text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer"
-                title="Sync Binance Wallet"
+                title={`Sync ${activeExchange === 'BITGET' ? 'Bitget' : 'Binance'} Wallet`}
               >
                 <RefreshCw className="w-3 h-3" />
               </button>
@@ -792,7 +854,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
           <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] p-4 flex flex-col justify-between transition-colors">
             <div className="flex items-center justify-between gap-1">
               <span className="font-mono text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400 font-semibold">
-                BINANCE GATEWAY
+                {activeExchange} GATEWAY
               </span>
               <span
                 className={`px-2.5 py-0.5 rounded-full text-[10px] font-mono font-semibold flex items-center gap-1 border ${
@@ -811,10 +873,14 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
             </div>
             <div className="my-1.5">
               <div className="font-mono text-xs font-bold text-[#0F172A] dark:text-slate-100 truncate">
-                {isTestnet ? 'testnet.binancefuture.com' : 'fapi.binance.com'}
+                {activeExchange === 'BITGET'
+                  ? 'api.bitget.com (USDT-M V2)'
+                  : isTestnet ? 'testnet.binancefuture.com' : 'fapi.binance.com'}
               </div>
               <div className="font-mono text-[11px] text-slate-500 dark:text-slate-400">
-                Signing: <strong className="text-emerald-700 dark:text-emerald-400">HMAC-SHA256</strong>
+                Signing: <strong className="text-emerald-700 dark:text-emerald-400">
+                  {activeExchange === 'BITGET' ? 'HMAC-SHA256 + Passphrase' : 'HMAC-SHA256'}
+                </strong>
               </div>
             </div>
             <div className="flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-slate-400">
@@ -825,7 +891,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                 className="text-[#0F172A] dark:text-slate-100 hover:text-emerald-700 dark:hover:text-emerald-400 font-semibold inline-flex items-center gap-1 cursor-pointer"
               >
                 <KeyRound className="w-3 h-3" />
-                <span>Configure</span>
+                <span>API KEY</span>
               </button>
             </div>
           </div>
@@ -861,7 +927,12 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
               </div>
             </div>
             <div className="text-[10px] font-mono text-slate-400 dark:text-zinc-500 flex items-center justify-between">
-              <span>Asymmetric 60% Lock</span>
+              <span>
+                Dynamic AI Gate: AUTO{' '}
+                {lastVerdict[selectedSymbol]?.dynamicThreshold
+                  ? `(${lastVerdict[selectedSymbol].dynamicThreshold}%)`
+                  : '(58–82%)'}
+              </span>
               <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
                 {isScanning ? 'SCANNING' : 'READY'}
               </span>
@@ -1046,7 +1117,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
               {positions.length === 0 ? (
                 <div className="p-8 text-center space-y-1">
                   <div className="font-mono text-xs text-slate-500 dark:text-slate-400">
-                    No open Binance USDⓈ-M Perpetual positions.
+                    No open {activeExchange === 'BITGET' ? 'Bitget' : 'Binance'} Futures positions.
                   </div>
                   <p className="text-slate-400 dark:text-zinc-500 text-xs">
                     Toggle START FUTURES AUTO-TRADING or use Manual Market Entry on the right panel.
@@ -1096,9 +1167,9 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                             </td>
                             <td className="px-4 py-3 font-semibold text-[#0F172A] dark:text-slate-100">{size}</td>
                             <td className="px-4 py-3 text-slate-700 dark:text-slate-300">
-                              ${pos.entryPrice.toFixed(pos.entryPrice < 1 ? 4 : 2)} -&gt;{' '}
+                              ${pos.entryPrice.toFixed(pos.entryPrice < 10 ? 4 : 2)} -&gt;{' '}
                               <strong className="text-[#0F172A] dark:text-slate-100">
-                                ${mark.toFixed(mark < 1 ? 4 : 2)}
+                                ${mark.toFixed(mark < 10 ? 4 : 2)}
                               </strong>
                             </td>
                             <td className="px-4 py-3 text-slate-600 dark:text-slate-400">
@@ -1118,13 +1189,13 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                               {pos.partialClosed ? (
                                 <span className="px-2 py-0.5 rounded-full text-[10px] bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800/60 text-emerald-700 dark:text-emerald-400 font-semibold inline-flex items-center gap-1">
                                   <CheckCircle2 className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
-                                  60% Banked (BE+ Locked)
+                                  50% Banked (BE+ Locked)
                                 </span>
                               ) : (
                                 <span className="px-2 py-0.5 rounded-full text-[10px] bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800/60 text-amber-800 dark:text-amber-300 font-semibold inline-flex items-center gap-1">
                                   <Lock className="w-3 h-3 text-amber-600 dark:text-amber-400" />
                                   TP1: $
-                                  {pos.takeProfit1Price?.toFixed(pos.entryPrice < 1 ? 4 : 2) ||
+                                  {pos.takeProfit1Price?.toFixed(pos.entryPrice < 10 ? 4 : 2) ||
                                     '---'}
                                 </span>
                               )}
@@ -1332,15 +1403,6 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                     <span>SHORT (${marginUsdt})</span>
                   </button>
                 </div>
-
-                <button
-                  type="button"
-                  onClick={panicCloseAll}
-                  className="w-full bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800/80 text-rose-600 dark:text-rose-400 hover:bg-rose-100 dark:hover:bg-rose-900/60 rounded-xl px-4 py-2 text-xs font-sans font-semibold transition-all flex items-center justify-center gap-1.5 cursor-pointer"
-                >
-                  <AlertOctagon className="w-3.5 h-3.5" />
-                  <span>PANIC CLOSE ALL POSITIONS</span>
-                </button>
               </div>
 
               {/* Multi-AI + Kronos Pipeline Telemetry */}
@@ -1414,7 +1476,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
           <div className="max-h-72 overflow-y-auto divide-y divide-slate-100 dark:divide-zinc-800 font-mono text-xs">
             {unifiedTelemetry.length === 0 ? (
               <div className="p-6 text-center text-slate-400 dark:text-zinc-500">
-                [SYSTEM] Binance USDⓈ-M Perpetual Execution Telemetry active for {selectedSymbol}. Waiting for scanner or manual execution event...
+                [SYSTEM] {activeExchange === 'BITGET' ? 'Bitget' : 'Binance'} Futures Execution Telemetry active for {selectedSymbol}. Waiting for scanner or manual execution event...
               </div>
             ) : (
               unifiedTelemetry.map((log) => {

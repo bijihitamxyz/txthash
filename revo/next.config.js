@@ -8,6 +8,23 @@ const nextConfig = {
   experimental: {
     lockDistDir: false,
   },
+  webpack: (config, { dev }) => {
+    if (dev) {
+      config.watchOptions = {
+        ...(config.watchOptions || {}),
+        ignored: [
+          '**/.git/**',
+          '**/node_modules/**',
+          '**/.data/**',
+          '**/data/**',
+          '**/*.enc',
+          '**/*.json',
+          '**/tmp/**',
+        ],
+      };
+    }
+    return config;
+  },
   turbopack: {
     resolveAlias: {
       fs: { browser: './src/lib/emptyModule.js' },

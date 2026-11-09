@@ -2355,7 +2355,7 @@ export const useTradingStore = create<TradingState>()(
         openPositions: state.openPositions || state.positions || [],
         positions: state.openPositions || state.positions || [],
         symbolPrices: state.symbolPrices || {},
-        // Note: isAutoTrading is strictly excluded from localStorage persistence
+        isAutoTrading: state.isAutoTrading,
         accountMode: state.accountMode,
         targetMarket: state.targetMarket,
         focusSymbol: state.focusSymbol,
@@ -2371,21 +2371,26 @@ export const useTradingStore = create<TradingState>()(
       }),
       onRehydrateStorage: () => (rehydratedState) => {
         if (rehydratedState) {
-          // Strictly force isAutoTrading to false on page load / refresh
-          rehydratedState.isAutoTrading = false;
+          // Persist isAutoTrading across tab switches and page loads
+          rehydratedState.isAutoTrading = Boolean(rehydratedState.isAutoTrading);
           rehydratedState.dailyPnlHistory = rehydratedState.dailyPnlHistory || {};
           const savedPrices = rehydratedState.symbolPrices && Object.keys(rehydratedState.symbolPrices).length > 0
             ? rehydratedState.symbolPrices
             : getPersistedSymbolPrices();
           rehydratedState.symbolPrices = savedPrices;
 
+          const valid = (Array.isArray(rehydratedState.openPositions)
+            ? rehydratedState.openPositions
+            : (Array.isArray(rehydratedState.positions) ? rehydratedState.positions : [])
+          ).filter((p: any) => p && p.id !== 'F-637' && p.id !== '#F-637');
+          rehydratedState.openPositions = valid;
+          rehydratedState.positions = valid;
+
           const isConn = Boolean(rehydratedState.accountInfo?.connected);
           if (!isConn) {
             rehydratedState.balance = null;
             rehydratedState.equity = null;
             rehydratedState.dailyPnl = null;
-            rehydratedState.openPositions = [];
-            rehydratedState.positions = [];
             if (rehydratedState.accountInfo) {
               rehydratedState.accountInfo.balance = null;
               rehydratedState.accountInfo.equity = null;
@@ -2455,6 +2460,5 @@ export const useTradingStore = create<TradingState>()(
 if (typeof window !== 'undefined') {
   setTimeout(() => {
     useTradingStore.persist?.rehydrate?.();
-    useTradingStore.setState({ isAutoTrading: false });
   }, 0);
 }

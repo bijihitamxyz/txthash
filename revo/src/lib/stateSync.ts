@@ -31,6 +31,11 @@ export interface StateTelemetryItem {
 
 export interface BotRuntimeState {
   isAutoTrading: boolean;
+  cryptoIsAutoTrading: boolean;
+  cryptoMarginUsdt?: number;
+  cryptoLeverage?: number;
+  cryptoMarginMode?: 'ISOLATED' | 'CROSS';
+  cryptoMaxConcurrentCoins?: number;
   accountMode: AccountMode;
   targetMarket: TargetMarket;
   selectedSymbol: string;
@@ -50,6 +55,11 @@ export interface BotRuntimeState {
 
 export const DEFAULT_STATE: BotRuntimeState = {
   isAutoTrading: false,
+  cryptoIsAutoTrading: false,
+  cryptoMarginUsdt: 25.0,
+  cryptoLeverage: 10,
+  cryptoMarginMode: 'ISOLATED',
+  cryptoMaxConcurrentCoins: 5,
   accountMode: 'DEMO',
   targetMarket: 'GOLD',
   selectedSymbol: 'XAUUSDm',
@@ -193,7 +203,12 @@ class StateSyncManager {
           this.inMemoryState = {
             ...DEFAULT_STATE,
             ...parsed,
-            isAutoTrading: false, // strictly initialize engine idle
+            isAutoTrading: Boolean(parsed.isAutoTrading),
+            cryptoIsAutoTrading: false, // strictly default to false on server startup to prevent ghost trades
+            cryptoMarginUsdt: typeof parsed.cryptoMarginUsdt === 'number' ? parsed.cryptoMarginUsdt : 25.0,
+            cryptoLeverage: typeof parsed.cryptoLeverage === 'number' ? parsed.cryptoLeverage : 10,
+            cryptoMarginMode: parsed.cryptoMarginMode || 'ISOLATED',
+            cryptoMaxConcurrentCoins: typeof parsed.cryptoMaxConcurrentCoins === 'number' ? parsed.cryptoMaxConcurrentCoins : 5,
             positions: Array.isArray(parsed.positions) ? parsed.positions : [],
             credentials: {
               ...DEFAULT_CREDENTIALS,

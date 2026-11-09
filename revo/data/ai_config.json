@@ -1,5 +1,5 @@
 {
-  "baseUrl": "http://54.252.135.240:11434/v1",
+  "baseUrl": "http://172.235.254.157:11434/v1",
   "model": "qwen2.5:3b",
   "apiKey": "nmssx-vps-key",
   "providers": [
@@ -9,7 +9,7 @@
       "baseUrl": "https://api.anthropic.com/v1",
       "apiKey": "",
       "model": "claude-sonnet-4-20250514",
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "openrouter",
@@ -17,7 +17,7 @@
       "baseUrl": "https://openrouter.ai/api/v1",
       "apiKey": "",
       "model": "anthropic/claude-3.7-sonnet",
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "openai",
@@ -25,7 +25,7 @@
       "baseUrl": "https://api.openai.com/v1",
       "apiKey": "",
       "model": "gpt-4o",
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "groq",
@@ -33,7 +33,7 @@
       "baseUrl": "https://api.groq.com/openai/v1",
       "apiKey": "",
       "model": "llama-3.3-70b-versatile",
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "deepseek",
@@ -41,7 +41,7 @@
       "baseUrl": "https://api.deepseek.com/v1",
       "apiKey": "",
       "model": "deepseek-chat",
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "gemini",
@@ -49,22 +49,23 @@
       "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
       "apiKey": "",
       "model": "gemini-2.5-flash",
-      "enabled": true
+      "enabled": false
     },
     {
       "id": "custom",
       "name": "Custom / OpenAI-Compatible Gateway",
-      "baseUrl": "http://54.252.135.240:11434/v1",
+      "baseUrl": "http://172.235.254.157:11434/v1",
       "apiKey": "nmssx-vps-key",
       "model": "qwen2.5:3b",
       "enabled": true,
-      "lastTestedAt": 1794111288180,
+      "lastTestedAt": 1794156710131,
       "lastTestOk": true,
-      "lastLatencyMs": 5575,
+      "lastLatencyMs": 1336,
       "lastError": ""
     }
   ],
-  "confidenceThreshold": 70,
+  "confidenceThreshold": 56,
+  "autoAdaptiveThreshold": true,
   "kronosVpsUrl": "http://129.225.13.35:8000",
   "kronosApiKey": "nmssx-kronos-secret-2026",
   "engineSwitches": {
@@ -75,5 +76,5 @@
     "restMutexQueue": true,
     "emergencyKillSwitch": false
   },
-  "updatedAt": 1794111300301
+  "updatedAt": 1794194512910
 }

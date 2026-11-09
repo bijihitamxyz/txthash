@@ -92,7 +92,7 @@ const PROVIDER_META: Record<
   }
 > = {
   anthropic: {
-    shortName: 'Anthropic',
+    shortName: 'Claude',
     brandColor: 'text-[#D97706] dark:text-[#FBBF24]',
     badgeBg: 'bg-amber-500/10',
     badgeBorder: 'border-amber-500/30',
@@ -122,13 +122,13 @@ const PROVIDER_META: Record<
     badgeBorder: 'border-sky-500/30',
   },
   gemini: {
-    shortName: 'Google Gemini',
+    shortName: 'Gemini',
     brandColor: 'text-purple-600 dark:text-purple-400',
     badgeBg: 'bg-purple-500/10',
     badgeBorder: 'border-purple-500/30',
   },
   custom: {
-    shortName: 'Custom / Local VPS',
+    shortName: 'VPS / Custom',
     brandColor: 'text-teal-600 dark:text-teal-400',
     badgeBg: 'bg-teal-500/10',
     badgeBorder: 'border-teal-500/30',
@@ -265,15 +265,20 @@ export default function SystemAdminPage() {
   const [providers, setProviders] = useState<AiProviderSlot[]>(() =>
     DEFAULT_AI_PROVIDER_SLOTS.map((s) => ({ ...s }))
   );
-  const [selectedProviderId, setSelectedProviderId] = useState<string>('anthropic');
+  const [activeProviderTab, setActiveProviderTab] = useState<string>(
+    providers[0]?.id || 'anthropic'
+  );
+  const selectedProviderId = activeProviderTab;
+  const setSelectedProviderId = setActiveProviderTab;
   const activeSlot = useMemo(() => {
-    return providers.find((p) => p.id === selectedProviderId) || providers[0] || null;
-  }, [providers, selectedProviderId]);
+    return providers.find((p) => p.id === activeProviderTab) || providers[0] || null;
+  }, [providers, activeProviderTab]);
   const [visibleProviderKeys, setVisibleProviderKeys] = useState<Record<string, boolean>>({});
   const [providerPingMap, setProviderPingMap] = useState<Record<string, ProviderPingState>>({});
   const [providerModelsMap, setProviderModelsMap] = useState<Record<string, string[]>>({});
   const [fetchingModelsId, setFetchingModelsId] = useState<string | null>(null);
   const [confidenceThreshold, setConfidenceThreshold] = useState<number>(70);
+  const [autoAdaptiveThreshold, setAutoAdaptiveThreshold] = useState<boolean>(true);
   const [isSavingAi, setIsSavingAi] = useState(false);
   const [aiFeedback, setAiFeedback] = useState<{ ok: boolean; text: string } | null>(null);
 
@@ -324,11 +329,19 @@ export default function SystemAdminPage() {
     return providers.filter((p) => {
       if (!p.enabled) return false;
       const cleanKey = (p.apiKey || '').trim();
-      const isLoc =
-        p.baseUrl.includes('localhost') ||
-        p.baseUrl.includes('127.0.0.1') ||
-        p.baseUrl.includes('0.0.0.0');
-      return cleanKey.length >= 5 || (isLoc && p.lastTestOk === true);
+      const cleanUrl = (p.baseUrl || '').trim();
+      const isCloud =
+        ['anthropic', 'openai', 'openrouter', 'groq', 'deepseek', 'gemini'].includes(p.id) ||
+        cleanUrl.includes('api.anthropic.com') ||
+        cleanUrl.includes('api.openai.com') ||
+        cleanUrl.includes('openrouter.ai') ||
+        cleanUrl.includes('api.groq.com') ||
+        cleanUrl.includes('api.deepseek.com') ||
+        cleanUrl.includes('googleapis.com');
+      if (isCloud) {
+        return cleanKey.length >= 5 && !cleanKey.includes('••••••••');
+      }
+      return cleanKey.length > 0 || p.lastTestOk === true || cleanUrl.length > 0;
     }).length;
   }, [providers]);
 
@@ -385,6 +398,11 @@ export default function SystemAdminPage() {
           }
           if (typeof cfg.confidenceThreshold === 'number') {
             setConfidenceThreshold(cfg.confidenceThreshold);
+          }
+          if (typeof cfg.autoAdaptiveThreshold === 'boolean') {
+            setAutoAdaptiveThreshold(cfg.autoAdaptiveThreshold);
+          } else {
+            setAutoAdaptiveThreshold(true);
           }
           if (cfg.kronosVpsUrl) setVpsUrl(cfg.kronosVpsUrl);
           if (cfg.kronosApiKey) setVpsApiKey(cfg.kronosApiKey);
@@ -610,6 +628,7 @@ export default function SystemAdminPage() {
           action: 'SAVE_CONFIG',
           providers,
           confidenceThreshold,
+          autoAdaptiveThreshold,
         }),
       });
       const data = await res.json();
@@ -1317,16 +1336,15 @@ export default function SystemAdminPage() {
                       </label>
                       <select
                         id="quick-provider-dropdown"
-                        value={activeSlot?.id || selectedProviderId}
-                        onChange={(e) => setSelectedProviderId(e.target.value)}
+                        value={activeProviderTab}
+                        onChange={(e) => setActiveProviderTab(e.target.value)}
                         className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg px-2.5 py-1 text-xs font-mono text-[#0F172A] dark:text-slate-200 cursor-pointer focus:outline-none focus:border-emerald-500 shadow-xs"
                       >
                         {providers.map((p) => {
                           const meta = PROVIDER_META[p.id] || { shortName: p.name };
-                          const isReady = p.enabled && (p.apiKey || '').trim().length >= 5;
                           return (
                             <option key={p.id} value={p.id}>
-                              {meta.shortName} {isReady ? '● (Active)' : '○ (Inactive)'}
+                              {p.enabled ? '🟢 ENABLED' : '⚪ DISABLED'} — {meta.shortName}
                             </option>
                           );
                         })}
@@ -1334,11 +1352,14 @@ export default function SystemAdminPage() {
                     </div>
                   </div>
 
-                  {/* Horizontal / Grid Logo Dock */}
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-7 gap-2">
+                  {/* Horizontal / Grid Logo Dock (4 cols mobile, 7 cols desktop) */}
+                  <div className="grid grid-cols-4 lg:grid-cols-7 gap-2">
                     {providers.map((slot) => {
-                      const isSelected = (activeSlot?.id || selectedProviderId) === slot.id;
-                      const hasKey = (slot.apiKey || '').trim().length >= 5;
+                      const isSelected = activeProviderTab === slot.id;
+                      const hasKey =
+                        (slot.apiKey || '').trim().length >= 5 ||
+                        slot.baseUrl.includes('127.0.0.1') ||
+                        slot.baseUrl.includes('localhost');
                       const isReady = slot.enabled && hasKey;
                       const meta = PROVIDER_META[slot.id] || {
                         shortName: slot.name,
@@ -1349,22 +1370,22 @@ export default function SystemAdminPage() {
                         <button
                           key={slot.id}
                           type="button"
-                          onClick={() => setSelectedProviderId(slot.id)}
+                          onClick={() => setActiveProviderTab(slot.id)}
                           className={`flex flex-col items-center justify-center p-2.5 rounded-xl border text-center transition-all cursor-pointer relative group ${
                             isSelected
-                              ? 'bg-emerald-50/70 dark:bg-emerald-950/25 border-emerald-500 dark:border-emerald-400 shadow-[0_0_12px_rgba(16,185,129,0.22)] ring-1 ring-emerald-500/40 text-[#0F172A] dark:text-slate-100'
+                              ? 'border-emerald-500 bg-emerald-500/10 shadow-sm text-emerald-950 dark:text-emerald-200 ring-1 ring-emerald-500/40'
                               : 'bg-[#F8FAFC]/80 dark:bg-zinc-950/50 border-slate-200/90 dark:border-zinc-800 hover:border-slate-300 dark:hover:border-zinc-700 hover:bg-slate-100/70 dark:hover:bg-zinc-800/40 text-slate-600 dark:text-slate-300'
                           }`}
                         >
-                          {/* Top-Right Status Dot (Emerald if active/ready, slate if inactive) */}
+                          {/* Top-Right Status Dot (Glowing emerald if active/ready, slate if disabled) */}
                           <span className="absolute top-2 right-2 flex items-center justify-center">
                             <span
                               className={`w-2 h-2 rounded-full transition-all ${
                                 isReady
-                                  ? 'bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.8)]'
-                                  : 'bg-slate-300 dark:bg-zinc-600'
+                                  ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.85)] ring-1 ring-emerald-400/50'
+                                  : 'bg-slate-400/40 dark:bg-zinc-600/40'
                               }`}
-                              title={isReady ? 'Active & Key Configured' : 'Inactive or Missing Key'}
+                              title={isReady ? '🟢 ENABLED (Key Active)' : '⚪ DISABLED'}
                             />
                           </span>
 
@@ -1380,7 +1401,13 @@ export default function SystemAdminPage() {
                           </div>
 
                           {/* Short Name */}
-                          <span className="font-sans font-bold text-xs tracking-tight mt-1.5 truncate max-w-full">
+                          <span
+                            className={`font-sans text-xs tracking-tight mt-1.5 truncate max-w-full ${
+                              isSelected
+                                ? 'font-bold text-emerald-950 dark:text-emerald-200'
+                                : 'font-semibold'
+                            }`}
+                          >
                             {meta.shortName}
                           </span>
 
@@ -1603,7 +1630,7 @@ export default function SystemAdminPage() {
                   );
                 })()}
 
-                {/* Compact Ensemble Summary Bar */}
+                {/* 4. Active Ensemble Summary Strip (Above Confidence Slider) */}
                 <div className="p-3 rounded-xl bg-slate-50 dark:bg-zinc-950/60 border border-slate-200/80 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-2.5">
                   <div className="flex items-center gap-2">
                     <span className="text-[10px] font-mono uppercase tracking-wider text-slate-500 dark:text-zinc-400 font-bold">
@@ -1611,7 +1638,7 @@ export default function SystemAdminPage() {
                     </span>
                     {activeConfiguredCount > 0 ? (
                       <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 font-bold border border-emerald-500/20">
-                        {activeConfiguredCount} OF {providers.length} ROUTED
+                        {activeConfiguredCount} OF {providers.length} CONFIGURED & ACTIVE
                       </span>
                     ) : (
                       <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-700 dark:text-amber-400 font-bold border border-amber-500/20">
@@ -1621,70 +1648,152 @@ export default function SystemAdminPage() {
                   </div>
 
                   <div className="flex flex-wrap items-center gap-1.5">
-                    {providers.map((p) => {
-                      const isReady =
-                        p.enabled &&
-                        ((p.apiKey || '').trim().length >= 5 ||
-                          p.baseUrl.includes('127.0.0.1') ||
-                          p.baseUrl.includes('localhost'));
-                      const meta = PROVIDER_META[p.id] || {
-                        shortName: p.name,
-                        brandColor: 'text-slate-400',
-                      };
-                      const isSelected = (activeSlot?.id || selectedProviderId) === p.id;
+                    {providers.filter((p) => {
+                      if (!p.enabled) return false;
+                      const cleanKey = (p.apiKey || '').trim();
+                      const cleanUrl = (p.baseUrl || '').trim();
+                      const isCloud =
+                        ['anthropic', 'openai', 'openrouter', 'groq', 'deepseek', 'gemini'].includes(p.id) ||
+                        cleanUrl.includes('api.anthropic.com') ||
+                        cleanUrl.includes('api.openai.com') ||
+                        cleanUrl.includes('openrouter.ai') ||
+                        cleanUrl.includes('api.groq.com') ||
+                        cleanUrl.includes('api.deepseek.com') ||
+                        cleanUrl.includes('googleapis.com');
+                      if (isCloud) {
+                        return cleanKey.length >= 5 && !cleanKey.includes('••••••••');
+                      }
+                      return cleanKey.length > 0 || p.lastTestOk === true || cleanUrl.length > 0;
+                    }).length > 0 ? (
+                      providers
+                        .filter((p) => {
+                          if (!p.enabled) return false;
+                          const cleanKey = (p.apiKey || '').trim();
+                          const cleanUrl = (p.baseUrl || '').trim();
+                          const isCloud =
+                            ['anthropic', 'openai', 'openrouter', 'groq', 'deepseek', 'gemini'].includes(p.id) ||
+                            cleanUrl.includes('api.anthropic.com') ||
+                            cleanUrl.includes('api.openai.com') ||
+                            cleanUrl.includes('openrouter.ai') ||
+                            cleanUrl.includes('api.groq.com') ||
+                            cleanUrl.includes('api.deepseek.com') ||
+                            cleanUrl.includes('googleapis.com');
+                          if (isCloud) {
+                            return cleanKey.length >= 5 && !cleanKey.includes('••••••••');
+                          }
+                          return cleanKey.length > 0 || p.lastTestOk === true || cleanUrl.length > 0;
+                        })
+                        .map((p) => {
+                          const meta = PROVIDER_META[p.id] || {
+                            shortName: p.name,
+                            brandColor: 'text-emerald-500',
+                          };
+                          const isSelected = activeProviderTab === p.id;
+                          const modelStr = (p.model || '').trim();
 
-                      return (
-                        <button
-                          key={p.id}
-                          type="button"
-                          onClick={() => setSelectedProviderId(p.id)}
-                          title={`Click to configure ${meta.shortName}`}
-                          className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-mono font-medium border transition-all cursor-pointer ${
-                            isReady
-                              ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-500/30 text-emerald-700 dark:text-emerald-300'
-                              : 'bg-slate-100/70 dark:bg-zinc-900 border-slate-200 dark:border-zinc-800 text-slate-400 dark:text-zinc-500 opacity-60'
-                          } ${isSelected ? 'ring-1 ring-emerald-500 font-bold shadow-xs' : ''}`}
-                        >
-                          <span
-                            className={
-                              isReady ? meta.brandColor : 'text-slate-400 dark:text-zinc-600'
-                            }
-                          >
-                            {renderProviderLogo(p.id, 'w-3 h-3')}
-                          </span>
-                          <span>{meta.shortName}</span>
-                          <span
-                            className={`w-1.5 h-1.5 rounded-full ${
-                              isReady ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-zinc-700'
-                            }`}
-                          />
-                        </button>
-                      );
-                    })}
+                          return (
+                            <button
+                              key={p.id}
+                              type="button"
+                              onClick={() => setActiveProviderTab(p.id)}
+                              title={`Click to configure ${p.name}`}
+                              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] font-mono font-medium border transition-all cursor-pointer ${
+                                isSelected
+                                  ? 'bg-emerald-500/20 border-emerald-500 text-emerald-900 dark:text-emerald-200 ring-1 ring-emerald-500/40 font-bold shadow-xs'
+                                  : 'bg-emerald-50/70 dark:bg-emerald-950/25 border-emerald-200/80 dark:border-emerald-500/30 text-emerald-800 dark:text-emerald-300 hover:border-emerald-400'
+                              }`}
+                            >
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.8)]" />
+                              <span className="font-semibold">{meta.shortName}</span>
+                              {modelStr && (
+                                <span className="opacity-80 text-[9px] max-w-[140px] truncate">
+                                  : {modelStr}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })
+                    ) : (
+                      <span className="text-[10px] font-mono text-slate-400 dark:text-zinc-500 italic">
+                        No active nodes configured — Zero-Key Quant Heuristic Fallback active
+                      </span>
+                    )}
                   </div>
                 </div>
 
-                {/* Confidence Threshold + Save Action */}
+                {/* Autonomous Dynamic Confidence Threshold Engine + Save Action */}
                 <div className="pt-3 border-t border-slate-100 dark:border-zinc-800 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-4">
-                    <div className="flex-1 min-w-[220px] max-w-sm font-mono text-xs space-y-1">
+                    <div className="flex-1 min-w-[280px] max-w-xl font-mono text-xs space-y-2">
                       <div className="flex items-center justify-between">
-                        <label className="text-[10px] uppercase tracking-wider text-slate-500 dark:text-zinc-400 font-semibold">
-                          Multi-AI Minimum Confidence Threshold
+                        <label className="text-[10px] uppercase tracking-wider text-slate-500 dark:text-zinc-400 font-semibold flex items-center gap-2">
+                          <span>Multi-AI Confidence Engine</span>
+                          <span className="text-[9px] px-1.5 py-0.5 rounded font-bold bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30">
+                            {autoAdaptiveThreshold ? 'AUTO-REGIME (ACTIVE)' : 'MANUAL OVERRIDE'}
+                          </span>
                         </label>
-                        <span className="font-bold text-[#0F172A] dark:text-emerald-400">
-                          {confidenceThreshold}%
-                        </span>
+                        <div className="flex items-center gap-1 bg-slate-100 dark:bg-zinc-800 p-0.5 rounded-lg border border-slate-200/80 dark:border-zinc-700">
+                          <button
+                            type="button"
+                            onClick={() => setAutoAdaptiveThreshold(true)}
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold transition-all cursor-pointer ${
+                              autoAdaptiveThreshold
+                                ? 'bg-white dark:bg-zinc-900 text-emerald-700 dark:text-emerald-400 shadow-2xs font-bold'
+                                : 'text-slate-500 dark:text-zinc-400 hover:text-slate-800 dark:hover:text-zinc-200'
+                            }`}
+                          >
+                            Auto-Adaptive
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setAutoAdaptiveThreshold(false)}
+                            className={`px-2 py-0.5 rounded text-[10px] font-bold transition-all cursor-pointer ${
+                              !autoAdaptiveThreshold
+                                ? 'bg-white dark:bg-zinc-900 text-emerald-700 dark:text-emerald-400 shadow-2xs font-bold'
+                                : 'text-slate-500 dark:text-zinc-400 hover:text-slate-800 dark:hover:text-zinc-200'
+                            }`}
+                          >
+                            Manual
+                          </button>
+                        </div>
                       </div>
-                      <input
-                        type="range"
-                        min="50"
-                        max="95"
-                        step="1"
-                        value={confidenceThreshold}
-                        onChange={(e) => setConfidenceThreshold(parseInt(e.target.value, 10))}
-                        className="w-full accent-emerald-600 cursor-pointer"
-                      />
+
+                      {autoAdaptiveThreshold ? (
+                        <div className="p-3 rounded-xl bg-slate-50 dark:bg-zinc-950/70 border border-slate-200/90 dark:border-zinc-800 space-y-1.5">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-bold text-emerald-700 dark:text-emerald-400 flex items-center gap-1.5">
+                              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                              AUTO-ADAPTIVE REGIME MODE (58%–82% Dynamic)
+                            </span>
+                            <span className="text-[10px] font-semibold text-slate-400 dark:text-zinc-500">
+                              Zero Tuning
+                            </span>
+                          </div>
+                          <p className="text-[10px] text-slate-500 dark:text-zinc-400 leading-relaxed font-sans">
+                            Dynamically computes threshold per trade based on Kaufman ER-10 (Ranging 60% / Momentum 72% / Cascade 78%), Kronos POC Alignment (-3%), Volatility Guard (+4%), and Sniper Recovery (+5%).
+                          </p>
+                        </div>
+                      ) : (
+                        <div className="space-y-1">
+                          <div className="flex items-center justify-between">
+                            <span className="text-[10px] text-slate-500 dark:text-zinc-400">
+                              Manual Static Confidence Threshold:
+                            </span>
+                            <span className="font-bold text-[#0F172A] dark:text-emerald-400">
+                              {confidenceThreshold}%
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min="50"
+                            max="95"
+                            step="1"
+                            value={confidenceThreshold}
+                            onChange={(e) => setConfidenceThreshold(parseInt(e.target.value, 10))}
+                            className="w-full accent-emerald-600 cursor-pointer"
+                          />
+                        </div>
+                      )}
                     </div>
 
                     <button

@@ -2,6 +2,7 @@
 
 import React from 'react';
 import { useRoomStore } from '@/store/useRoomStore';
+import { useBinanceStore } from '@/store/useBinanceStore';
 
 interface TopRoomSwitcherProps {
   activeMarket?: 'FOREX' | 'CRYPTO';
@@ -14,6 +15,7 @@ export const TopRoomSwitcher: React.FC<TopRoomSwitcherProps> = ({
 }) => {
   const storeActiveRoom = useRoomStore((s) => s.activeRoom);
   const setActiveRoom = useRoomStore((s) => s.setActiveRoom);
+  const activeExchange = useBinanceStore((s) => s.activeExchange || 'BINANCE');
 
   const isForex = propActiveMarket
     ? propActiveMarket === 'FOREX'
@@ -55,7 +57,7 @@ export const TopRoomSwitcher: React.FC<TopRoomSwitcherProps> = ({
               }`}
             >
               <span className={`w-1.5 h-1.5 rounded-full ${!isForex ? 'bg-emerald-400' : 'bg-slate-400'}`} />
-              <span>CRYPTO · Binance</span>
+              <span>CRYPTO · {activeExchange === 'BITGET' ? 'Bitget' : 'Binance'}</span>
             </button>
           </div>
         </div>

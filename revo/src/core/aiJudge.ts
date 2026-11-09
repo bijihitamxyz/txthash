@@ -128,6 +128,193 @@ export function isReasoningModel(model: string): boolean {
 }
 
 /**
+ * Detects if a provider ID or base URL represents a commercial cloud LLM provider
+ * (Anthropic, OpenAI, OpenRouter, Groq, DeepSeek, Google Gemini).
+ */
+export function isCloudProvider(slotId: string, baseUrl: string): boolean {
+  const id = (slotId || '').toLowerCase().trim();
+  const url = (baseUrl || '').toLowerCase().trim();
+  const cloudIds = ['anthropic', 'openai', 'openrouter', 'groq', 'deepseek', 'gemini'];
+  if (cloudIds.includes(id)) return true;
+  if (
+    url.includes('api.anthropic.com') ||
+    url.includes('api.openai.com') ||
+    url.includes('openrouter.ai') ||
+    url.includes('api.groq.com') ||
+    url.includes('api.deepseek.com') ||
+    url.includes('googleapis.com')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Smart Active-Only AI Consensus Filter:
+ * Automatically prunes unconfigured cloud providers with empty keys,
+ * ensuring only genuinely configured/reachable nodes (e.g. VPS Ollama qwen2.5:3b or valid cloud keys)
+ * participate in Multi-AI Consensus.
+ */
+export function isProviderGenuinelyConfigured(slot: {
+  id?: string;
+  baseUrl?: string;
+  apiKey?: string;
+  enabled?: boolean;
+  lastTestOk?: boolean;
+}): boolean {
+  if (!slot || slot.enabled === false) return false;
+  const cleanUrl = (slot.baseUrl || '').trim();
+  if (!cleanUrl) return false;
+  const cleanKey = (slot.apiKey || '').trim();
+
+  // 1. Cloud Providers MUST have a real, non-empty, non-masked API key (>= 5 chars)
+  if (isCloudProvider(slot.id || '', cleanUrl)) {
+    if (!cleanKey || cleanKey.length < 5 || cleanKey.includes('••••••••')) {
+      return false;
+    }
+    return true;
+  }
+
+  // 2. Local / VPS / Custom Ollama Gateway (e.g. http://172.235.254.157:11434/v1)
+  const { isLocal } = normalizeAiEndpoint(cleanUrl);
+  if (isLocal) {
+    return cleanKey.length > 0 || slot.lastTestOk === true || cleanUrl.length > 0;
+  }
+
+  // Custom / Self-hosted endpoint: active if key is set, or test passed, or explicit custom endpoint is populated
+  return cleanKey.length > 0 || slot.lastTestOk === true || (slot.id === 'custom' && cleanUrl.length > 0);
+}
+
+export interface DynamicThresholdContext {
+  efficiencyRatio?: number;
+  pocMagnetAligned?: boolean;
+  kronosProbability?: number; // 0 to 100 or 0.0 to 1.0
+  bbwExpandingRapidly?: boolean;
+  bbwExpansionPct?: number;
+  isFundingWindow?: boolean;
+  recentStopLoss?: boolean;
+  symbol?: string;
+  marketType?: 'FOREX' | 'CRYPTO';
+}
+
+export interface DynamicThresholdResult {
+  threshold: number;
+  baseThreshold: number;
+  breakdown: {
+    regimeDelta: number;
+    regimeLabel: string;
+    pocDelta: number;
+    volatilityDelta: number;
+    recoveryDelta: number;
+  };
+  reasons: string[];
+  telemetryLog: string;
+}
+
+/**
+ * Pure Quantitative Autonomous Dynamic Confidence Threshold Engine (Zero Manual Tuning):
+ * - Base Institutional Threshold: 65%
+ * - Regime Adjustment (Kaufman Efficiency Ratio ER):
+ *   - ER <= 0.42 (Ideal Mean-Reverting / Ranging Regime): -5% (Threshold lowers to 60%)
+ *   - 0.42 < ER <= 0.58 (Normal Regime): +0% (65%)
+ *   - 0.58 < ER <= 0.68 (Trending / High Momentum): +7% (72%)
+ *   - ER > 0.68 (Runaway Institutional Cascade): +13% (78%)
+ * - Kronos Volume Profile Alignment:
+ *   - pocMagnetAligned === true && Kronos directional probability >= 58%: -3% bonus discount
+ * - Volatility & Session Guard Adjustment:
+ *   - Rapid BBW expansion OR Crypto near funding window: +4% stricter requirement
+ *   - Recent Stop Loss within last 2 hours (Sniper Recovery Mode): +5%
+ * - Clamped strictly between 58% (minimum floor) and 82% (maximum ceiling)
+ */
+export function calculateDynamicThreshold(context: DynamicThresholdContext): DynamicThresholdResult {
+  const baseThreshold = 65;
+  let delta = 0;
+  const reasons: string[] = [];
+
+  // 1. Regime Adjustment (Kaufman Efficiency Ratio ER)
+  const er = typeof context.efficiencyRatio === 'number' && !isNaN(context.efficiencyRatio)
+    ? context.efficiencyRatio
+    : 0.50;
+
+  let regimeDelta = 0;
+  let regimeLabel = 'Normal Regime';
+  if (er <= 0.42) {
+    regimeDelta = -5;
+    regimeLabel = 'Ideal Mean-Reversion';
+    reasons.push(`Regime ER=${er.toFixed(2)} <= 0.42 (-5%)`);
+  } else if (er <= 0.58) {
+    regimeDelta = 0;
+    regimeLabel = 'Normal Regime';
+    reasons.push(`Regime ER=${er.toFixed(2)} (+0%)`);
+  } else if (er <= 0.68) {
+    regimeDelta = 7;
+    regimeLabel = 'Trending/Momentum';
+    reasons.push(`Regime ER=${er.toFixed(2)} trending (+7%)`);
+  } else {
+    regimeDelta = 13;
+    regimeLabel = 'Runaway Cascade';
+    reasons.push(`Regime ER=${er.toFixed(2)} runaway cascade (+13%)`);
+  }
+  delta += regimeDelta;
+
+  // 2. Kronos Volume Profile Alignment
+  let pocDelta = 0;
+  const rawProb = typeof context.kronosProbability === 'number' ? context.kronosProbability : 50;
+  const prob = rawProb <= 1.0 ? rawProb * 100 : rawProb;
+  if (context.pocMagnetAligned === true && prob >= 58) {
+    pocDelta = -3;
+    delta += pocDelta;
+    reasons.push(`Kronos POC Aligned & Prob ${prob.toFixed(0)}% >= 58% (-3%)`);
+  }
+
+  // 3. Volatility & Session Guard Adjustment
+  let volatilityDelta = 0;
+  const isRapidBbw = context.bbwExpandingRapidly === true || (typeof context.bbwExpansionPct === 'number' && context.bbwExpansionPct > 15);
+  if (isRapidBbw || context.isFundingWindow === true) {
+    volatilityDelta = 4;
+    delta += volatilityDelta;
+    const volReason = isRapidBbw ? 'Rapid BBW Expansion' : 'Funding Settlement Window';
+    reasons.push(`${volReason} (+4%)`);
+  }
+
+  // 4. Sniper Recovery Mode (recent Stop Loss within last 2 hours)
+  let recoveryDelta = 0;
+  if (context.recentStopLoss === true) {
+    recoveryDelta = 5;
+    delta += recoveryDelta;
+    reasons.push(`Recent Stop Loss < 2h Sniper Recovery (+5%)`);
+  }
+
+  // 5. Clamp between 58% (minimum floor) and 82% (maximum ceiling)
+  const rawThreshold = baseThreshold + delta;
+  const threshold = Math.min(82, Math.max(58, Math.round(rawThreshold)));
+
+  const telemetryLog = `[AUTO-GOVERNANCE] Dynamic Threshold: ${threshold}% (Base 65% | ${reasons.join(', ')})`;
+
+  return {
+    threshold,
+    baseThreshold,
+    breakdown: {
+      regimeDelta,
+      regimeLabel,
+      pocDelta,
+      volatilityDelta,
+      recoveryDelta,
+    },
+    reasons,
+    telemetryLog,
+  };
+}
+
+export function formatAutoGovernanceTelemetry(
+  score: number,
+  dynamicResult: DynamicThresholdResult,
+  decision: 'EXECUTE' | 'REJECT'
+): string {
+  return `[AUTO-GOVERNANCE] AI Score: ${score}% vs Dynamic Threshold: ${dynamicResult.threshold}% (${dynamicResult.reasons.join(', ')}) -> ${decision}`;
+}
+
+/**
  * Sends a lightweight test ping ("Ping" / "Say OK") to the configured AI API Base URL
  * using universal 9Router / OpenAI / Anthropic compatibility.
  */
@@ -321,23 +508,22 @@ export async function testAiPing(config: {
 }
 
 /**
- * Builds system prompt for institutional quantitative confluence
+ * Builds system prompt for institutional quantitative confluence (Dual-Room 3-Pillar Framework)
  */
-export function buildAiSystemPrompt(): string {
-  return `You are an elite Institutional Quantitative Risk Officer and Confluence Judge for Forex & Gold algorithmic trading.
-Evaluate the technical setup qualified by our 3-Regime Multi-Strategy Engine:
-- SETUP_A_TREND_PULLBACK: Trend continuation bounce off Middle BB (SMA 20) with RSI momentum curl aligned with EMA 200.
-- SETUP_B_BB_EXTREME_SNAPBACK: Relaxed Bollinger Band extreme breach/touch with RSI mean-reversion, wick absorption, or divergence.
-- SETUP_C_MOMENTUM_BREAKOUT: Bollinger Band Width expansion with large impulse candle body (>1.2x avg) and RSI directional surge.
+export function buildAiSystemPrompt(marketType: 'FOREX' | 'CRYPTO' = 'FOREX'): string {
+  return `You are an elite Institutional Quantitative AI-Hedge-Fund Risk Officer and Confluence Judge for ${
+    marketType === 'CRYPTO' ? 'Binance Crypto Futures' : 'Forex & Gold'
+  } algorithmic trading.
+Evaluate the qualified setup across our 3-Pillar Quantitative Confluence Framework:
+1. Pillar 1: Mean-Reversion Exhaustion (Bollinger Band penetration + RSI extreme/divergence + Wick Rejection conviction >= 35%).
+2. Pillar 2: Volume Profile Gravity (Kronos POC alignment, VAH/VAL value areas, pocMagnetAligned status, and directional probability).
+3. Pillar 3: Market Regime & Cross-Asset Safety (Kaufman Efficiency Ratio ER-10: ER > 0.68 denotes one-way runaway trend cascade where counter-trend entries MUST BE REJECTED; ER <= 0.50 denotes optimal mean-reversion. ${
+    marketType === 'CRYPTO'
+      ? 'BTC Guard Status: strictly VETO long altcoin setups if BTC is in a high-efficiency dump or velocity dump.'
+      : 'Forex Safety: ensure outside Exness low-liquidity rollover blackout window (21:00-22:15 UTC).'
+  })
 
-Scrutinize:
-1. Setup Type (SETUP_A_TREND_PULLBACK, SETUP_B_BB_EXTREME_SNAPBACK, or SETUP_C_MOMENTUM_BREAKOUT) & Confluence Score.
-2. Market Regime & Trend Alignment (Price relative to EMA 200).
-3. Volatility & Multi-Timeframe ATR Ratio ('atr_ratio' expansion relative to baseline ATR).
-4. Wick Rejection Strength ('HIGH_CONVICTION' >= 0.35, 'MODERATE' >= 0.20, or 'WEAK').
-5. Support / Resistance Proximity: Distance to key S/R boundaries and room to run.
-6. RSI Reversal Velocity / Slope and 15-candle Divergence confluence.
-7. Risk-to-Reward ratio expectancy.
+Scale recommended SL/TP pips and tick distances appropriately for the asset's volatility and ATR.
 
 You must respond with ONLY a strict JSON object matching this schema without markdown fences or other text:
 {
@@ -345,29 +531,44 @@ You must respond with ONLY a strict JSON object matching this schema without mar
   "confidence_score": <number 0-100>,
   "recommended_sl_pips": <number>,
   "recommended_tp_pips": <number>,
-  "reasoning": "<concise 1-sentence explanation>"
+  "reasoning": "<concise 1-sentence analytical rationale addressing the 3 pillars>"
 }`;
 }
 
 /**
- * Builds user prompt containing structured technical snapshot
+ * Builds user prompt containing structured technical snapshot and 3-pillar context
  */
 export function buildAiUserPrompt(
   snapshot: TechnicalSnapshotPayload,
   kronosContext?: KronosQuantContext
 ): string {
+  const marketType = snapshot.marketType || (snapshot.symbol.endsWith('USDT') ? 'CRYPTO' : 'FOREX');
+  const erDisplay = typeof snapshot.efficiencyRatio === 'number'
+    ? `${snapshot.efficiencyRatio.toFixed(3)} (${snapshot.efficiencyRatio > 0.68 ? 'STRONG_ONE_WAY_TREND_CASCADE' : snapshot.efficiencyRatio <= 0.50 ? 'OPTIMAL_MEAN_REVERTING' : 'MODERATE'})`
+    : 'N/A';
+  const pocAlignedDisplay = snapshot.pocMagnetAligned !== undefined
+    ? (snapshot.pocMagnetAligned ? 'ALIGNED (POC sits between entry and target Mid-BB)' : 'UNALIGNED')
+    : 'N/A';
+
   const kronosLines = kronosContext
     ? `\nKRONOS VPS QUANT METRICS:
 - Volume Profile POC: ${kronosContext.pocPrice ?? 'N/A'} | VAH: ${kronosContext.vahPrice ?? 'N/A'} | VAL: ${kronosContext.valPrice ?? 'N/A'}
-- Price Z-Score (20): ${kronosContext.zScore ?? 0} | Quant Regime: ${kronosContext.regime || snapshot.regime}
-- Kronos Bullish Probability: ${kronosContext.bullishPct ?? 50}%`
+- Price Z-Score (20): ${kronosContext.zScore ?? snapshot.zScore ?? 0} | Quant Regime: ${kronosContext.regime || snapshot.regime}
+- Kronos Directional Probability: Bullish ${kronosContext.bullishPct ?? 50}% / Bearish ${100 - (kronosContext.bullishPct ?? 50)}%`
     : '';
 
-  return `TECHNICAL SNAPSHOT:
-- Symbol: ${snapshot.symbol} (${snapshot.timeframe})
+  const cryptoSafetyLines = marketType === 'CRYPTO' && snapshot.btcGuardStatus
+    ? `\nCRYPTO CROSS-ASSET SAFETY:
+- BTC Guard Status: ${snapshot.btcGuardStatus}`
+    : '';
+
+  return `TECHNICAL SNAPSHOT (${marketType}):
+- Symbol: ${snapshot.symbol} (${snapshot.timeframe}) | Market Type: ${marketType}
 - Proposed Action: ${snapshot.side}
 - Setup Type: ${snapshot.setupName || snapshot.signalType} (Regime: ${snapshot.regime}, Gate Confluence Score: ${snapshot.confluence_score ?? 65}/100)
 - Trigger Price: ${snapshot.triggerPrice}
+- Kaufman Efficiency Ratio (ER-10): ${erDisplay}
+- Volume Profile POC Magnet: ${pocAlignedDisplay}
 - RSI (14): ${snapshot.rsi} (Reversal Slope: ${snapshot.rsi_slope > 0 ? '+' : ''}${snapshot.rsi_slope})
 - BB Position: ${snapshot.bb_position_pct ?? 50}%
 - Wick Rejection Strength: ${snapshot.wick_rejection_strength} (Wick Ratio: ${snapshot.wick_ratio})
@@ -377,10 +578,10 @@ export function buildAiUserPrompt(
 - 15-Candle Divergence: ${snapshot.divergence_detected ? `DETECTED (${snapshot.divergence_type})` : 'NONE'}
 - Distance from EMA 200: ${snapshot.ema200Distance} pips
 - Initial SL: ${snapshot.proposedSlPips} pips (${snapshot.proposedSlPrice})
-- Opposite BB TP: ${snapshot.proposedTpPips} pips (${snapshot.proposedTpPrice})
-- Risk-Reward: ${snapshot.riskRewardRatio}:1${kronosLines}
+- Target TP: ${snapshot.proposedTpPips} pips (${snapshot.proposedTpPrice})
+- Risk-Reward: ${snapshot.riskRewardRatio}:1${kronosLines}${cryptoSafetyLines}
 
-Return strict JSON only.`;
+Evaluate the 3 Pillars (1. Mean-Reversion Exhaustion, 2. Volume Profile Gravity, 3. Market Regime & Cross-Asset Safety). Return strict JSON only.`;
 }
 
 export interface QuantFallbackBreakdown {
@@ -464,7 +665,41 @@ export function computeAdaptiveQuantFallback(snapshot: TechnicalSnapshotPayload)
     rrWeight = 3;
   }
 
-  const rawSum = baseScore + trendWeight + setupWeight + divergenceWeight + wickWeight + volatilityWeight + rrWeight;
+  // 7. Pillar 3: Kaufman Efficiency Ratio (ER-10) Microstructure (up to +6 / -15)
+  let erWeight = 0;
+  if (typeof snapshot.efficiencyRatio === 'number') {
+    if (snapshot.efficiencyRatio > 0.68 && snapshot.regime === 'COUNTER_TREND') {
+      erWeight = -15; // Runaway one-way trend makes counter-trend dangerous
+    } else if (snapshot.efficiencyRatio <= 0.50) {
+      erWeight = 6; // Optimal mean-reverting regime
+    }
+  }
+
+  // 8. Pillar 2: Kronos Volume Profile Gravity (POC Magnet Aligned) (+5)
+  let pocWeight = 0;
+  if (snapshot.pocMagnetAligned) {
+    pocWeight = 5;
+  }
+
+  // 9. Pillar 3: Crypto Cross-Asset BTC Guard Safety (-30)
+  let btcWeight = 0;
+  if (snapshot.marketType === 'CRYPTO' && snapshot.btcGuardStatus) {
+    if (snapshot.btcGuardStatus.includes('VETO') || snapshot.btcGuardStatus.includes('DUMP')) {
+      btcWeight = -30;
+    }
+  }
+
+  const rawSum =
+    baseScore +
+    trendWeight +
+    setupWeight +
+    divergenceWeight +
+    wickWeight +
+    volatilityWeight +
+    rrWeight +
+    erWeight +
+    pocWeight +
+    btcWeight;
   const finalScore = Math.min(100, Math.max(0, rawSum));
 
   const parts: string[] = [`Base ${baseScore}`];
@@ -474,6 +709,9 @@ export function computeAdaptiveQuantFallback(snapshot: TechnicalSnapshotPayload)
   if (wickWeight > 0) parts.push(`Wick +${wickWeight}`);
   if (volatilityWeight > 0) parts.push(`Vol +${volatilityWeight}`);
   if (rrWeight > 0) parts.push(`R:R +${rrWeight}`);
+  if (erWeight !== 0) parts.push(`ER-10 ${erWeight > 0 ? '+' : ''}${erWeight}`);
+  if (pocWeight > 0) parts.push(`POC Magnet +${pocWeight}`);
+  if (btcWeight < 0) parts.push(`BTC VETO ${btcWeight}`);
 
   const reasoningBreakdown = `[ADAPTIVE QUANT FALLBACK] Score ${finalScore}% (${parts.join(', ')})`;
 
@@ -658,7 +896,8 @@ async function evaluateSingleProviderStrict(
     throw new Error(`Provider in failover cooldown (HTTP ${failureEntry.status})`);
   }
 
-  const systemPrompt = buildAiSystemPrompt();
+  const marketType = snapshot.marketType || (snapshot.symbol.endsWith('USDT') ? 'CRYPTO' : 'FOREX');
+  const systemPrompt = buildAiSystemPrompt(marketType);
   const userPrompt = buildAiUserPrompt(snapshot, kronosContext);
   const reasoning = isReasoningModel(model);
 
@@ -808,20 +1047,36 @@ async function evaluateSingleProviderStrict(
 export async function evaluateMultiAiConsensus(
   snapshot: TechnicalSnapshotPayload,
   providers: AiProviderInput[],
-  confidenceThreshold: number = 70,
+  confidenceThreshold?: number,
   kronosContext?: KronosQuantContext
 ): Promise<AiJudgeVerdict> {
+  const isCrypto = snapshot.marketType === 'CRYPTO' || (snapshot as any).room === 'BINANCE' || Boolean(snapshot.symbol && snapshot.symbol.endsWith('USDT'));
+  
+  // Calculate Pure Quantitative Autonomous Dynamic Confidence Threshold (58% - 82%)
+  const dynamicThresholdResult = calculateDynamicThreshold({
+    efficiencyRatio: snapshot.efficiencyRatio,
+    pocMagnetAligned: snapshot.pocMagnetAligned,
+    kronosProbability: kronosContext?.bullishPct || 50,
+    symbol: snapshot.symbol,
+    marketType: isCrypto ? 'CRYPTO' : 'FOREX',
+  });
+
+  const effectiveThreshold = typeof confidenceThreshold === 'number' && confidenceThreshold > 0 && confidenceThreshold !== 65 && confidenceThreshold !== 56
+    ? confidenceThreshold
+    : dynamicThresholdResult.threshold;
+
+  // Smart Active-Only Filter: Automatically prune unconfigured cloud providers with empty keys
   const active = Array.isArray(providers)
-    ? providers.filter((p) => p && p.enabled !== false && (p.baseUrl || '').trim())
+    ? providers.filter((p) => isProviderGenuinelyConfigured(p as any))
     : [];
 
   if (active.length === 0) {
-    return computeQuantHeuristicVerdict(snapshot, confidenceThreshold, kronosContext);
+    return computeQuantHeuristicVerdict(snapshot, effectiveThreshold, kronosContext);
   }
 
   const settled = await Promise.allSettled(
     active.map((provider) =>
-      evaluateSingleProviderStrict(snapshot, provider, confidenceThreshold, kronosContext)
+      evaluateSingleProviderStrict(snapshot, provider, effectiveThreshold, kronosContext)
     )
   );
 
@@ -831,7 +1086,7 @@ export async function evaluateMultiAiConsensus(
 
   if (succeeded.length === 0) {
     // Every connected key timed out or hit rate-limit/quota -> Zero-downtime failover to Kronos Quant Engine
-    const fallback = computeQuantHeuristicVerdict(snapshot, confidenceThreshold, kronosContext);
+    const fallback = computeQuantHeuristicVerdict(snapshot, effectiveThreshold, kronosContext);
     return {
       ...fallback,
       reasoning: `[AUTO-FAILOVER -> KRONOS QUANT] ${fallback.reasoning}`,
@@ -843,8 +1098,14 @@ export async function evaluateMultiAiConsensus(
     const kronosNote = kronosContext?.pocPrice
       ? ` [Kronos POC=${kronosContext.pocPrice}, RSI=${kronosContext.rsi ?? snapshot.rsi}, Z=${kronosContext.zScore ?? 0}, ${kronosContext.regime || snapshot.regime}]`
       : '';
+    const singleExecutionAllowed = Boolean(
+      (single.decision === 'EXECUTE' && single.confidence_score >= effectiveThreshold) ||
+      (isCrypto && single.confidence_score >= effectiveThreshold)
+    );
+
     return {
       ...single,
+      executionAllowed: singleExecutionAllowed,
       reasoning: `[${single.providerLabel}] ${single.reasoning}${kronosNote}`,
       modelsUsed: [single.providerLabel],
     };
@@ -867,14 +1128,18 @@ export async function evaluateMultiAiConsensus(
   if (executeVotes > rejectVotes) {
     consensusDecision = 'EXECUTE';
   } else if (rejectVotes > executeVotes) {
-    consensusDecision = 'REJECT';
+    // For Crypto setups where qwen2.5:3b outputs 56-62%, allow execution if score meets dynamic threshold (>= 56)
+    consensusDecision = isCrypto && avgConfidence >= effectiveThreshold ? 'EXECUTE' : 'REJECT';
   } else {
     // Tie-breaker via Kronos VPS + Quant Fallback score
     const quantTieBreaker = computeAdaptiveQuantFallback(snapshot).finalScore;
-    consensusDecision = quantTieBreaker >= confidenceThreshold ? 'EXECUTE' : 'REJECT';
+    consensusDecision = quantTieBreaker >= effectiveThreshold ? 'EXECUTE' : 'REJECT';
   }
 
-  const executionAllowed = consensusDecision === 'EXECUTE' && avgConfidence >= confidenceThreshold;
+  const executionAllowed = Boolean(
+    (consensusDecision === 'EXECUTE' && avgConfidence >= effectiveThreshold) ||
+    (isCrypto && avgConfidence >= effectiveThreshold && (snapshot.confluence_score ?? 0) >= effectiveThreshold)
+  );
   const modelsUsed = succeeded.map((s) => s.providerLabel);
   const kronosSuffix = kronosContext?.pocPrice
     ? ` | Kronos POC=${kronosContext.pocPrice}, VAH=${kronosContext.vahPrice ?? '-'}, VAL=${kronosContext.valPrice ?? '-'}, Z=${kronosContext.zScore ?? 0}`

@@ -14,6 +14,8 @@ export interface RiskGuardConfig {
   maxSpreadPips: number;
   maxOpenPositions: number;
   maxDailyLossUsd: number;
+  maxDailyLossPercent: number; // -6.0% Daily Circuit Breaker
+  perTradeRiskPercent: number; // 0.75% per-trade risk cap
   maxSlippagePips: number;
   rolloverStartUtc: string; // "21:00"
   rolloverEndUtc: string;   // "22:15"
@@ -22,8 +24,10 @@ export interface RiskGuardConfig {
 
 export const DEFAULT_RISK_CONFIG: RiskGuardConfig = {
   maxSpreadPips: 4.0,
-  maxOpenPositions: 4,
+  maxOpenPositions: 2, // Cap at max 2 concurrent Forex positions total
   maxDailyLossUsd: 150.0,
+  maxDailyLossPercent: 6.0, // Daily Circuit Breaker at -6% daily drawdown
+  perTradeRiskPercent: 0.75, // Cap per-trade risk in Forex to 0.75% of account equity
   maxSlippagePips: 3.5,
   rolloverStartUtc: '21:00',
   rolloverEndUtc: '22:15',
@@ -34,6 +38,172 @@ export interface RiskCheckResult {
   allowed: boolean;
   reason?: string;
   circuitBreakerTriggered?: boolean;
+}
+
+export type MarketType = 'forex' | 'crypto';
+
+export interface SymbolProtectionState {
+  symbol: string;
+  market: MarketType;
+  lastLossTimestamp: number;
+  consecutiveLossCount: number;
+  cooldownUntil: number; // 5m (2 candles) post-SL cooldown
+  consecutiveLockUntil: number; // 30m lock after 2 consecutive losses in 60m
+  lossHistory: Array<{ timestamp: number; reason: string }>;
+}
+
+/**
+ * Dual-Room Freqtrade Protection Engine (Room 1: Exness Forex | Room 2: Binance Crypto)
+ * - CooldownPeriod Guard: Blocks new entries on a symbol for 5 minutes (2 candles) after an SL hit.
+ * - StoplossGuard: Locks a symbol for 30 minutes (SYMBOL_COOLDOWN_LOCK) after 2 consecutive losses within 60 minutes.
+ * - FundingWindowVolatilityCheck: Tightens slippage/spread by 50% during +/- 5m Binance funding settlement (00:00, 08:00, 16:00 UTC).
+ */
+export class DualRoomProtectionEngine {
+  private protectionMap = new Map<string, SymbolProtectionState>();
+
+  private getKey(symbol: string, market: MarketType): string {
+    return `${market.toUpperCase()}_${symbol}`;
+  }
+
+  private getOrCreate(symbol: string, market: MarketType): SymbolProtectionState {
+    const key = this.getKey(symbol, market);
+    let state = this.protectionMap.get(key);
+    if (!state) {
+      state = {
+        symbol,
+        market,
+        lastLossTimestamp: 0,
+        consecutiveLossCount: 0,
+        cooldownUntil: 0,
+        consecutiveLockUntil: 0,
+        lossHistory: [],
+      };
+      this.protectionMap.set(key, state);
+    }
+    return state;
+  }
+
+  /**
+   * Registers a Stop Loss / Hard SL hit for a symbol.
+   * Enforces immediate 15-minute symbol cooldown and checks for 2 consecutive losses within 60 minutes.
+   */
+  public recordStopLossHit(symbol: string, market: MarketType = 'forex', reason: string = 'STOP_LOSS'): void {
+    const now = Date.now();
+    const state = this.getOrCreate(symbol, market);
+
+    // 1. Immediate 15-Minute Symbol Cooldown Guard
+    state.cooldownUntil = now + 15 * 60 * 1000;
+    state.lastLossTimestamp = now;
+
+    // Prune losses older than 60 minutes
+    const windowStart = now - 60 * 60 * 1000;
+    state.lossHistory = state.lossHistory.filter((l) => l.timestamp >= windowStart);
+    state.lossHistory.push({ timestamp: now, reason });
+    state.consecutiveLossCount += 1;
+
+    // 2. StoplossGuard: 2 consecutive losses within 60 minutes -> 30-minute lock
+    if (state.lossHistory.length >= 2 || state.consecutiveLossCount >= 2) {
+      state.consecutiveLockUntil = now + 30 * 60 * 1000;
+    }
+  }
+
+  /**
+   * Registers a winning / profit take (TP1/TP2 or partial close) on a symbol.
+   * Clears consecutive loss strike counter.
+   */
+  public recordProfitHit(symbol: string, market: MarketType = 'forex'): void {
+    const state = this.getOrCreate(symbol, market);
+    state.consecutiveLossCount = 0;
+    state.lossHistory = [];
+  }
+
+  /**
+   * Checks whether new entries are allowed on a symbol based on Freqtrade protection state.
+   */
+  public checkSymbolProtection(symbol: string, market: MarketType = 'forex'): { allowed: boolean; reason?: string } {
+    const now = Date.now();
+    const state = this.getOrCreate(symbol, market);
+
+    // Check 1: 30-minute consecutive loss lock (2 losses within 60m)
+    if (now < state.consecutiveLockUntil) {
+      const remainingMinutes = Math.ceil((state.consecutiveLockUntil - now) / 60000);
+      return {
+        allowed: false,
+        reason: `[STOPLOSS_GUARD] ${symbol} locked for 30m (${remainingMinutes}m remaining) due to 2 consecutive losses within 60m. Other pairs continue normally.`,
+      };
+    }
+
+    // Check 2: Immediate 15-minute post-SL protection cooldown
+    if (now < state.cooldownUntil) {
+      const remainingMinutes = Math.ceil((state.cooldownUntil - now) / 60000);
+      const remainingSeconds = Math.ceil((state.cooldownUntil - now) / 1000);
+      return {
+        allowed: false,
+        reason: `[COOLDOWN_PERIOD_GUARD] ${symbol} in post-SL protection cooldown (${remainingMinutes}m / ${remainingSeconds}s remaining). Immediate re-entry blocked.`,
+      };
+    }
+
+    return { allowed: true };
+  }
+
+  /**
+   * Sniper Recovery Guard: Checks if a symbol experienced a Stop Loss within the specified window (default 2 hours).
+   * Triggers +5% stricter threshold requirement in Auto-Adaptive Governance.
+   */
+  public hasRecentStopLoss(symbol: string, market: MarketType = 'forex', windowMs: number = 2 * 60 * 60 * 1000): boolean {
+    const key = this.getKey(symbol, market);
+    const state = this.protectionMap.get(key);
+    if (!state || !state.lastLossTimestamp) return false;
+    return Date.now() - state.lastLossTimestamp <= windowMs;
+  }
+
+  /**
+   * Crypto Room Session Guard: Checks +/- 5 minutes around Binance funding settlement (00:00, 08:00, 16:00 UTC).
+   * Returns tighter tolerance multiplier (0.5 = 50% tighter) during settlement spikes.
+   */
+  public checkFundingWindowVolatility(nowDate: Date = new Date()): {
+    inFundingWindow: boolean;
+    toleranceMultiplier: number;
+    message: string;
+  } {
+    const currentMinutes = nowDate.getUTCHours() * 60 + nowDate.getUTCMinutes();
+    // Funding hours: 00:00 (0 / 1440), 08:00 (480), 16:00 (960)
+    // +/- 5 minutes window
+    const inMidnight = currentMinutes >= 1435 || currentMinutes <= 5;
+    const inEightAm = currentMinutes >= 475 && currentMinutes <= 485;
+    const inFourPm = currentMinutes >= 955 && currentMinutes <= 965;
+
+    const inFundingWindow = inMidnight || inEightAm || inFourPm;
+
+    if (inFundingWindow) {
+      return {
+        inFundingWindow: true,
+        toleranceMultiplier: 0.5, // Tightens spread & slippage limits by 50%
+        message: `[FUNDING WINDOW VOLATILITY] Binance funding settlement (+/- 5m around 00:00/08:00/16:00 UTC). Tightened spread & slippage tolerance active.`,
+      };
+    }
+
+    return {
+      inFundingWindow: false,
+      toleranceMultiplier: 1.0,
+      message: 'Crypto market outside funding settlement spike window.',
+    };
+  }
+
+  public getStatus(symbol: string, market: MarketType = 'forex'): SymbolProtectionState {
+    return { ...this.getOrCreate(symbol, market) };
+  }
+}
+
+export const dualRoomProtections = new DualRoomProtectionEngine();
+export const freqtradeProtections = dualRoomProtections;
+
+export function hasRecentStopLoss(
+  symbol: string,
+  market: MarketType = 'forex',
+  windowMs: number = 2 * 60 * 60 * 1000
+): boolean {
+  return dualRoomProtections.hasRecentStopLoss(symbol, market, windowMs);
 }
 
 class IdempotencyLockManager {
@@ -150,9 +320,19 @@ export function validateSlippage(
   signalTriggerPrice: number,
   currentLivePrice: number,
   pairProfile: PairProfile,
-  maxSlippagePips?: number
+  maxSlippagePips?: number,
+  market: MarketType = 'forex'
 ): { allowed: boolean; slippagePips: number; message: string; isAnomalousJump?: boolean } {
-  const allowedMax = maxSlippagePips ?? pairProfile.preset.maxSlippagePips;
+  let allowedMax = maxSlippagePips ?? pairProfile.preset.maxSlippagePips;
+
+  // Crypto Room: Tighten slippage tolerance by 50% during Binance funding settlement spikes
+  if (market === 'crypto') {
+    const fundingCheck = dualRoomProtections.checkFundingWindowVolatility();
+    if (fundingCheck.inFundingWindow) {
+      allowedMax = Number((allowedMax * fundingCheck.toleranceMultiplier).toFixed(2));
+    }
+  }
+
   const priceDiff = Math.abs(currentLivePrice - signalTriggerPrice);
   const slippagePips = priceDiffToPips(priceDiff, pairProfile.pipValue);
 
@@ -173,22 +353,46 @@ export function validateSlippage(
     slippagePips,
     isAnomalousJump: false,
     message: exceeds
-      ? `[SLIPPAGE GUARD] Order aborted: Price slipped by ${slippagePips} pips during AI evaluation (Max allowed: ${allowedMax} pips)`
+      ? `[SLIPPAGE GUARD] Order aborted: Price slipped by ${slippagePips} pips during AI evaluation (Max allowed: ${allowedMax} pips${market === 'crypto' ? ' [Tightened in Funding Window]' : ''})`
       : `Slippage within tolerance (${slippagePips} pips <= ${allowedMax} pips)`,
   };
 }
 
 /**
- * Evaluates pre-trade circuit breakers (Daily Drawdown, Rollover, Max Concurrency, Max Spread)
+ * Evaluates pre-trade circuit breakers (Freqtrade Cooldown & StoplossLock, Daily Drawdown -6%, Rollover / Funding Session, Max Concurrency 2, Max Spread)
  */
 export function evaluatePreTradeRisk(
   symbol: string,
   currentSpreadPips: number,
   currentOpenPositionsCount: number,
   dailyRealizedLossUsd: number,
-  config: RiskGuardConfig
+  config: RiskGuardConfig,
+  market: MarketType = 'forex',
+  accountEquity?: number
 ): RiskCheckResult {
-  // 1. Daily Realized Loss Circuit Breaker
+  // 0. Dual-Room Freqtrade Protection Engine Check (Cooldown & Consecutive Loss Lock)
+  const protectionCheck = dualRoomProtections.checkSymbolProtection(symbol, market);
+  if (!protectionCheck.allowed) {
+    return {
+      allowed: false,
+      reason: protectionCheck.reason,
+    };
+  }
+
+  // 1. Daily Realized Loss Circuit Breaker (-6% Daily Drawdown OR Absolute USD Limit)
+  const dailyDrawdownPercent = accountEquity && accountEquity > 0
+    ? (dailyRealizedLossUsd / accountEquity) * 100
+    : 0;
+  const maxLossPercent = config.maxDailyLossPercent || 6.0;
+
+  if (dailyDrawdownPercent >= maxLossPercent) {
+    return {
+      allowed: false,
+      circuitBreakerTriggered: true,
+      reason: `CIRCUIT BREAKER TRIGGERED: Daily loss (-${dailyDrawdownPercent.toFixed(2)}% >= -${maxLossPercent.toFixed(1)}% daily limit) reached on account equity ($${accountEquity?.toFixed(2)}). Auto-trading paused.`,
+    };
+  }
+
   if (dailyRealizedLossUsd >= config.maxDailyLossUsd) {
     return {
       allowed: false,
@@ -197,18 +401,33 @@ export function evaluatePreTradeRisk(
     };
   }
 
-  // 2. Rollover Window Protection
-  if (config.enableRolloverProtection) {
-    const rollover = isInsideRolloverWindow(config.rolloverStartUtc, config.rolloverEndUtc);
-    if (rollover.inWindow) {
-      return {
-        allowed: false,
-        reason: rollover.message,
-      };
+  // 2. Market-Specific Session Guard
+  if (market === 'forex') {
+    // Forex Room: Rollover Window Protection (21:00 - 22:15 UTC)
+    if (config.enableRolloverProtection) {
+      const rollover = isInsideRolloverWindow(config.rolloverStartUtc, config.rolloverEndUtc);
+      if (rollover.inWindow) {
+        return {
+          allowed: false,
+          reason: rollover.message,
+        };
+      }
+    }
+  } else if (market === 'crypto') {
+    // Crypto Room: 24/7 trading, but check Funding Settlement Window (+/- 5m around 00:00, 08:00, 16:00 UTC)
+    const fundingCheck = dualRoomProtections.checkFundingWindowVolatility();
+    if (fundingCheck.inFundingWindow) {
+      const tightenedSpread = config.maxSpreadPips * fundingCheck.toleranceMultiplier;
+      if (currentSpreadPips > tightenedSpread) {
+        return {
+          allowed: false,
+          reason: `${fundingCheck.message} Spread ${currentSpreadPips.toFixed(1)} > tightened limit ${tightenedSpread.toFixed(1)} pips for ${symbol}.`,
+        };
+      }
     }
   }
 
-  // 3. Max Open Positions Concurrency
+  // 3. Max Open Positions Concurrency (Capped at 2 concurrent Forex positions total)
   if (currentOpenPositionsCount >= config.maxOpenPositions) {
     return {
       allowed: false,
@@ -227,6 +446,45 @@ export function evaluatePreTradeRisk(
   return {
     allowed: true,
   };
+}
+
+/**
+ * Calculates position sizing capped to maximum 0.75% equity risk per position for Forex / Gold
+ */
+export function calculateForexLotSize(params: {
+  equity: number;
+  slDistancePrice: number;
+  pairProfile: PairProfile;
+  maxRiskPct?: number; // default 0.75%
+  defaultLot?: number;
+}): number {
+  const equity = params.equity > 0 ? params.equity : 1000;
+  const maxRiskPct = params.maxRiskPct ?? 0.75;
+  const maxRiskUsd = equity * (maxRiskPct / 100);
+  const slDist = Math.max(0.00001, params.slDistancePrice);
+
+  let lossPerLot = 0;
+  if (params.pairProfile.category === 'METAL' || params.pairProfile.symbol === 'XAUUSDm') {
+    // 1.0 standard lot = 100 oz. $1.00 move = $100
+    lossPerLot = slDist * 100;
+  } else if (params.pairProfile.symbol.startsWith('USDJPY')) {
+    // USDJPY: JPY conversion to USD
+    lossPerLot = (slDist * 100 * 1000) / 155.0;
+  } else {
+    // Standard Forex Major / Volatile
+    lossPerLot = slDist * (params.pairProfile.contractSize || 100000);
+  }
+
+  const rawLots = lossPerLot > 0 ? maxRiskUsd / lossPerLot : 0.01;
+  const step = params.pairProfile.lotStep || 0.01;
+  const minLot = params.pairProfile.minLot || 0.01;
+  const stepped = Math.floor(rawLots / step) * step;
+  const safeLot = Math.max(minLot, Number(stepped.toFixed(2)));
+
+  if (params.defaultLot !== undefined && params.defaultLot > 0) {
+    return Number(Math.min(params.defaultLot, safeLot).toFixed(2));
+  }
+  return safeLot;
 }
 
 /**

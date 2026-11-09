@@ -58,6 +58,7 @@ export interface IndicatorSnapshot {
   momentum5: number;
   bbPositionPct: number;
   atrRatio: number;
+  efficiencyRatio: number;
   supportPrice: number;
   resistancePrice: number;
   divergence: DivergenceResult;
@@ -69,8 +70,10 @@ export interface IndicatorSnapshot {
     middleBB: number;
     lowerBB: number;
     bbWidth: number;
+    ema50: number;
     ema200: number;
     atr14: number;
+    zScore: number;
     lowerWickRatio: number;
     upperWickRatio: number;
   };
@@ -81,8 +84,10 @@ export interface IndicatorSnapshot {
     middleBB: number;
     lowerBB: number;
     bbWidth: number;
+    ema50: number;
     ema200: number;
     atr14: number;
+    zScore: number;
     lowerWickRatio: number;
     upperWickRatio: number;
   };
@@ -93,8 +98,10 @@ export interface IndicatorSnapshot {
     middleBB: number;
     lowerBB: number;
     bbWidth: number;
+    ema50: number;
     ema200: number;
     atr14: number;
+    zScore: number;
     lowerWickRatio: number;
     upperWickRatio: number;
   };
@@ -248,6 +255,25 @@ export function calculateATR(candles: Candle[], period: number = 14): number[] {
   }
 
   return atr;
+}
+
+/**
+ * Kaufman Efficiency Ratio (ER-10) for Microstructure Regime Detection:
+ * ER = |close[n] - close[n - period]| / sum(|close[i] - close[i - 1]| for last 10 candles)
+ * Returns 0.0 (pure chop/noise) to 1.0 (pure straight-line trend without pullbacks).
+ * - ER > 0.68: Strong one-way institutional trend/cascade (penalizes counter-trend snapback)
+ * - ER <= 0.50: Optimal mean-reverting regime (boosts snapback signal confidence)
+ */
+export function calculateKaufmanEfficiencyRatio(closes: number[], period: number = 10): number {
+  if (closes.length <= period) return 0.5;
+  const n = closes.length - 1;
+  const netChange = Math.abs(closes[n] - closes[n - period]);
+  let totalVolatility = 0;
+  for (let i = n - period + 1; i <= n; i++) {
+    totalVolatility += Math.abs(closes[i] - closes[i - 1]);
+  }
+  if (totalVolatility === 0) return 0.5;
+  return Number((netChange / totalVolatility).toFixed(4));
 }
 
 /**
@@ -468,6 +494,9 @@ export function computeIndicatorSnapshot(
   const atrVal = atr14[c0Index] > 0 ? atr14[c0Index] : 1;
   const atrRatio = Number((c0Range / atrVal).toFixed(2));
 
+  // Kaufman Efficiency Ratio (ER-10) for Microstructure Regime Detection
+  const efficiencyRatio = calculateKaufmanEfficiencyRatio(closes, 10);
+
   // Support & Resistance swing boundary calculation over lookback window (up to 30 candles)
   const srLookback = Math.min(30, len);
   const srStart = Math.max(0, len - srLookback);
@@ -484,6 +513,14 @@ export function computeIndicatorSnapshot(
   const c1Wicks = calculateWickRatios(candles[c1Index]);
   const c2Wicks = calculateWickRatios(candles[c2Index]);
 
+  // Compute Z-Scores based on Bollinger Band stdDev
+  const c0Std = (bb.upper[c0Index] - bb.middle[c0Index]) / (bbStdDev || 2);
+  const c0ZScore = c0Std > 0 ? Number(((candles[c0Index].close - bb.middle[c0Index]) / c0Std).toFixed(2)) : 0;
+  const c1Std = (bb.upper[c1Index] - bb.middle[c1Index]) / (bbStdDev || 2);
+  const c1ZScore = c1Std > 0 ? Number(((candles[c1Index].close - bb.middle[c1Index]) / c1Std).toFixed(2)) : 0;
+  const c2Std = (bb.upper[c2Index] - bb.middle[c2Index]) / (bbStdDev || 2);
+  const c2ZScore = c2Std > 0 ? Number(((candles[c2Index].close - bb.middle[c2Index]) / c2Std).toFixed(2)) : 0;
+
   return {
     rsi,
     bb,
@@ -498,6 +535,7 @@ export function computeIndicatorSnapshot(
     momentum5,
     bbPositionPct,
     atrRatio,
+    efficiencyRatio,
     supportPrice: Number(supportPrice.toFixed(5)),
     resistancePrice: Number(resistancePrice.toFixed(5)),
     divergence,
@@ -508,8 +546,10 @@ export function computeIndicatorSnapshot(
       middleBB: bb.middle[c0Index],
       lowerBB: bb.lower[c0Index],
       bbWidth: bb.width[c0Index],
+      ema50: ema50[c0Index],
       ema200: ema200[c0Index],
       atr14: atr14[c0Index],
+      zScore: c0ZScore,
       lowerWickRatio: c0Wicks.lowerWickRatio,
       upperWickRatio: c0Wicks.upperWickRatio,
     },
@@ -520,8 +560,10 @@ export function computeIndicatorSnapshot(
       middleBB: bb.middle[c1Index],
       lowerBB: bb.lower[c1Index],
       bbWidth: bb.width[c1Index],
+      ema50: ema50[c1Index],
       ema200: ema200[c1Index],
       atr14: atr14[c1Index],
+      zScore: c1ZScore,
       lowerWickRatio: c1Wicks.lowerWickRatio,
       upperWickRatio: c1Wicks.upperWickRatio,
     },
@@ -532,8 +574,10 @@ export function computeIndicatorSnapshot(
       middleBB: bb.middle[c2Index],
       lowerBB: bb.lower[c2Index],
       bbWidth: bb.width[c2Index],
+      ema50: ema50[c2Index],
       ema200: ema200[c2Index],
       atr14: atr14[c2Index],
+      zScore: c2ZScore,
       lowerWickRatio: c2Wicks.lowerWickRatio,
       upperWickRatio: c2Wicks.upperWickRatio,
     },

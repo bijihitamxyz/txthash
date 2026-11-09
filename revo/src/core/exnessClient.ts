@@ -267,6 +267,100 @@ export function parseEd25519PrivateKey(privateKeyInput: string | crypto.KeyObjec
   return null;
 }
 
+// ==========================================
+// 1. MODULE-LEVEL CLOCK SYNCHRONIZATION
+// ==========================================
+let exnessTimeOffsetMs = 0;
+
+export function getExnessTimeOffsetMs(): number {
+  return exnessTimeOffsetMs;
+}
+
+export function setExnessTimeOffsetMs(offsetMs: number): void {
+  exnessTimeOffsetMs = offsetMs;
+}
+
+export function getSyncedTimestamp(): number {
+  return Date.now() + exnessTimeOffsetMs;
+}
+
+/**
+ * Parses Exness server time from HTTP response headers (x-request-start or date)
+ * and updates module-level exnessTimeOffsetMs = serverTimeMs - Date.now().
+ */
+export function updateExnessTimeOffsetFromHeaders(
+  headers: Headers | Record<string, string> | any
+): number | null {
+  try {
+    let xRequestStart: string | null = null;
+    let dateHeader: string | null = null;
+
+    if (headers && typeof headers.get === 'function') {
+      xRequestStart = headers.get('x-request-start') || headers.get('X-Request-Start');
+      dateHeader = headers.get('date') || headers.get('Date');
+    } else if (headers && typeof headers === 'object') {
+      for (const [k, v] of Object.entries(headers)) {
+        const lk = k.toLowerCase();
+        if (lk === 'x-request-start') xRequestStart = String(v);
+        if (lk === 'date') dateHeader = String(v);
+      }
+    }
+
+    let serverTimeMs: number | null = null;
+
+    if (xRequestStart) {
+      // Exness format: "t=1794216010.802" or "1794216010.802"
+      const match = String(xRequestStart).match(/t?=?([0-9.]+)/);
+      if (match && match[1]) {
+        const sec = parseFloat(match[1]);
+        if (!isNaN(sec) && sec > 0) {
+          // If in seconds (e.g. ~1.7e9), multiply by 1000; if already in ms (> 1e11), use directly
+          serverTimeMs = sec < 1e11 ? Math.floor(sec * 1000) : Math.floor(sec);
+        }
+      }
+    }
+
+    if (!serverTimeMs && dateHeader) {
+      const parsed = Date.parse(dateHeader);
+      if (!isNaN(parsed) && parsed > 0) {
+        serverTimeMs = parsed;
+      }
+    }
+
+    if (serverTimeMs) {
+      const newOffset = serverTimeMs - Date.now();
+      if (Math.abs(newOffset - exnessTimeOffsetMs) > 500) {
+        console.log(
+          `[ExnessClockSync] Synced Exness clock offset: ${newOffset}ms (Server Time: ${new Date(
+            serverTimeMs
+          ).toISOString()})`
+        );
+      }
+      exnessTimeOffsetMs = newOffset;
+      return exnessTimeOffsetMs;
+    }
+  } catch (err: any) {
+    console.warn('[ExnessClockSync] Failed to parse server time from headers:', err?.message || err);
+  }
+  return null;
+}
+
+/**
+ * Checks if response indicates an Exness timestamp drift error (e.g. 1001 "outside allowed window")
+ */
+export function isClockDriftError(status: number, body: any): boolean {
+  if (status !== 401 && status !== 400) return false;
+  const str = typeof body === 'string' ? body : JSON.stringify(body || {});
+  const lower = str.toLowerCase();
+  return (
+    lower.includes('outside allowed window') ||
+    lower.includes('1001') ||
+    lower.includes('auth_invalid_signature') ||
+    lower.includes('timestamp') ||
+    lower.includes('clock')
+  );
+}
+
 /**
  * Constructs the official EXN-* request headers according to the Exness specification:
  * Keys in exact order in JSON payload:
@@ -289,7 +383,7 @@ export function buildExnessAuthHeaders(params: {
   idempotencyKey?: string;
   timestampMs?: number;
 }): Record<string, string> {
-  const timestampMs = params.timestampMs !== undefined ? Math.floor(Number(params.timestampMs)) : Date.now();
+  const timestampMs = params.timestampMs !== undefined ? Math.floor(Number(params.timestampMs)) : getSyncedTimestamp();
   const methodUpper = params.method.toUpperCase();
   const isGet = methodUpper === 'GET';
   const idempotencyKey = isGet
@@ -1265,12 +1359,32 @@ export function matchAccountFromPayload(
 // 2. ACCESS POINT DISCOVERY & CACHING
 // ==========================================
 
+export function normalizeGatewayHost(rawHost?: string): string {
+  if (!rawHost) return 'https://api.exness-api.com';
+  let trimmed = String(rawHost).trim().replace(/\/+$/, '');
+  if (!trimmed) return 'https://api.exness-api.com';
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+    trimmed = `https://${trimmed}`;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    return parsed.origin.replace(/\/+$/, '');
+  } catch {
+    return trimmed.replace(/\/+$/, '');
+  }
+}
+
 export function isGatewayHost(urlOrHost: string): boolean {
   if (!urlOrHost) return false;
   try {
     const parsed = new URL(urlOrHost.startsWith('http') ? urlOrHost : `https://${urlOrHost}`);
     const hostname = parsed.hostname.toLowerCase();
-    return hostname === 'api.exness.com' || hostname === 'api.exness-api.com';
+    return (
+      hostname === 'api.exness.com' ||
+      hostname === 'api.exness-api.com' ||
+      (hostname.endsWith('.exness.com') && !hostname.startsWith('ap-')) ||
+      (hostname.endsWith('.exness-api.com') && !hostname.startsWith('ap-'))
+    );
   } catch {
     const clean = urlOrHost.toLowerCase().replace(/^https?:\/\//, '').split('/')[0].split(':')[0];
     return clean === 'api.exness.com' || clean === 'api.exness-api.com';
@@ -1332,16 +1446,19 @@ export async function resolveAccessPoint(
   // Gateways: Try api.exness-api.com first (fast, reliable globally), then fallback to api.exness.com
   const defaultGateways = ['https://api.exness-api.com', 'https://api.exness.com'];
   let gatewayBases = defaultGateways;
-  if (host && isGatewayHost(host)) {
-    const norm = (host.startsWith('http') ? host : `https://${host}`).replace(/\/+$/, '');
-    gatewayBases = [norm, ...defaultGateways.filter((g) => g !== norm)];
+  if (host) {
+    const norm = normalizeGatewayHost(host);
+    if (isGatewayHost(norm) || !norm.includes('ap-')) {
+      gatewayBases = [norm, ...defaultGateways.filter((g) => g !== norm)];
+    }
   }
-  const discoveryPath = '/v1/trading/access-point?account_id=' + cleanAccountId;
+  const cleanPath = '/v1/trading/access-point';
+  const discoveryPath = `${cleanPath}?account_id=${encodeURIComponent(cleanAccountId)}`;
 
   const discoveryAttempts: DiscoveryAttemptLog[] = [];
 
   for (const gatewayBaseUrl of gatewayBases) {
-    const fullDiscoveryUrl = `${gatewayBaseUrl}${discoveryPath}`;
+    const fullDiscoveryUrl = `${gatewayBaseUrl.replace(/\/+$/, '')}${discoveryPath}`;
     console.log(`[ExnessDiscovery] Probing Exness Gateway: GET ${fullDiscoveryUrl}`);
 
     try {
@@ -1352,6 +1469,7 @@ export async function resolveAccessPoint(
         path: discoveryPath,
         bodyStr: '',
         idempotencyKey: '',
+        timestampMs: getSyncedTimestamp(),
       });
 
       const { signal, cleanup } = createTimeoutSignal(7000);
@@ -1375,8 +1493,76 @@ export async function resolveAccessPoint(
         res.headers.forEach((val, key) => {
           resHeadersObj[key] = val;
         });
+        updateExnessTimeOffsetFromHeaders(res.headers);
       } finally {
         cleanup();
+      }
+
+      // Check for timestamp drift (code: 1001, "outside allowed window", AUTH_INVALID_SIGNATURE)
+      if (!res.ok && isClockDriftError(res.status, rawBody)) {
+        console.warn(
+          `[ExnessDiscovery] Clock drift detected (${res.status}: ${rawBody}). Re-signing with synced offset (${exnessTimeOffsetMs}ms) and retrying once...`
+        );
+        const retryHeaders = buildExnessAuthHeaders({
+          apiKey: cleanApiKey,
+          privateKey,
+          method: 'GET',
+          path: discoveryPath,
+          bodyStr: '',
+          idempotencyKey: '',
+          timestampMs: getSyncedTimestamp(),
+        });
+        const { signal: s2, cleanup: c2 } = createTimeoutSignal(7000);
+        try {
+          const retryRes = await fetch(fullDiscoveryUrl, {
+            method: 'GET',
+            headers: retryHeaders,
+            signal: s2,
+            cache: 'no-store',
+          });
+          const retryBody = await retryRes.text().catch(() => '');
+          updateExnessTimeOffsetFromHeaders(retryRes.headers);
+          if (retryRes.status === 200) {
+            res = retryRes;
+            rawBody = retryBody;
+            retryRes.headers.forEach((val, key) => {
+              resHeadersObj[key] = val;
+            });
+          } else if (isClockDriftError(retryRes.status, retryBody)) {
+            // Also test seconds format if needed by endpoint
+            const secHeaders = buildExnessAuthHeaders({
+              apiKey: cleanApiKey,
+              privateKey,
+              method: 'GET',
+              path: discoveryPath,
+              bodyStr: '',
+              idempotencyKey: '',
+              timestampMs: Math.floor(getSyncedTimestamp() / 1000),
+            });
+            const { signal: s3, cleanup: c3 } = createTimeoutSignal(7000);
+            try {
+              const secRes = await fetch(fullDiscoveryUrl, {
+                method: 'GET',
+                headers: secHeaders,
+                signal: s3,
+                cache: 'no-store',
+              });
+              const secBody = await secRes.text().catch(() => '');
+              updateExnessTimeOffsetFromHeaders(secRes.headers);
+              if (secRes.status === 200) {
+                res = secRes;
+                rawBody = secBody;
+                secRes.headers.forEach((val, key) => {
+                  resHeadersObj[key] = val;
+                });
+              }
+            } finally {
+              c3();
+            }
+          }
+        } finally {
+          c2();
+        }
       }
 
       // Exact logging of HTTP status code, response headers, and raw response body
@@ -1478,6 +1664,9 @@ class ExnessWebSocketManager {
   private activeAccountId: string | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private lastCreds: { accessPoint: string; accountId: string; apiKey: string; privateKey: string } | null = null;
+  private rateLimitAttempts: number = 0;
+  private isRateLimited: boolean = false;
+  private readonly rateLimitDelays = [5000, 15000, 30000, 60000];
 
   public connect(accessPoint: string, accountId: string, apiKey: string, privateKey: string): void {
     const cleanAccountId = String(accountId || '').trim();
@@ -1489,6 +1678,10 @@ class ExnessWebSocketManager {
 
     this.lastCreds = { accessPoint, accountId: cleanAccountId, apiKey, privateKey };
     if (this.activeAccountId === cleanAccountId && (this.ticksWs || this.eventsWs)) {
+      return;
+    }
+    // If currently rate-limited (HTTP 429) and cooldown timer is already running, avoid spamming
+    if (this.isRateLimited && this.reconnectTimer) {
       return;
     }
     this.disconnect();
@@ -1525,6 +1718,8 @@ class ExnessWebSocketManager {
       this.ticksWs = wsTicks;
 
       wsTicks.on('open', () => {
+        this.isRateLimited = false;
+        this.rateLimitAttempts = 0;
         console.log(`[ExnessWS] Ticks stream connected for account #${accountId}`);
         try {
           // Subscribe strictly to Forex & Gold instruments
@@ -1572,7 +1767,13 @@ class ExnessWebSocketManager {
       });
 
       wsTicks.on('error', (err: any) => {
-        console.warn(`[ExnessWS] Ticks stream warning: ${err?.message || 'handshake error'}`);
+        const msg = String(err?.message || '');
+        if (msg.includes('429')) {
+          this.isRateLimited = true;
+          console.warn(`[ExnessWS] Ticks stream rate limited (HTTP 429). Initiating exponential backoff cooldown...`);
+        } else {
+          console.warn(`[ExnessWS] Ticks stream warning: ${err?.message || 'handshake error'}`);
+        }
       });
 
       wsTicks.on('close', () => {
@@ -1603,6 +1804,8 @@ class ExnessWebSocketManager {
       this.eventsWs = wsEvents;
 
       wsEvents.on('open', () => {
+        this.isRateLimited = false;
+        this.rateLimitAttempts = 0;
         console.log(`[ExnessWS] Events stream connected for account #${accountId}`);
         try {
           wsEvents.send(JSON.stringify({ id: 'sub-account-1', subscribe: { event: 'account' } }));
@@ -1687,7 +1890,13 @@ class ExnessWebSocketManager {
       });
 
       wsEvents.on('error', (err: any) => {
-        console.warn(`[ExnessWS] Events stream warning: ${err?.message || 'handshake error'}`);
+        const msg = String(err?.message || '');
+        if (msg.includes('429')) {
+          this.isRateLimited = true;
+          console.warn(`[ExnessWS] Events stream rate limited (HTTP 429). Initiating exponential backoff cooldown...`);
+        } else {
+          console.warn(`[ExnessWS] Events stream warning: ${err?.message || 'handshake error'}`);
+        }
       });
 
       wsEvents.on('close', () => {
@@ -1703,6 +1912,15 @@ class ExnessWebSocketManager {
 
   private scheduleReconnect(): void {
     if (this.reconnectTimer) return;
+
+    let delay = 5000;
+    if (this.isRateLimited) {
+      const idx = Math.min(this.rateLimitAttempts, this.rateLimitDelays.length - 1);
+      delay = this.rateLimitDelays[idx];
+      this.rateLimitAttempts++;
+      console.warn(`[ExnessWS] 429 Rate Limit backoff active. Cooldown for ${delay / 1000}s (attempt ${this.rateLimitAttempts}) before reconnecting...`);
+    }
+
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       if (this.activeAccountId && this.lastCreds) {
@@ -1710,7 +1928,7 @@ class ExnessWebSocketManager {
           this.initStreams();
         }
       }
-    }, 5000);
+    }, delay);
   }
 
   public disconnect(): void {
@@ -1718,6 +1936,8 @@ class ExnessWebSocketManager {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.rateLimitAttempts = 0;
+    this.isRateLimited = false;
     this.activeAccountId = null;
     if (this.ticksWs) {
       try {
@@ -1763,7 +1983,7 @@ export class ExnessClient {
         apiKey: key,
         privateKey: (credentials as any).privateKey || '',
       };
-      this.configuredHost = srv;
+      this.configuredHost = normalizeGatewayHost(srv);
     } else {
       this.credentials = {};
     }
@@ -1798,7 +2018,8 @@ export class ExnessClient {
     method: string,
     path: string,
     bodyStr: string = '',
-    customIdempotencyKey?: string
+    customIdempotencyKey?: string,
+    timestampMs?: number
   ): Record<string, string> {
     const apiKey = String(this.credentials.apiKey || '').trim().replace(/^["']|["']$/g, '');
     const privateKey = typeof this.credentials.privateKey === 'string'
@@ -1812,6 +2033,7 @@ export class ExnessClient {
       path,
       bodyStr,
       idempotencyKey: customIdempotencyKey,
+      timestampMs: timestampMs !== undefined ? timestampMs : getSyncedTimestamp(),
     });
   }
 
@@ -1848,29 +2070,51 @@ export class ExnessClient {
 
     const bodyStr = body !== undefined ? (typeof body === 'string' ? body : JSON.stringify(body)) : '';
     const cleanPath = path.startsWith('/') ? path : `/${path}`;
-    const headers = this.buildAuthHeaders(method, cleanPath, bodyStr, customIdempotencyKey);
-
     const baseAp = accessPoint.replace(/\/+$/, '');
     const fullUrl = `${baseAp}${cleanPath}`;
 
     return exnessRestThrottler.schedule<T>(async () => {
-      const { signal, cleanup } = createTimeoutSignal(EXNESS_API_CONFIG.timeoutMs);
-      let res: Response;
-      try {
-        res = await fetch(fullUrl, {
-          method,
-          headers,
-          body: bodyStr || undefined,
-          signal,
-          cache: 'no-store',
-        } as RequestInit);
-      } catch (err: any) {
-        throw new ExnessApiError(`Tidak dapat terhubung ke Exness API (${err?.message || 'network error'}).`, 0);
-      } finally {
-        cleanup();
+      const executeCall = async (tsOverride?: number) => {
+        const headers = this.buildAuthHeaders(method, cleanPath, bodyStr, customIdempotencyKey, tsOverride);
+        const { signal, cleanup } = createTimeoutSignal(EXNESS_API_CONFIG.timeoutMs);
+        try {
+          const res = await fetch(fullUrl, {
+            method,
+            headers,
+            body: bodyStr || undefined,
+            signal,
+            cache: 'no-store',
+          } as RequestInit);
+          const text = await res.text().catch(() => '');
+          updateExnessTimeOffsetFromHeaders(res.headers);
+          return { res, text };
+        } catch (err: any) {
+          throw new ExnessApiError(`Tidak dapat terhubung ke Exness API (${err?.message || 'network error'}).`, 0);
+        } finally {
+          cleanup();
+        }
+      };
+
+      let { res, text } = await executeCall();
+
+      // If clock drift error (1001 / outside allowed window), re-sign and retry once transparently
+      if (!res.ok && isClockDriftError(res.status, text)) {
+        console.warn(
+          `[ExnessAuth] Detected clock drift (status ${res.status}: ${text}). Re-signing with synced offset (${exnessTimeOffsetMs}ms) and retrying once...`
+        );
+        const retry1 = await executeCall(getSyncedTimestamp());
+        res = retry1.res;
+        text = retry1.text;
+
+        if (!res.ok && isClockDriftError(res.status, text)) {
+          const retrySec = await executeCall(Math.floor(getSyncedTimestamp() / 1000));
+          if (retrySec.res.ok) {
+            res = retrySec.res;
+            text = retrySec.text;
+          }
+        }
       }
 
-      const text = await res.text().catch(() => '');
       let data: any = null;
       try {
         data = text ? JSON.parse(text) : null;
@@ -2090,7 +2334,7 @@ export class ExnessClient {
         privateKey: (credentials as any).privateKey || this.credentials.privateKey,
       };
       if (credentials.server) {
-        this.configuredHost = credentials.server;
+        this.configuredHost = normalizeGatewayHost(credentials.server);
       }
     }
 

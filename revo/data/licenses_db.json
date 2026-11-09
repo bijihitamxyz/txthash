@@ -11,16 +11,6 @@
       "expiresAt": "2026-11-15T03:59:43.659Z"
     },
     {
-      "id": "lic_1792865299454_37594f4a",
-      "licenseKey": "EQ-7D-3V8P-FADK",
-      "username": "@niuibb",
-      "telegram": "@niuibb",
-      "duration": "7d",
-      "status": "EXPIRED",
-      "createdAt": "2026-10-24T18:08:19.449Z",
-      "expiresAt": "2026-10-31T18:08:19.449Z"
-    },
-    {
       "id": "lic_demo_01",
       "licenseKey": "EQ-30D-EXN8-99K2",
       "username": "vip_trader",
@@ -30,17 +20,6 @@
       "status": "ACTIVE",
       "createdAt": "2026-10-20T10:00:00.000Z",
       "expiresAt": "2026-11-19T10:00:00.000Z"
-    },
-    {
-      "id": "lic_demo_02",
-      "licenseKey": "EQ-7D-GOLD-77X1",
-      "username": "algo_scalper",
-      "telegram": "@algoscalper",
-      "email": "scalper@exness-ai.com",
-      "duration": "7d",
-      "status": "EXPIRED",
-      "createdAt": "2026-10-22T08:00:00.000Z",
-      "expiresAt": "2026-10-29T08:00:00.000Z"
     }
   ]
 }

@@ -11,9 +11,23 @@ import {
 import {
   evaluateCryptoSignal,
   evaluateBtcVelocityGuard,
+  getCryptoDynamicThreshold,
   CryptoSignalVerdict,
 } from '@/core/cryptoSignalEngine';
-import { encryptCredential, decryptCredential } from '@/lib/cryptoVault';
+import { dualRoomProtections } from '@/core/riskGuard';
+import { evaluateCryptoPositionTrailing } from '@/core/trailingManager';
+import {
+  CryptoExchange,
+  CryptoAccountType,
+  CryptoExchangeCredentials,
+  CryptoVaultData,
+  DEFAULT_CRYPTO_VAULT,
+  saveCryptoVaultToLocalStorage,
+  loadCryptoVaultFromLocalStorage,
+  isCryptoVaultConfigured,
+  encryptCredential,
+  decryptCredential,
+} from '@/lib/cryptoVault';
 
 export interface BinanceTelemetryItem {
   id: string;
@@ -47,6 +61,21 @@ export const ANCHOR_MAJOR_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT']
 const STORAGE_KEY = 'binance_quant_storage_v2';
 const VAULT_STORAGE_KEY = 'binance_vault_enc_v2';
 
+function getActiveCredentialsPayload(state: BinanceStoreState) {
+  const isBitget = state.activeExchange === 'BITGET';
+  const c = isBitget ? state.bitgetConfig : state.binanceConfig;
+  const isTest = (c?.accountType || (state.isTestnet ? 'DEMO' : 'REAL')) === 'DEMO';
+  return {
+    apiKey: c?.apiKey || state.apiKey,
+    secretKey: c?.secretKey || state.apiSecret,
+    apiSecret: c?.secretKey || state.apiSecret,
+    passphrase: (c as any)?.passphrase || '',
+    accountType: c?.accountType || (state.isTestnet ? 'DEMO' : 'REAL'),
+    isTestnet: isTest,
+    exchange: state.activeExchange,
+  };
+}
+
 export function getTodayDateString(): string {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -68,6 +97,8 @@ export interface BinanceStoreState {
   setIsAutoTrading: (active: boolean) => void;
   toggleAutoTrading: () => void;
   isScanning: boolean;
+  isPanicClosing: boolean;
+  syncConfigToServer: () => void;
   lastScanTime: number;
   lastScanStatus: string;
 
@@ -92,7 +123,11 @@ export interface BinanceStoreState {
   btcPumpBlocked: boolean;
   btcGuardStatus: string;
 
-  // 5. Binance API Vault Credentials (AES-256)
+  // 5. Crypto API Vault Credentials (AES-256 for Binance & Bitget)
+  activeExchange: CryptoExchange;
+  setActiveExchange: (exchange: CryptoExchange) => void;
+  binanceConfig: CryptoExchangeCredentials;
+  bitgetConfig: CryptoExchangeCredentials;
   apiKey: string;
   apiSecret: string;
   isTestnet: boolean;
@@ -100,8 +135,13 @@ export interface BinanceStoreState {
   isVaultModalOpen: boolean;
   openVaultModal: () => void;
   closeVaultModal: () => void;
+  saveCryptoCredentials: (
+    exchange: CryptoExchange,
+    creds: CryptoExchangeCredentials,
+    activateNow?: boolean
+  ) => Promise<void>;
   saveCredentials: (apiKey: string, apiSecret: string, isTestnet: boolean) => Promise<void>;
-  clearCredentials: () => Promise<void>;
+  clearCredentials: (exchange?: CryptoExchange) => Promise<void>;
   loadSavedCredentials: () => Promise<void>;
 
   // 6. Account & Daily PnL
@@ -126,7 +166,7 @@ export interface BinanceStoreState {
   clearTelemetry: () => void;
 
   // Action Methods
-  fetchSymbolsAndTickers: () => Promise<void>;
+  fetchSymbolsAndTickers: (forceExchangeInfo?: boolean) => Promise<void>;
   fetchKlines: (symbol: string) => Promise<void>;
   fetchAccountInfo: () => Promise<void>;
   executeScannerTick: () => Promise<void>;
@@ -138,27 +178,66 @@ export interface BinanceStoreState {
 export const useBinanceStore = create<BinanceStoreState>()(
   persist(
     (set, get) => ({
-      // Sizing defaults
-      marginUsdt: 3.00,
-      setMarginUsdt: (val) => set({ marginUsdt: Math.max(1, Math.min(500, Number(val) || 3.00)) }),
+      // Sizing defaults (User margin setting strictly synchronized with backend)
+      marginUsdt: 25.00,
+      setMarginUsdt: (val) => {
+        set({ marginUsdt: Math.max(1, Math.min(500, Number(val) || 25.00)) });
+        get().syncConfigToServer();
+      },
       leverage: 10,
-      setLeverage: (val) => set({ leverage: Math.max(2, Math.min(50, Number(val) || 10)) }),
+      setLeverage: (val) => {
+        set({ leverage: Math.max(2, Math.min(50, Number(val) || 10)) });
+        get().syncConfigToServer();
+      },
       marginMode: 'ISOLATED',
-      setMarginMode: (marginMode) => set({ marginMode }),
-      maxConcurrentCoins: 3,
-      setMaxConcurrentCoins: (val) => set({ maxConcurrentCoins: Math.max(1, Math.min(5, Number(val) || 3)) }),
+      setMarginMode: (marginMode) => {
+        set({ marginMode });
+        get().syncConfigToServer();
+      },
+      maxConcurrentCoins: 5,
+      setMaxConcurrentCoins: (val) => {
+        set({ maxConcurrentCoins: Math.max(1, Math.min(5, Number(val) || 5)) });
+        get().syncConfigToServer();
+      },
 
       // Engine defaults - strictly starts idle
       isAutoTrading: false,
-      setIsAutoTrading: (isAutoTrading) => set({ isAutoTrading }),
-      toggleAutoTrading: () => {
-        const next = !get().isAutoTrading;
-        set({ isAutoTrading: next });
+      isScanning: false,
+      isPanicClosing: false,
+
+      syncConfigToServer: () => {
+        const state = get();
+        fetch('/api/binance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'SYNC_STATE',
+            isAutoTrading: state.isAutoTrading,
+            marginUsdt: state.marginUsdt,
+            leverage: state.leverage,
+            marginMode: state.marginMode,
+            maxConcurrentCoins: state.maxConcurrentCoins,
+          }),
+        }).catch(() => {});
+      },
+
+      setIsAutoTrading: (isAutoTrading) => {
+        set({ isAutoTrading, isScanning: isAutoTrading ? get().isScanning : false });
+        get().syncConfigToServer();
+      },
+      toggleAutoTrading: (forceState?: boolean) => {
+        const next = typeof forceState === 'boolean' ? forceState : !get().isAutoTrading;
+        set({ isAutoTrading: next, isScanning: false });
+        const exName = get().activeExchange === 'BITGET' ? 'BITGET' : 'BINANCE';
         get().addTelemetryLog(
           'ENGINE',
           'INFO',
-          next ? '🚀 BINANCE AUTO-TRADING STARTED (Altcoins & L2 24/7 Engine Active)' : '⏸️ BINANCE AUTO-TRADING STOPPED (Engine Idle)'
+          next ? `🚀 ${exName} AUTO-TRADING STARTED (Altcoins & L2 24/7 Engine Active)` : `⏸️ ${exName} AUTO-TRADING STOPPED (Engine Idle)`
         );
+
+        // Sync to backend scheduler immediately so it stops/starts scanning & orders
+        get().syncConfigToServer();
+
         if (next) {
           get().executeScannerTick();
         }
@@ -198,7 +277,30 @@ export const useBinanceStore = create<BinanceStoreState>()(
       btcPumpBlocked: false,
       btcGuardStatus: 'BTC Guard: Monitoring',
 
-      // API Vault
+      // Crypto API Vault (Binance & Bitget)
+      activeExchange: 'BINANCE',
+      setActiveExchange: (activeExchange) => {
+        set({ activeExchange });
+        const creds = activeExchange === 'BITGET' ? get().bitgetConfig : get().binanceConfig;
+        const configured = isCryptoVaultConfigured(
+          {
+            activeCryptoExchange: activeExchange,
+            binance: get().binanceConfig,
+            bitget: get().bitgetConfig,
+            updatedAt: Date.now(),
+          },
+          activeExchange
+        );
+        set({
+          apiKey: creds.apiKey || '',
+          apiSecret: creds.secretKey || '',
+          isTestnet: creds.accountType === 'DEMO',
+          isVaultConfigured: configured,
+        });
+        get().fetchSymbolsAndTickers();
+      },
+      binanceConfig: { apiKey: '', secretKey: '', accountType: 'DEMO' },
+      bitgetConfig: { apiKey: '', secretKey: '', passphrase: '', accountType: 'DEMO' },
       apiKey: '',
       apiSecret: '',
       isTestnet: true,
@@ -207,47 +309,138 @@ export const useBinanceStore = create<BinanceStoreState>()(
       openVaultModal: () => set({ isVaultModalOpen: true }),
       closeVaultModal: () => set({ isVaultModalOpen: false }),
 
-      saveCredentials: async (apiKey, apiSecret, isTestnet) => {
-        set({ apiKey, apiSecret, isTestnet, isVaultConfigured: Boolean(apiKey && apiSecret) });
-        if (typeof window !== 'undefined') {
-          try {
-            const raw = JSON.stringify({ apiKey, apiSecret, isTestnet });
-            const encrypted = await encryptCredential(raw);
-            localStorage.setItem(VAULT_STORAGE_KEY, encrypted);
-          } catch (e) {
-            console.warn('Failed to encrypt credentials to localStorage:', e);
-          }
-        }
+      saveCryptoCredentials: async (exchange, creds, activateNow = true) => {
+        const currentVault = (await loadCryptoVaultFromLocalStorage()) || { ...DEFAULT_CRYPTO_VAULT };
+        const updatedVault: CryptoVaultData = {
+          ...currentVault,
+          activeCryptoExchange: activateNow ? exchange : currentVault.activeCryptoExchange,
+          binance: exchange === 'BINANCE' ? { ...currentVault.binance, ...creds } : currentVault.binance,
+          bitget: exchange === 'BITGET' ? { ...currentVault.bitget, ...creds } : currentVault.bitget,
+          updatedAt: Date.now(),
+        };
+
+        await saveCryptoVaultToLocalStorage(updatedVault);
+
+        // Sync to server storage safely
+        fetch('/api/binance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'SAVE_SERVER_VAULT', vault: updatedVault }),
+        }).catch(() => {});
+
+        const activeEx = updatedVault.activeCryptoExchange;
+        const activeCreds = activeEx === 'BITGET' ? updatedVault.bitget : updatedVault.binance;
+        const configured = isCryptoVaultConfigured(updatedVault, activeEx);
+
+        set({
+          activeExchange: activeEx,
+          binanceConfig: updatedVault.binance,
+          bitgetConfig: updatedVault.bitget,
+          apiKey: activeCreds.apiKey || '',
+          apiSecret: activeCreds.secretKey || '',
+          isTestnet: activeCreds.accountType === 'DEMO',
+          isVaultConfigured: configured,
+        });
+
+        get().addTelemetryLog(
+          'VAULT',
+          'INFO',
+          `🔐 [VAULT] ${exchange} (${creds.accountType}) AES-256 credentials securely saved & activated as primary engine.`
+        );
       },
 
-      clearCredentials: async () => {
-        set({ apiKey: '', apiSecret: '', isVaultConfigured: false });
-        if (typeof window !== 'undefined') {
-          try {
-            localStorage.removeItem(VAULT_STORAGE_KEY);
-          } catch {}
-        }
-        get().addTelemetryLog('VAULT', 'INFO', '[SECURITY] Binance AES-256 API credentials cleared from vault.');
+      saveCredentials: async (apiKey, apiSecret, isTestnet) => {
+        await get().saveCryptoCredentials(
+          'BINANCE',
+          {
+            apiKey,
+            secretKey: apiSecret,
+            accountType: isTestnet ? 'DEMO' : 'REAL',
+          },
+          true
+        );
+      },
+
+      clearCredentials: async (exchange) => {
+        const targetExchange = exchange || get().activeExchange;
+        const currentVault = (await loadCryptoVaultFromLocalStorage()) || { ...DEFAULT_CRYPTO_VAULT };
+        const updatedVault: CryptoVaultData = {
+          ...currentVault,
+          binance: targetExchange === 'BINANCE'
+            ? { apiKey: '', secretKey: '', accountType: 'DEMO' }
+            : currentVault.binance,
+          bitget: targetExchange === 'BITGET'
+            ? { apiKey: '', secretKey: '', passphrase: '', accountType: 'DEMO' }
+            : currentVault.bitget,
+          updatedAt: Date.now(),
+        };
+
+        await saveCryptoVaultToLocalStorage(updatedVault);
+
+        fetch('/api/binance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'SAVE_SERVER_VAULT', vault: updatedVault }),
+        }).catch(() => {});
+
+        const activeEx = updatedVault.activeCryptoExchange;
+        const activeCreds = activeEx === 'BITGET' ? updatedVault.bitget : updatedVault.binance;
+        const configured = isCryptoVaultConfigured(updatedVault, activeEx);
+
+        set({
+          binanceConfig: updatedVault.binance,
+          bitgetConfig: updatedVault.bitget,
+          apiKey: activeCreds.apiKey || '',
+          apiSecret: activeCreds.secretKey || '',
+          isTestnet: activeCreds.accountType === 'DEMO',
+          isVaultConfigured: configured,
+        });
+
+        get().addTelemetryLog('VAULT', 'INFO', `[SECURITY] ${targetExchange} credentials cleared from vault.`);
       },
 
       loadSavedCredentials: async () => {
         if (typeof window === 'undefined') return;
         try {
-          const enc = localStorage.getItem(VAULT_STORAGE_KEY);
-          if (enc) {
-            const dec = await decryptCredential(enc);
-            if (dec) {
-              const parsed = JSON.parse(dec);
-              set({
-                apiKey: parsed.apiKey || '',
-                apiSecret: parsed.apiSecret || '',
-                isTestnet: parsed.isTestnet ?? true,
-                isVaultConfigured: Boolean(parsed.apiKey && parsed.apiSecret),
-              });
-            }
+          const vault = await loadCryptoVaultFromLocalStorage();
+          if (vault) {
+            const activeEx = vault.activeCryptoExchange || 'BINANCE';
+            const activeCreds = activeEx === 'BITGET' ? vault.bitget : vault.binance;
+            const configured = isCryptoVaultConfigured(vault, activeEx);
+
+            set({
+              activeExchange: activeEx,
+              binanceConfig: vault.binance || { apiKey: '', secretKey: '', accountType: 'DEMO' },
+              bitgetConfig: vault.bitget || { apiKey: '', secretKey: '', passphrase: '', accountType: 'DEMO' },
+              apiKey: activeCreds?.apiKey || '',
+              apiSecret: activeCreds?.secretKey || '',
+              isTestnet: activeCreds?.accountType === 'DEMO',
+              isVaultConfigured: configured,
+            });
           }
+
+          // Ensure backend and client auto-trading state are strictly aligned
+          try {
+            const stateRes = await fetch('/api/binance?action=GET_STATE');
+            if (stateRes.ok) {
+              const stateData = await stateRes.json();
+              if (stateData.success && typeof stateData.isAutoTrading === 'boolean') {
+                const currentLocal = get().isAutoTrading;
+                // If local scan button is currently inactive (e.g. after refresh), enforce server idle to stop background scanning
+                if (!currentLocal && stateData.isAutoTrading) {
+                  await fetch('/api/binance', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'SYNC_STATE', isAutoTrading: false }),
+                  });
+                } else if (currentLocal !== stateData.isAutoTrading) {
+                  set({ isAutoTrading: stateData.isAutoTrading, isScanning: false });
+                }
+              }
+            }
+          } catch {}
         } catch (e) {
-          console.warn('Failed to decrypt credentials from localStorage:', e);
+          console.warn('Failed to load crypto credentials from vault:', e);
         }
       },
 
@@ -312,31 +505,68 @@ export const useBinanceStore = create<BinanceStoreState>()(
       clearTelemetry: () => set({ telemetryLogs: [] }),
 
       // Methods
-      fetchSymbolsAndTickers: async () => {
+      fetchSymbolsAndTickers: async (forceExchangeInfo = false) => {
+        const ex = get().activeExchange || 'BINANCE';
+        const isTest = get().isTestnet;
+        const currentSymbols = get().allSymbols;
+        const needsExchangeInfo = forceExchangeInfo || !currentSymbols || currentSymbols.length <= FALLBACK_SYMBOLS.length;
+
         try {
+          const promises: [Promise<Response> | null, Promise<Response>] = [
+            needsExchangeInfo
+              ? fetch(`/api/binance?action=EXCHANGE_INFO&exchange=${ex}&isTestnet=${isTest}`)
+              : null,
+            fetch(`/api/binance?action=TICKERS&exchange=${ex}&isTestnet=${isTest}`),
+          ];
+
           const [infoRes, tickRes] = await Promise.all([
-            fetch('/api/binance?action=EXCHANGE_INFO'),
-            fetch('/api/binance?action=TICKERS'),
+            promises[0] ? promises[0] : Promise.resolve(null),
+            promises[1],
           ]);
 
-          const infoJson = await infoRes.json();
-          const tickJson = await tickRes.json();
-
-          if (infoJson.success && Array.isArray(infoJson.symbols) && infoJson.symbols.length > 0) {
-            set({ allSymbols: infoJson.symbols });
+          if (infoRes) {
+            const infoJson = await infoRes.json();
+            if (infoJson.success && Array.isArray(infoJson.symbols) && infoJson.symbols.length > 0) {
+              set({ allSymbols: infoJson.symbols });
+            }
           }
+
+          const tickJson = await tickRes.json();
           if (tickJson.success && tickJson.tickers) {
-            set({ tickers: tickJson.tickers });
+            const newTickers = tickJson.tickers;
+            const updatedPositions = get().positions.map((pos) => {
+              const ticker = newTickers[pos.symbol];
+              if (!ticker || !ticker.lastPrice) return pos;
+              const curPrice = ticker.lastPrice;
+              const isLong = pos.positionAmt > 0;
+              const size = Math.abs(pos.positionAmt);
+              const pnl = isLong ? (curPrice - pos.entryPrice) * size : (pos.entryPrice - curPrice) * size;
+              return {
+                ...pos,
+                markPrice: curPrice,
+                unRealizedProfit: Number(pnl.toFixed(4)),
+                highestPriceSinceEntry: Math.max(pos.highestPriceSinceEntry || curPrice, curPrice),
+                lowestPriceSinceEntry: Math.min(pos.lowestPriceSinceEntry || curPrice, curPrice),
+              };
+            });
+            const totalUnrealized = updatedPositions.reduce((sum, p) => sum + (p.unRealizedProfit || 0), 0);
+            set({
+              tickers: newTickers,
+              positions: updatedPositions,
+              unrealizedProfit: Number(totalUnrealized.toFixed(2)),
+            });
           }
         } catch (e) {
-          console.warn('Error fetching symbols/tickers from /api/binance:', e);
+          console.warn(`Error fetching symbols/tickers from /api/binance (${ex}):`, e);
         }
       },
 
       fetchKlines: async (symbol) => {
         const tf = get().timeframe || 'M5';
+        const ex = get().activeExchange || 'BINANCE';
+        const isTest = get().isTestnet;
         try {
-          const res = await fetch(`/api/binance?action=KLINES&symbol=${symbol}&interval=${tf}&limit=100`);
+          const res = await fetch(`/api/binance?action=KLINES&symbol=${symbol}&interval=${tf}&limit=100&exchange=${ex}&isTestnet=${isTest}`);
           const json = await res.json();
           if (json.success && Array.isArray(json.klines)) {
             set((state) => ({
@@ -349,8 +579,12 @@ export const useBinanceStore = create<BinanceStoreState>()(
       },
 
       fetchAccountInfo: async () => {
-        const { apiKey, apiSecret, isTestnet, isVaultConfigured } = get();
-        if (!isVaultConfigured || !apiKey) return;
+        if (get().isPanicClosing) return;
+        const { activeExchange, binanceConfig, bitgetConfig, isVaultConfigured } = get();
+        if (!isVaultConfigured) return;
+
+        const currentCreds = activeExchange === 'BITGET' ? bitgetConfig : binanceConfig;
+        if (!currentCreds.apiKey) return;
 
         try {
           const res = await fetch('/api/binance', {
@@ -358,7 +592,15 @@ export const useBinanceStore = create<BinanceStoreState>()(
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               action: 'ACCOUNT',
-              credentials: { apiKey, apiSecret, isTestnet },
+              exchange: activeExchange,
+              credentials: {
+                apiKey: currentCreds.apiKey,
+                secretKey: currentCreds.secretKey,
+                apiSecret: currentCreds.secretKey,
+                passphrase: (currentCreds as any).passphrase || '',
+                accountType: currentCreds.accountType,
+                isTestnet: currentCreds.accountType === 'DEMO',
+              },
             }),
           });
           const json = await res.json();
@@ -366,29 +608,75 @@ export const useBinanceStore = create<BinanceStoreState>()(
             const data = json.data;
             const newBal = data.totalWalletBalance > 0 ? data.totalWalletBalance : get().walletBalance;
 
-            // Merge local tracking (partialClose, breakeven) into incoming live positions
             const currentPositions = get().positions;
-            const mergedPositions = (data.positions || []).map((p: BinancePosition) => {
-              const existing = currentPositions.find((cp) => cp.symbol === p.symbol);
+            const remotePositions: BinancePosition[] = Array.isArray(data.positions) ? data.positions : [];
+            const mergedMap = new Map<string, BinancePosition>();
+
+            // 1. Anchor all active local / simulated positions so newly executed trades NEVER vanish!
+            for (const cp of currentPositions) {
+              if (cp && cp.symbol) {
+                mergedMap.set(cp.symbol, { ...cp });
+              }
+            }
+
+            // 2. Overlay / merge incoming remote positions from exchange
+            for (const rp of remotePositions) {
+              if (!rp || !rp.symbol) continue;
+              const existing = mergedMap.get(rp.symbol);
+              if (existing) {
+                mergedMap.set(rp.symbol, {
+                  ...existing,
+                  ...rp,
+                  initialQuantity: existing.initialQuantity || Math.abs(rp.positionAmt),
+                  partialClosed: existing.partialClosed || false,
+                  isBreakevenLocked: existing.isBreakevenLocked || false,
+                  takeProfit1Price: existing.takeProfit1Price ?? rp.takeProfit1Price,
+                  stopLossPrice: existing.stopLossPrice ?? rp.stopLossPrice,
+                  trailingStopPrice: existing.trailingStopPrice ?? rp.trailingStopPrice,
+                  highestPriceSinceEntry: existing.highestPriceSinceEntry || rp.entryPrice,
+                  lowestPriceSinceEntry: existing.lowestPriceSinceEntry || rp.entryPrice,
+                  openTime: existing.openTime || Date.now(),
+                });
+              } else {
+                mergedMap.set(rp.symbol, {
+                  ...rp,
+                  initialQuantity: Math.abs(rp.positionAmt),
+                  partialClosed: false,
+                  isBreakevenLocked: false,
+                  highestPriceSinceEntry: rp.entryPrice,
+                  lowestPriceSinceEntry: rp.entryPrice,
+                  openTime: Date.now(),
+                });
+              }
+            }
+
+            // 3. Continuously compute mark price and unrealized PnL from latest live tickers
+            const tickers = get().tickers;
+            const updatedPositions = Array.from(mergedMap.values()).map((pos) => {
+              const ticker = tickers[pos.symbol];
+              const curPrice = ticker?.lastPrice && ticker.lastPrice > 0 ? ticker.lastPrice : (pos.markPrice || pos.entryPrice);
+              const isLong = pos.positionAmt > 0;
+              const size = Math.abs(pos.positionAmt);
+              const pnl = isLong ? (curPrice - pos.entryPrice) * size : (pos.entryPrice - curPrice) * size;
+
               return {
-                ...p,
-                initialQuantity: existing?.initialQuantity || Math.abs(p.positionAmt),
-                partialClosed: existing?.partialClosed || false,
-                isBreakevenLocked: existing?.isBreakevenLocked || false,
-                takeProfit1Price: existing?.takeProfit1Price,
-                stopLossPrice: existing?.stopLossPrice,
-                trailingStopPrice: existing?.trailingStopPrice,
-                highestPriceSinceEntry: existing?.highestPriceSinceEntry || p.entryPrice,
-                lowestPriceSinceEntry: existing?.lowestPriceSinceEntry || p.entryPrice,
+                ...pos,
+                markPrice: curPrice,
+                unRealizedProfit: Number(pnl.toFixed(4)),
+                highestPriceSinceEntry: Math.max(pos.highestPriceSinceEntry || curPrice, curPrice),
+                lowestPriceSinceEntry: Math.min(pos.lowestPriceSinceEntry || curPrice, curPrice),
               };
             });
 
+            const totalUnrealized = updatedPositions.reduce((sum, p) => sum + (p.unRealizedProfit || 0), 0);
+            const calcWalletBal = newBal > 0 ? newBal : (get().walletBalance > 0 ? get().walletBalance : 1000.00);
+
             set({
-              walletBalance: Number(newBal.toFixed(2)),
-              unrealizedProfit: Number((data.totalUnrealizedProfit || 0).toFixed(2)),
-              marginBalance: Number((data.totalMarginBalance || newBal).toFixed(2)),
-              availableBalance: Number((data.availableBalance || newBal).toFixed(2)),
-              positions: mergedPositions,
+              walletBalance: Number(calcWalletBal.toFixed(2)),
+              unrealizedProfit: Number(totalUnrealized.toFixed(2)),
+              marginBalance: Number((calcWalletBal + totalUnrealized).toFixed(2)),
+              availableBalance: Number((data.availableBalance > 0 ? data.availableBalance : calcWalletBal).toFixed(2)),
+              positions: updatedPositions,
             });
           }
         } catch (e) {
@@ -398,14 +686,20 @@ export const useBinanceStore = create<BinanceStoreState>()(
 
       executeScannerTick: async () => {
         const state = get();
-        if (!state.isAutoTrading || state.isScanning) return;
+        if (!state.isAutoTrading || state.isPanicClosing) {
+          if (state.isScanning) set({ isScanning: false });
+          return;
+        }
+        if (state.isScanning) return;
         set({ isScanning: true, lastScanTime: Date.now() });
 
         try {
           // Step 1: Monitor BTCUSDT 5m Velocity Guard
           let btcGuard = { dumpBlocked: false, pumpBlocked: false, velocityPct: 0 };
           try {
-            const btcRes = await fetch('/api/binance?action=KLINES&symbol=BTCUSDT&interval=5m&limit=10');
+            const ex = state.activeExchange || 'BINANCE';
+            const isTest = state.isTestnet;
+            const btcRes = await fetch(`/api/binance?action=KLINES&symbol=BTCUSDT&interval=5m&limit=10&exchange=${ex}&isTestnet=${isTest}`);
             const btcJson = await btcRes.json();
             if (btcJson.success && btcJson.klines) {
               const guardRes = evaluateBtcVelocityGuard(btcJson.klines);
@@ -424,7 +718,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
             console.warn('Could not check BTC Guard velocity:', e);
           }
 
-          // Step 2: Manage Open Positions for Asymmetric Winrate Lock
+          // Step 2: Manage Open Positions for Asymmetric Winrate Lock (50% Stage-1 Partial Close & Stage-2 Trailing Stop)
           const currentPositions = [...state.positions];
           const tickers = state.tickers;
 
@@ -440,85 +734,154 @@ export const useBinanceStore = create<BinanceStoreState>()(
             pos.highestPriceSinceEntry = Math.max(pos.highestPriceSinceEntry || curPrice, curPrice);
             pos.lowestPriceSinceEntry = Math.min(pos.lowestPriceSinceEntry || curPrice, curPrice);
 
-            // Check TP1 (60% Partial Close) hit!
-            // Strictly guard: MUST be in net positive profit (>= 0.6R / minProfit) and target must be beyond entryPrice
-            if (!pos.partialClosed) {
-              const riskDist = pos.stopLossPrice
-                ? Math.abs(pos.entryPrice - pos.stopLossPrice)
-                : pos.entryPrice * 0.005;
-              const minProfitDist = Math.max(pos.entryPrice * 0.0015, 0.6 * riskDist);
+            // Evaluate 2-Stage Trailing Stop via trailingManager
+            const trailingAction = evaluateCryptoPositionTrailing({
+              symbol: pos.symbol,
+              side: isLong ? 'BUY' : 'SELL',
+              entryPrice: pos.entryPrice,
+              currentPrice: curPrice,
+              quantity: absAmt,
+              partialClosed: pos.partialClosed,
+              currentSl: pos.trailingStopPrice || pos.stopLossPrice,
+              atr14: curPrice * 0.012,
+              exchange: state.activeExchange,
+            });
 
-              const isLongProfit = isLong && curPrice > pos.entryPrice + minProfitDist;
-              const isShortProfit = !isLong && curPrice < pos.entryPrice - minProfitDist;
+            // Stage 1: 50% Partial Close & Breakeven Stop
+            if (trailingAction.action === 'PARTIAL_CLOSE' && !pos.partialClosed) {
+              const closeQty = trailingAction.closeQuantity || (absAmt * 0.5);
+              const realizedPnl = isLong
+                ? (curPrice - pos.entryPrice) * closeQty
+                : (pos.entryPrice - curPrice) * closeQty;
 
-              const tp1TargetValid = pos.takeProfit1Price
-                ? (isLong ? pos.takeProfit1Price > pos.entryPrice + minProfitDist : pos.takeProfit1Price < pos.entryPrice - minProfitDist)
-                : false;
+              state.recordTradePnL(realizedPnl);
+              dualRoomProtections.recordProfitHit(pos.symbol, 'crypto');
+              pos.partialClosed = true;
+              pos.isBreakevenLocked = true;
+              pos.stopLossPrice = trailingAction.newSlPrice || (isLong ? pos.entryPrice * 1.0008 : pos.entryPrice * 0.9992);
+              pos.trailingStopPrice = pos.stopLossPrice;
 
-              const tp1Hit = (isLongProfit && ((tp1TargetValid && curPrice >= (pos.takeProfit1Price || 0)) || curPrice >= pos.entryPrice + 0.6 * riskDist)) ||
-                             (isShortProfit && ((tp1TargetValid && curPrice <= (pos.takeProfit1Price || 0)) || curPrice <= pos.entryPrice - 0.6 * riskDist));
+              state.addTelemetryLog(
+                pos.symbol,
+                'LOCK',
+                trailingAction.reason || `🎯 STAGE-1 PARTIAL CLOSE: 50% Closed (+$${realizedPnl.toFixed(2)} USDT Locked). Stop Loss moved to Breakeven+ ($${pos.stopLossPrice.toFixed(4)}). Zero Risk Moonbag Active!`
+              );
 
-              if (tp1Hit) {
-                // Execute 60% Partial Close
-                const closeQty = absAmt * 0.60;
-                const realizedPnl = isLong
-                  ? (curPrice - pos.entryPrice) * closeQty
-                  : (pos.entryPrice - curPrice) * closeQty;
+              if (state.isVaultConfigured) {
+                // 1. Partial close 50% on exchange
+                fetch('/api/binance', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    action: 'CLOSE_POSITION',
+                    exchange: state.activeExchange,
+                    isTestnet: state.isTestnet,
+                    credentials: getActiveCredentialsPayload(state),
+                    payload: { symbol: pos.symbol, positionAmt: pos.positionAmt, quantityToClose: closeQty },
+                  }),
+                }).catch(() => {});
 
-                state.recordTradePnL(realizedPnl);
-                pos.partialClosed = true;
-                pos.isBreakevenLocked = true;
-                // Move SL to Breakeven+
-                pos.stopLossPrice = isLong
-                  ? pos.entryPrice * 1.0008 // fee buffer
-                  : pos.entryPrice * 0.9992;
+                // 2. Route Stage-1 Breakeven SL update to exchange
+                fetch('/api/binance', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    action: 'UPDATE_TRAILING_STOP',
+                    exchange: state.activeExchange,
+                    isTestnet: state.isTestnet,
+                    credentials: getActiveCredentialsPayload(state),
+                    payload: {
+                      symbol: pos.symbol,
+                      triggerPrice: pos.stopLossPrice,
+                      holdSide: isLong ? 'long' : 'short',
+                      side: isLong ? 'BUY' : 'SELL',
+                      planType: 'pos_loss',
+                    },
+                  }),
+                }).catch(() => {});
+              }
+            } else if (trailingAction.action === 'MODIFY_SL' && trailingAction.newSlPrice) {
+              // Stage 2: Adaptive ATR Trailing Stop
+              pos.trailingStopPrice = trailingAction.newSlPrice;
+              pos.stopLossPrice = trailingAction.newSlPrice;
+              state.addTelemetryLog(
+                pos.symbol,
+                'LOCK',
+                trailingAction.reason || `🚀 STAGE-2 TRAILING SL: Advanced trailing stop to $${pos.stopLossPrice.toFixed(4)} on ${pos.symbol}`
+              );
 
-                state.addTelemetryLog(
-                  pos.symbol,
-                  'LOCK',
-                  `🎯 TP1 HIT (+0.7R/VWAP): 60% Closed (+$${realizedPnl.toFixed(2)} USDT Locked). Stop Loss moved to Breakeven+ ($${pos.stopLossPrice.toFixed(4)}). Zero Risk Moonbag Active!`
-                );
-
-                // Call exchange API if credentials configured
-                if (state.isVaultConfigured) {
-                  fetch('/api/binance', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      action: 'CLOSE_POSITION',
-                      credentials: { apiKey: state.apiKey, apiSecret: state.apiSecret, isTestnet: state.isTestnet },
-                      payload: { symbol: pos.symbol, positionAmt: pos.positionAmt, quantityToClose: closeQty },
-                    }),
-                  }).catch(() => {});
-                }
+              if (state.isVaultConfigured) {
+                fetch('/api/binance', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    action: 'UPDATE_TRAILING_STOP',
+                    exchange: state.activeExchange,
+                    isTestnet: state.isTestnet,
+                    credentials: getActiveCredentialsPayload(state),
+                    payload: {
+                      symbol: pos.symbol,
+                      triggerPrice: trailingAction.newSlPrice,
+                      holdSide: isLong ? 'long' : 'short',
+                      side: isLong ? 'BUY' : 'SELL',
+                      planType: 'pos_loss',
+                    },
+                  }),
+                }).catch(() => {});
               }
             }
 
-            // Check Breakeven+ Stop Loss hit
-            if (pos.stopLossPrice) {
-              const slHit = isLong ? curPrice <= pos.stopLossPrice : curPrice >= pos.stopLossPrice;
-              if (slHit) {
-                const remainingQty = absAmt;
-                const realizedPnl = isLong
-                  ? (curPrice - pos.entryPrice) * remainingQty
-                  : (pos.entryPrice - curPrice) * remainingQty;
-                state.recordTradePnL(realizedPnl);
-                state.addTelemetryLog(
-                  pos.symbol,
-                  'ORDER',
-                  `${pos.isBreakevenLocked ? '🛡️ BREAKEVEN+ HIT' : '🛑 STOP LOSS HIT'}: Closed remaining ${pos.symbol} at $${curPrice} (PnL: ${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)})`
-                );
-                currentPositions.splice(i, 1);
-                i--;
-                continue;
+            // Check Breakeven+ Stop Loss or Hard SL Circuit Breaker hit
+            const slHit = trailingAction.action === 'HARD_SL_CLOSE' || (pos.stopLossPrice ? (isLong ? curPrice <= pos.stopLossPrice : curPrice >= pos.stopLossPrice) : false);
+            if (slHit) {
+              const remainingQty = absAmt;
+              const realizedPnl = isLong
+                ? (curPrice - pos.entryPrice) * remainingQty
+                : (pos.entryPrice - curPrice) * remainingQty;
+              state.recordTradePnL(realizedPnl);
+              dualRoomProtections.recordStopLossHit(
+                pos.symbol,
+                'crypto',
+                pos.isBreakevenLocked ? 'BREAKEVEN_HIT' : 'STOP_LOSS'
+              );
+              state.addTelemetryLog(
+                pos.symbol,
+                'ORDER',
+                `${pos.isBreakevenLocked ? '🛡️ BREAKEVEN+ HIT' : '🛑 STOP LOSS HIT'}: Closed remaining ${pos.symbol} at $${curPrice} (PnL: ${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)})`
+              );
+
+              if (state.isVaultConfigured) {
+                fetch('/api/binance', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    action: 'CLOSE_POSITION',
+                    exchange: state.activeExchange,
+                    isTestnet: state.isTestnet,
+                    credentials: getActiveCredentialsPayload(state),
+                    payload: { symbol: pos.symbol, positionAmt: pos.positionAmt, quantityToClose: remainingQty },
+                  }),
+                })
+                  .then(() => {
+                    setTimeout(() => get().fetchAccountInfo(), 1000);
+                  })
+                  .catch(() => {});
               }
+
+              currentPositions.splice(i, 1);
+              i--;
+              continue;
             }
           }
           set({ positions: currentPositions });
 
           // Step 3: Determine Coins to Scan
           // Priority: User's customWatchlist -> or dynamically selected Top Liquid / L2s
-          let scanQueue = state.customWatchlist.length > 0 ? state.customWatchlist : L2_MODULAR_SYMBOLS;
+          let scanQueue = state.customWatchlist.length > 0 ? [...state.customWatchlist] : [...L2_MODULAR_SYMBOLS];
+          // Ensure active chart pair is evaluated if selected
+          if (state.selectedSymbol && !scanQueue.includes(state.selectedSymbol)) {
+            scanQueue.unshift(state.selectedSymbol);
+          }
           // Limit to max 6 coins per scan tick to keep Termux lightning fast
           scanQueue = scanQueue.slice(0, 6);
 
@@ -530,10 +893,28 @@ export const useBinanceStore = create<BinanceStoreState>()(
 
           // Step 4: Scan and Evaluate Signals
           for (const sym of scanQueue) {
+            // Strictly abort if auto-trading is toggled off / inactive or panic closing
+            if (!get().isAutoTrading || get().isPanicClosing) break;
+
             // Skip if already in position
             if (currentPositions.some((p) => p.symbol === sym)) continue;
 
-            const klineRes = await fetch(`/api/binance?action=KLINES&symbol=${sym}&interval=5m&limit=60`);
+            // Dual-Room Freqtrade Protection Guard Check (Cooldown & Consecutive Loss Lock)
+            const protectionCheck = dualRoomProtections.checkSymbolProtection(sym, 'crypto');
+            if (!protectionCheck.allowed) {
+              state.addTelemetryLog(sym, 'GUARD', protectionCheck.reason!);
+              continue;
+            }
+
+            // Funding Settlement Spike Window Check (+/- 5m around 00:00, 08:00, 16:00 UTC)
+            const fundingCheck = dualRoomProtections.checkFundingWindowVolatility();
+            if (fundingCheck.inFundingWindow) {
+              state.addTelemetryLog(sym, 'GUARD', fundingCheck.message);
+            }
+
+            const ex = state.activeExchange || 'BINANCE';
+            const isTest = state.isTestnet;
+            const klineRes = await fetch(`/api/binance?action=KLINES&symbol=${sym}&interval=5m&limit=60&exchange=${ex}&isTestnet=${isTest}`);
             const klineJson = await klineRes.json();
             if (!klineJson.success || !Array.isArray(klineJson.klines)) continue;
 
@@ -555,11 +936,31 @@ export const useBinanceStore = create<BinanceStoreState>()(
               );
             }
 
-            if (verdict.approved && (verdict.score >= 80)) {
+            const cryptoDynamicThreshold = verdict.dynamicThreshold || getCryptoDynamicThreshold({
+              efficiencyRatio: verdict.indicators?.efficiencyRatio,
+              pocMagnetAligned: verdict.indicators?.pocMagnetAligned,
+            });
+
+            const effectiveScore = verdict.aiVerdict ? verdict.aiVerdict.confidence : verdict.score;
+            // Any verified signal scoring >= dynamic threshold (when Risk Guard is clear) MUST execute!
+            const isSignalQualified = (verdict.approved || verdict.score >= cryptoDynamicThreshold || effectiveScore >= cryptoDynamicThreshold) &&
+              effectiveScore >= cryptoDynamicThreshold &&
+              !verdict.btcGuardBlocked;
+
+            const erVal = verdict.indicators?.efficiencyRatio ?? 0.50;
+            const pocLabel = verdict.indicators?.pocMagnetAligned ? 'Kronos POC Aligned' : 'Normal POC';
+            const govDecision = isSignalQualified ? 'EXECUTE' : 'REJECT';
+            state.addTelemetryLog(
+              sym,
+              'AI',
+              `[AUTO-GOVERNANCE] AI Score: ${effectiveScore}% vs Dynamic Threshold: ${cryptoDynamicThreshold}% (Regime ER=${erVal.toFixed(2)}, ${pocLabel}) -> ${govDecision}`
+            );
+
+            if (isSignalQualified && get().isAutoTrading && !get().isPanicClosing) {
               state.addTelemetryLog(
                 sym,
                 'SIGNAL',
-                `🔥 5-INDICATOR CONFLUENCE [${verdict.score}/100]: ${verdict.side} qualified. SL: $${verdict.stopLossPrice} | TP1: $${verdict.takeProfit1Price}`
+                `🔥 CRYPTO ${verdict.setupName || 'CONFLUENCE'} [Score ${verdict.score}/100 | AI ${effectiveScore}% >= ${cryptoDynamicThreshold}%]: ${verdict.side} qualified. SL: $${verdict.stopLossPrice} | TP1: $${verdict.takeProfit1Price}`
               );
 
               // Calculate Notional & Coin Quantity using stepSize
@@ -592,6 +993,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
                 stopLossPrice: verdict.stopLossPrice,
                 highestPriceSinceEntry: verdict.entryPrice,
                 lowestPriceSinceEntry: verdict.entryPrice,
+                openTime: Date.now(),
               };
 
               // Add position
@@ -603,22 +1005,33 @@ export const useBinanceStore = create<BinanceStoreState>()(
                 `⚡ EXECUTED ${verdict.side} #${sym}: ${formattedQty} coins (Margin: $${margin.toFixed(2)} at ${lev}x ${state.marginMode})`
               );
 
-              // Send live order to Binance if vault configured
+              // Send live order to active crypto exchange if vault configured
               if (state.isVaultConfigured) {
                 fetch('/api/binance', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
-                    action: 'ORDER',
-                    credentials: { apiKey: state.apiKey, apiSecret: state.apiSecret, isTestnet: state.isTestnet },
+                    action: 'PLACE_ORDER',
+                    exchange: state.activeExchange,
+                    isTestnet: state.isTestnet,
+                    credentials: getActiveCredentialsPayload(state),
                     payload: {
                       symbol: sym,
                       side: verdict.side === 'LONG' ? 'BUY' : 'SELL',
                       type: 'MARKET',
                       quantity: formattedQty,
+                      price: verdict.entryPrice,
+                      margin,
+                      leverage: lev,
+                      marginMode: state.marginMode,
+                      stopPrice: verdict.stopLossPrice ? String(verdict.stopLossPrice) : undefined,
                     },
                   }),
-                }).catch(() => {});
+                })
+                  .then(() => {
+                    setTimeout(() => get().fetchAccountInfo(), 1000);
+                  })
+                  .catch(() => {});
               }
 
               // Check if concurrent limit reached
@@ -671,6 +1084,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
           stopLossPrice,
           highestPriceSinceEntry: price,
           lowestPriceSinceEntry: price,
+          openTime: Date.now(),
         };
 
         set((s) => ({ positions: [...s.positions, newPos] }));
@@ -687,15 +1101,26 @@ export const useBinanceStore = create<BinanceStoreState>()(
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               action: 'ORDER',
-              credentials: { apiKey: state.apiKey, apiSecret: state.apiSecret, isTestnet: state.isTestnet },
+              exchange: state.activeExchange,
+              isTestnet: state.isTestnet,
+              credentials: getActiveCredentialsPayload(state),
               payload: {
                 symbol,
                 side: isLong ? 'BUY' : 'SELL',
                 type: 'MARKET',
                 quantity: formattedQty,
+                price,
+                margin,
+                leverage: lev,
+                marginMode: state.marginMode,
+                stopPrice: stopLossPrice ? String(stopLossPrice) : undefined,
               },
             }),
-          }).catch(() => {});
+          })
+            .then(() => {
+              setTimeout(() => get().fetchAccountInfo(), 1000);
+            })
+            .catch(() => {});
         }
       },
 
@@ -739,28 +1164,69 @@ export const useBinanceStore = create<BinanceStoreState>()(
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               action: 'CLOSE_POSITION',
-              credentials: { apiKey: state.apiKey, apiSecret: state.apiSecret, isTestnet: state.isTestnet },
+              exchange: state.activeExchange,
+              isTestnet: state.isTestnet,
+              credentials: getActiveCredentialsPayload(state),
               payload: { symbol, positionAmt: pos.positionAmt, quantityToClose: qty },
             }),
-          }).catch(() => {});
+          })
+            .then(() => {
+              setTimeout(() => get().fetchAccountInfo(), 1000);
+            })
+            .catch(() => {});
         }
       },
 
       panicCloseAll: async () => {
         const state = get();
         const currentPositions = [...state.positions];
-        state.addTelemetryLog('PANIC', 'ORDER', `🚨 PANIC CLOSE ALL: Liquidating ${currentPositions.length} positions!`);
+        state.addTelemetryLog('PANIC', 'ORDER', `🚨 PANIC CLOSE ALL: Liquidating ${currentPositions.length} positions across ${state.activeExchange}! Execution lock active (5s).`);
+
+        // 1. Immediately set execution lock for 5s, turn off auto-trading & scanning, and clear positions array
+        set({
+          isPanicClosing: true,
+          isAutoTrading: false,
+          isScanning: false,
+          positions: [],
+        });
+
+        setTimeout(() => {
+          set({ isPanicClosing: false });
+        }, 5000);
+
+        // 2. Dispatch PANIC_CLOSE to backend to clear server exchange and simulated ledger
+        fetch('/api/binance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'PANIC_CLOSE',
+            exchange: state.activeExchange,
+            isTestnet: state.isTestnet,
+            credentials: getActiveCredentialsPayload(state),
+            payload: { positions: currentPositions },
+          }),
+        })
+          .then(() => {
+            setTimeout(() => {
+              if (!get().isPanicClosing) {
+                get().fetchAccountInfo();
+              }
+            }, 2500);
+          })
+          .catch(() => {});
 
         for (const pos of currentPositions) {
-          await state.closePosition(pos.symbol);
+          try {
+            await state.closePosition(pos.symbol);
+          } catch {}
         }
-        set({ positions: [], isAutoTrading: false });
       },
     }),
     {
       name: STORAGE_KEY,
       storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({
+        activeExchange: state.activeExchange,
         marginUsdt: state.marginUsdt,
         leverage: state.leverage,
         marginMode: state.marginMode,
@@ -772,7 +1238,16 @@ export const useBinanceStore = create<BinanceStoreState>()(
         isTestnet: state.isTestnet,
         dailyPnlHistory: state.dailyPnlHistory,
         walletBalance: state.walletBalance,
+        isAutoTrading: state.isAutoTrading,
+        positions: state.positions,
       }),
+      onRehydrateStorage: () => (rehydratedState) => {
+        if (rehydratedState) {
+          rehydratedState.isScanning = false;
+          rehydratedState.isPanicClosing = false;
+          rehydratedState.isAutoTrading = Boolean(rehydratedState.isAutoTrading);
+        }
+      },
     }
   )
 );

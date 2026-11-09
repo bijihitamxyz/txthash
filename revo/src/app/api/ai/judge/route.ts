@@ -8,7 +8,10 @@ import {
   writeCentralAiConfig,
   getActiveAiProviders,
   formatActiveAiSummaryLabel,
+  calculateDynamicThreshold,
+  formatAutoGovernanceTelemetry,
 } from '@/core/centralAiConfig';
+import { dualRoomProtections } from '@/core/riskGuard';
 import { DEFAULT_KRONOS_API_KEY } from '@/core/kronosService';
 
 export const dynamic = 'force-dynamic';
@@ -184,6 +187,10 @@ async function evaluateSetupWithCentralAi(payload: {
   emaTrend?: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
   divergence?: string;
   room?: 'EXNESS' | 'BINANCE';
+  marketType?: 'FOREX' | 'CRYPTO';
+  efficiencyRatio?: number;
+  pocMagnetAligned?: boolean;
+  btcGuardStatus?: string;
 }): Promise<AiJudgeVerdict> {
   const startTime = Date.now();
   const config = await readCentralAiConfig();
@@ -200,11 +207,51 @@ async function evaluateSetupWithCentralAi(payload: {
   }
 
   const activeProviders = getActiveAiProviders(config);
-  const threshold = Math.max(55, config.confidenceThreshold || 70);
+  const marketType: 'FOREX' | 'CRYPTO' =
+    payload.marketType || (payload.room === 'BINANCE' || payload.symbol.endsWith('USDT') ? 'CRYPTO' : 'FOREX');
+
+  // Pure Quantitative Autonomous Dynamic Confidence Threshold Engine (58% - 82%)
+  const recentSl = dualRoomProtections.hasRecentStopLoss(payload.symbol, marketType.toLowerCase() as any);
+  const dynamicResult = calculateDynamicThreshold({
+    efficiencyRatio: payload.efficiencyRatio,
+    pocMagnetAligned: payload.pocMagnetAligned,
+    kronosProbability: 60,
+    bbwExpandingRapidly: (payload.bbWickSweepPct || 0) > 0.15,
+    recentStopLoss: recentSl,
+    symbol: payload.symbol,
+    marketType,
+  });
+
+  const threshold = config.autoAdaptiveThreshold !== false
+    ? dynamicResult.threshold
+    : Math.max(55, config.confidenceThreshold || 65);
 
   const buildQuantFallback = (prefix: string): AiJudgeVerdict => {
     const latencyMs = Math.max(1, Date.now() - startTime);
-    const isApproved = payload.confluenceScore >= threshold;
+    let baseScore = payload.confluenceScore;
+
+    // Apply RD-Agent Kaufman ER factor
+    if (typeof payload.efficiencyRatio === 'number') {
+      if (payload.efficiencyRatio > 0.68 && payload.regime === 'COUNTER_TREND') {
+        baseScore -= 15;
+      } else if (payload.efficiencyRatio <= 0.50) {
+        baseScore += 6;
+      }
+    }
+
+    // Apply POC Magnet Alignment boost
+    if (payload.pocMagnetAligned) {
+      baseScore += 6;
+    }
+
+    // Apply BTC Guard penalty for Crypto
+    if (marketType === 'CRYPTO' && payload.btcGuardStatus) {
+      if (payload.btcGuardStatus.includes('VETO') || payload.btcGuardStatus.includes('DUMP')) {
+        baseScore -= 30;
+      }
+    }
+
+    const isApproved = baseScore >= threshold;
     return {
       decision: isApproved ? 'EXECUTE' : 'REJECT',
       confidence_score: isApproved
@@ -212,13 +259,13 @@ async function evaluateSetupWithCentralAi(payload: {
             96,
             Math.max(
               threshold,
-              Math.round(payload.confluenceScore * 0.95 + (payload.bbWickSweepPct || 0) * 0.1)
+              Math.round(baseScore * 0.95 + (payload.bbWickSweepPct || 0) * 0.1)
             )
           )
-        : Math.round(payload.confluenceScore * 0.7),
+        : Math.round(baseScore * 0.7),
       reasoning: isApproved
-        ? `${prefix} Confluence Score ${payload.confluenceScore}/100 meets ${threshold}% threshold.`
-        : `${prefix} Confluence Score ${payload.confluenceScore}/100 below ${threshold}% threshold.`,
+        ? `${prefix} Confluence Score ${baseScore}/100 meets ${threshold}% threshold (ER-10 ${payload.efficiencyRatio?.toFixed(2) ?? '-'}, POC Magnet ${payload.pocMagnetAligned ? 'Yes' : 'No'}).`
+        : `${prefix} Confluence Score ${baseScore}/100 below ${threshold}% threshold.`,
       source: 'HEURISTIC_QUANT_FALLBACK',
       modelUsed: 'Kronos-Quant-Governance',
       modelsUsed: ['Kronos-Quant-Governance'],
@@ -230,20 +277,32 @@ async function evaluateSetupWithCentralAi(payload: {
     return buildQuantFallback('[KRONOS QUANT GOVERNANCE]');
   }
 
-  const systemPrompt = `You are an elite Institutional Multi-AI Consensus / Risk Governance Judge verifying automated algorithmic setups for ${payload.room || 'INSTITUTIONAL_TERMINAL'}.
-Evaluate whether to EXECUTE or REJECT this signal alongside Kronos quantitative metrics (POC, VAH, VAL, RSI, Z-Score, Regime).
-Only return strict JSON in this exact structure:
+  const systemPrompt = `You are an elite Institutional Quantitative AI-Hedge-Fund Risk Officer and Confluence Judge for ${
+    marketType === 'CRYPTO' ? 'Binance Crypto Futures' : 'Exness Forex & Gold'
+  }.
+Evaluate the setup across our 3-Pillar Institutional Quantitative Framework:
+1. Pillar 1: Mean-Reversion Exhaustion (Bollinger Band penetration + RSI extreme/divergence + Wick Rejection conviction).
+2. Pillar 2: Volume Profile Gravity (Kronos POC alignment, VAH/VAL boundaries, pocMagnetAligned status).
+3. Pillar 3: Market Regime & Cross-Asset Safety (Kaufman Efficiency Ratio ER-10: ER > 0.68 denotes strong runaway cascade where counter-trend entries must be REJECTED; ER <= 0.50 denotes optimal mean-reversion. ${
+    marketType === 'CRYPTO'
+      ? 'BTC Guard: strictly VETO long setups if BTC is in high-efficiency dump.'
+      : 'Forex Safety: ensure outside Exness low-liquidity rollover window.'
+  })
+
+Respond with ONLY a strict JSON object:
 {
   "decision": "EXECUTE" or "REJECT",
   "confidence_score": 0 to 100,
-  "reasoning": "Concise 1-sentence analytical rationale highlighting key metrics"
+  "reasoning": "Concise 1-sentence analytical rationale addressing the 3 pillars"
 }`;
 
-  const userPrompt = `Asset: ${payload.symbol}
+  const userPrompt = `Asset: ${payload.symbol} (${marketType})
 Proposed Side: ${payload.side}
 Timeframe: ${payload.timeframe || 'M5'}
 Current Price: ${payload.price}
 Confluence Score: ${payload.confluenceScore}/100
+Kaufman Efficiency Ratio (ER-10): ${payload.efficiencyRatio?.toFixed(3) ?? 'N/A'}
+POC Magnet Aligned: ${payload.pocMagnetAligned !== undefined ? (payload.pocMagnetAligned ? 'YES (POC between price & Mid-BB)' : 'NO') : 'N/A'}
 Volume Profile POC: ${payload.pocPrice ?? payload.price} | VAH: ${payload.vahPrice ?? 'N/A'} | VAL: ${payload.valPrice ?? 'N/A'}
 RSI(14): ${payload.rsi ? payload.rsi.toFixed(1) : 'N/A'} | Z-Score: ${payload.zScore ?? 'N/A'} | Regime: ${payload.regime || payload.emaTrend || 'NEUTRAL'}
 Bollinger Wick Sweep: ${payload.bbWickSweepPct ? (payload.bbWickSweepPct * 100).toFixed(1) + '%' : 'N/A'}
@@ -251,7 +310,8 @@ Volume vs SMA20: ${payload.volumeRatio ? payload.volumeRatio.toFixed(2) + 'x' : 
 Divergence: ${payload.divergence || 'NONE'}
 VWAP Fair Value Distance: ${payload.vwapDistancePct ? (payload.vwapDistancePct * 100).toFixed(2) + '%' : 'N/A'}
 Funding Rate: ${payload.fundingRate !== undefined ? (payload.fundingRate * 100).toFixed(4) + '%' : 'N/A'}
-Trend: ${payload.emaTrend || 'NEUTRAL'}`;
+Trend: ${payload.emaTrend || 'NEUTRAL'}
+${marketType === 'CRYPTO' ? `BTC Guard Status: ${payload.btcGuardStatus || 'NORMAL'}` : ''}`;
 
   const settled = await Promise.allSettled(
     activeProviders.map((slot) => querySingleSetupProvider(slot, systemPrompt, userPrompt))
@@ -283,24 +343,32 @@ Trend: ${payload.emaTrend || 'NEUTRAL'}`;
 
   let rawDecision: 'EXECUTE' | 'REJECT';
   if (executeVotes > rejectVotes) rawDecision = 'EXECUTE';
-  else if (rejectVotes > executeVotes) rawDecision = 'REJECT';
-  else rawDecision = payload.confluenceScore >= threshold ? 'EXECUTE' : 'REJECT';
+  else if (rejectVotes > executeVotes) {
+    // For Crypto setups where qwen2.5:3b outputs 56-62%, allow execution if score meets dynamic threshold (>= 56)
+    rawDecision = marketType === 'CRYPTO' && avgScore >= threshold ? 'EXECUTE' : 'REJECT';
+  } else rawDecision = payload.confluenceScore >= threshold ? 'EXECUTE' : 'REJECT';
 
   const finalDecision: 'EXECUTE' | 'REJECT' =
-    rawDecision === 'EXECUTE' && avgScore >= threshold ? 'EXECUTE' : 'REJECT';
+    (rawDecision === 'EXECUTE' && avgScore >= threshold) ||
+    (marketType === 'CRYPTO' && avgScore >= threshold && payload.confluenceScore >= threshold)
+      ? 'EXECUTE'
+      : 'REJECT';
   const modelsUsed = succeeded.map((s) => s.label);
   const modelUsedLabel =
     succeeded.length === 1
       ? succeeded[0].label
       : `Multi-AI Consensus (${succeeded.length} Active)`;
 
+  const autoGovLog = formatAutoGovernanceTelemetry(avgScore, dynamicResult, finalDecision);
+  const baseReasoning =
+    succeeded.length === 1
+      ? `[${succeeded[0].label}] ${succeeded[0].reasoning}`
+      : `[Multi-AI Consensus ${executeVotes}/${succeeded.length} (${modelsUsed.join(', ')})] ${succeeded[0].reasoning}`;
+
   return {
     decision: finalDecision,
     confidence_score: avgScore,
-    reasoning:
-      succeeded.length === 1
-        ? `[${succeeded[0].label}] ${succeeded[0].reasoning}`
-        : `[Multi-AI Consensus ${executeVotes}/${succeeded.length} (${modelsUsed.join(', ')})] ${succeeded[0].reasoning}`,
+    reasoning: `${baseReasoning} | ${autoGovLog}`,
     source: 'LLM',
     modelUsed: modelUsedLabel,
     modelsUsed,
@@ -328,6 +396,7 @@ export async function GET(req: NextRequest) {
           activeProviderCount: activeProviders.length,
           activeModels: activeProviders.map((p) => `${p.name.split(' ')[0]}:${p.model}`),
           confidenceThreshold: config.confidenceThreshold,
+          autoAdaptiveThreshold: config.autoAdaptiveThreshold !== false,
           kronosVpsUrl: config.kronosVpsUrl,
           kronosApiKey: config.kronosApiKey,
           engineSwitches: config.engineSwitches,
@@ -345,6 +414,7 @@ export async function GET(req: NextRequest) {
         activeProviderCount: activeProviders.length,
         activeModels: activeProviders.map((p) => `${p.name.split(' ')[0]}:${p.model}`),
         confidenceThreshold: config.confidenceThreshold,
+        autoAdaptiveThreshold: config.autoAdaptiveThreshold !== false,
         engineSwitches: config.engineSwitches,
         isConfigured,
         updatedAt: config.updatedAt,
@@ -395,6 +465,7 @@ export async function POST(req: NextRequest) {
         apiKey,
         providers,
         confidenceThreshold,
+        autoAdaptiveThreshold,
         kronosVpsUrl,
         kronosApiKey,
         engineSwitches,
@@ -406,6 +477,8 @@ export async function POST(req: NextRequest) {
         providers: Array.isArray(providers) ? providers : undefined,
         confidenceThreshold:
           typeof confidenceThreshold === 'number' ? confidenceThreshold : undefined,
+        autoAdaptiveThreshold:
+          typeof autoAdaptiveThreshold === 'boolean' ? autoAdaptiveThreshold : undefined,
         kronosVpsUrl: kronosVpsUrl !== undefined ? kronosVpsUrl : undefined,
         kronosApiKey: kronosApiKey !== undefined ? kronosApiKey : undefined,
         engineSwitches: engineSwitches !== undefined ? engineSwitches : undefined,
@@ -425,6 +498,7 @@ export async function POST(req: NextRequest) {
           activeProviderCount: activeProviders.length,
           activeModels: activeProviders.map((p) => `${p.name.split(' ')[0]}:${p.model}`),
           confidenceThreshold: updated.confidenceThreshold,
+          autoAdaptiveThreshold: updated.autoAdaptiveThreshold !== false,
           kronosVpsUrl: updated.kronosVpsUrl,
           kronosApiKey: updated.kronosApiKey,
           engineSwitches: updated.engineSwitches,
@@ -603,6 +677,10 @@ export async function POST(req: NextRequest) {
       emaTrend: body.emaTrend,
       divergence: body.divergence,
       room: body.room,
+      marketType: body.marketType,
+      efficiencyRatio: body.efficiencyRatio,
+      pocMagnetAligned: body.pocMagnetAligned,
+      btcGuardStatus: body.btcGuardStatus,
     });
 
     return NextResponse.json({

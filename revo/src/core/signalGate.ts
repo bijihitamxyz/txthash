@@ -16,7 +16,7 @@
  * e.g., `[XAUUSDm] SCAN: Price 4134.91 | Regime: BEARISH (<EMA200) | RSI: 49.8 | BB Pos: 42% | Confluence Score: 58/65 (Waiting for ...)`
  */
 
-import { Candle, IndicatorSnapshot, computeIndicatorSnapshot, DivergenceResult } from './indicatorEngine';
+import { Candle, IndicatorSnapshot, computeIndicatorSnapshot, DivergenceResult, calculateKaufmanEfficiencyRatio } from './indicatorEngine';
 import { PairProfile, StrategyPreset, priceDiffToPips, formatPrice } from './pairConfig';
 
 export type HybridSignalType = 'WITH_TREND_BUY' | 'WITH_TREND_SELL' | 'COUNTER_TREND_BUY' | 'COUNTER_TREND_SELL' | 'NONE';
@@ -87,6 +87,11 @@ export interface TechnicalSnapshotPayload {
   proposedSlPips: number;
   proposedTpPips: number;
   riskRewardRatio: number;
+  marketType?: 'FOREX' | 'CRYPTO';
+  efficiencyRatio?: number;
+  pocMagnetAligned?: boolean;
+  zScore?: number;
+  btcGuardStatus?: string;
 }
 
 export interface SignalGateResult {
@@ -340,161 +345,141 @@ function evaluateSetupB(indicators: IndicatorSnapshot, pairProfile: PairProfile)
   const { c0, c1, c2, divergence } = indicators;
   const digits = pairProfile.digits;
 
-  // --- BUY EVALUATION ---
+  // --- BUY EVALUATION (Mean Reversion Snap-Back) ---
   let buyScore = 0;
   const buyReasons: string[] = [];
-  let buyWaiting = 'Waiting for Lower BB touch/pierce';
+  let buyWaiting = 'Waiting for Confirmation Hook at Lower BB';
 
-  // 1. Lower BB breach or touch in last 3 candles
-  const c0TouchedLower = c0.candle.low <= c0.lowerBB * 1.0003;
-  const c1TouchedLower = c1.candle.low <= c1.lowerBB * 1.0003;
-  const c2TouchedLower = c2.candle.low <= c2.lowerBB * 1.0003;
-  const touchedLowerBB = c0TouchedLower || c1TouchedLower || c2TouchedLower;
+  // 1. Mandatory Momentum Expansion Veto:
+  // Do NOT trigger a counter-trend BUY while a strong momentum candle is expanding outside the Bollinger Band.
+  const isC0ExpandingDown = c0.candle.close <= c0.lowerBB && c0.candle.close < c0.candle.open && c0.lowerWickRatio < 0.35;
 
-  if (touchedLowerBB) {
-    buyScore += 35;
-    const minLow = Math.min(c0.candle.low, c1.candle.low, c2.candle.low);
-    buyReasons.push(`Lower BB Touch: Low (${formatPrice(minLow, digits)}) touched/pierced Lower BB (${formatPrice(c0.lowerBB, digits)}) (+35pts)`);
-  } else if (c0.candle.low <= c0.lowerBB * 1.0015 || c1.candle.low <= c1.lowerBB * 1.0015) {
-    buyScore += 18;
-    buyReasons.push(`Lower BB Proximity: Within 0.15% of Lower BB (+18pts)`);
-  }
+  // 2. Prior candle pierced / touched outside Lower BB OR |zScore| >= 1.85
+  const c1PiercedLower = c1.candle.low <= c1.lowerBB * 1.0003 || c1.candle.close <= c1.lowerBB || (c1.zScore !== undefined && c1.zScore <= -1.85);
+  const c2PiercedLower = c2.candle.low <= c2.lowerBB * 1.0003 || c2.candle.close <= c2.lowerBB || (c2.zScore !== undefined && c2.zScore <= -1.85);
+  const prevPiercedLower = c1PiercedLower || c2PiercedLower;
 
-  // 2. Condition: RSI <= 45 OR Bullish Divergence OR Lower Wick >= 25%
-  const isRsiLow = c0.rsi <= 45;
-  const hasBullishDiv = divergence.detected && divergence.bullishDivergence;
-  const hasLowerWick = c0.lowerWickRatio >= 0.25 || c1.lowerWickRatio >= 0.25;
+  // 3. Current candle shows rejection:
+  // Lower wick >= 35% of range OR closes back inside lower BB with RSI hooking back toward 50 (curling up).
+  const c0LowerWickRejection = c0.lowerWickRatio >= 0.35;
+  const c0ClosedInsideWithRsiHook = c0.candle.close > c0.lowerBB && c0.rsi > c1.rsi && c0.rsi <= 52;
+  const c0ShowsRejection = c0LowerWickRejection || c0ClosedInsideWithRsiHook;
 
-  let conditionPts = 0;
-  if (c0.rsi <= 35) {
-    conditionPts += 25;
-    buyReasons.push(`Oversold RSI: RSI ${c0.rsi.toFixed(1)} <= 35 (+25pts)`);
-  } else if (isRsiLow) {
-    conditionPts += 18;
-    buyReasons.push(`Relaxed RSI: RSI ${c0.rsi.toFixed(1)} <= 45 (+18pts)`);
-  }
+  const buyConfirmationHookPassed = prevPiercedLower && c0ShowsRejection && !isC0ExpandingDown;
 
-  if (hasBullishDiv) {
-    conditionPts += 18;
-    buyReasons.push(`Divergence: Bullish divergence active (+18pts)`);
-  }
+  if (isC0ExpandingDown) {
+    buyWaiting = 'Counter-trend BUY blocked: Strong momentum candle expanding outside Lower BB (Falling Knife)';
+  } else if (!prevPiercedLower) {
+    buyWaiting = 'Waiting for previous candle to pierce outside Lower BB or |zScore| >= 1.85';
+  } else if (!c0ShowsRejection) {
+    buyWaiting = 'Waiting for rejection confirmation (Lower wick >= 35% or close back inside BB with RSI hook toward 50)';
+  } else {
+    // Confirmation Hook Passed (+40 pts)
+    buyScore += 40;
+    buyReasons.push(`Confirmation Hook: Previous candle pierced Lower BB/|zScore| >= 1.85 & C0 rejected (${c0LowerWickRejection ? `lower wick ${(c0.lowerWickRatio * 100).toFixed(0)}% >= 35%` : 'closed back inside BB with RSI hook toward 50'}) (+40pts)`);
 
-  if (c0.lowerWickRatio >= 0.35) {
-    conditionPts += 16;
-    buyReasons.push(`Absorption Wick: Lower wick ${c0.lowerWickRatio.toFixed(2)} >= 0.35 (+16pts)`);
-  } else if (hasLowerWick) {
-    conditionPts += 10;
-    buyReasons.push(`Absorption Wick: Lower wick >= 0.25 (+10pts)`);
-  }
+    // Additional confluence points
+    if (c0.lowerWickRatio >= 0.35) {
+      buyScore += 20;
+      buyReasons.push(`Rejection Wick: Strong lower absorption wick ${c0.lowerWickRatio.toFixed(2)} (+20pts)`);
+    } else if (c0.lowerWickRatio >= 0.25) {
+      buyScore += 10;
+      buyReasons.push(`Absorption Wick: Lower wick >= 0.25 (+10pts)`);
+    }
 
-  buyScore += Math.min(35, conditionPts);
+    if (c0ClosedInsideWithRsiHook) {
+      buyScore += 15;
+      buyReasons.push(`RSI Hook Toward 50: Closed inside BB and RSI curled (${c1.rsi.toFixed(1)} -> ${c0.rsi.toFixed(1)}) (+15pts)`);
+    }
 
-  // 3. Bounce confirmation: C0.close > C0.open OR C0.close > C1.low
-  const isC0Bullish = c0.candle.close > c0.candle.open;
-  const isAboveC1Low = c0.candle.close > c1.candle.low;
-  const isBouncing = isC0Bullish || isAboveC1Low;
+    if (c0.rsi <= 35) {
+      buyScore += 15;
+      buyReasons.push(`Oversold RSI: RSI ${c0.rsi.toFixed(1)} <= 35 (+15pts)`);
+    } else if (c0.rsi <= 45) {
+      buyScore += 10;
+      buyReasons.push(`Relaxed Oversold RSI: RSI ${c0.rsi.toFixed(1)} <= 45 (+10pts)`);
+    }
 
-  if (isC0Bullish && c0.candle.close > c1.candle.close) {
-    buyScore += 22;
-    buyReasons.push(`Bounce Confirmation: Strong bullish engulfing close (+22pts)`);
-  } else if (isBouncing) {
-    buyScore += 18;
-    buyReasons.push(`Bounce Confirmation: C0 bouncing (${isC0Bullish ? 'close > open' : 'close > C1 low'}) (+18pts)`);
-  }
+    if (divergence.detected && divergence.bullishDivergence) {
+      buyScore += 15;
+      buyReasons.push(`Bullish Divergence: Confirmed divergence active (+15pts)`);
+    }
 
-  // RSI Momentum curl bonus
-  if (c0.rsi > c1.rsi) {
-    buyScore += 10;
-    buyReasons.push(`Momentum Reversal: RSI curling up (+${(c0.rsi - c1.rsi).toFixed(1)}) (+10pts)`);
-  }
-
-  // Waiting condition diagnosis for BUY
-  if (!touchedLowerBB) {
-    buyWaiting = 'Waiting for Lower BB touch/pierce';
-  } else if (!isRsiLow && !hasBullishDiv && !hasLowerWick) {
-    buyWaiting = 'Waiting for RSI <= 45, lower wick >= 25%, or bullish divergence';
-  } else if (!isBouncing) {
-    buyWaiting = 'Waiting for bounce candle (C0.close > C0.open or C0.close > C1.low)';
+    const isC0Bullish = c0.candle.close > c0.candle.open;
+    if (isC0Bullish && c0.candle.close > c1.candle.close) {
+      buyScore += 10;
+      buyReasons.push(`Bullish Engulfing: Close > C1 close (+10pts)`);
+    }
   }
 
   const buyRegime = c0.candle.close >= c0.ema200 ? 'WITH_TREND' : 'COUNTER_TREND';
   const buySignalType = buyRegime === 'WITH_TREND' ? 'WITH_TREND_BUY' : 'COUNTER_TREND_BUY';
 
-  // --- SELL EVALUATION ---
+  // --- SELL EVALUATION (Mean Reversion Snap-Back) ---
   let sellScore = 0;
   const sellReasons: string[] = [];
-  let sellWaiting = 'Waiting for Upper BB touch/pierce';
+  let sellWaiting = 'Waiting for Confirmation Hook at Upper BB';
 
-  // 1. Upper BB breach or touch in last 3 candles
-  const c0TouchedUpper = c0.candle.high >= c0.upperBB * 0.9997;
-  const c1TouchedUpper = c1.candle.high >= c1.upperBB * 0.9997;
-  const c2TouchedUpper = c2.candle.high >= c2.upperBB * 0.9997;
-  const touchedUpperBB = c0TouchedUpper || c1TouchedUpper || c2TouchedUpper;
+  // 1. Mandatory Momentum Expansion Veto:
+  // Do NOT trigger a counter-trend SELL while a strong momentum candle is expanding outside the Bollinger Band.
+  const isC0ExpandingUp = c0.candle.close >= c0.upperBB && c0.candle.close > c0.candle.open && c0.upperWickRatio < 0.35;
 
-  if (touchedUpperBB) {
-    sellScore += 35;
-    const maxHigh = Math.max(c0.candle.high, c1.candle.high, c2.candle.high);
-    sellReasons.push(`Upper BB Touch: High (${formatPrice(maxHigh, digits)}) touched/pierced Upper BB (${formatPrice(c0.upperBB, digits)}) (+35pts)`);
-  } else if (c0.candle.high >= c0.upperBB * 0.9985 || c1.candle.high >= c1.upperBB * 0.9985) {
-    sellScore += 18;
-    sellReasons.push(`Upper BB Proximity: Within 0.15% of Upper BB (+18pts)`);
-  }
+  // 2. Prior candle pierced / touched outside Upper BB OR |zScore| >= 1.85
+  const c1PiercedUpper = c1.candle.high >= c1.upperBB * 0.9997 || c1.candle.close >= c1.upperBB || (c1.zScore !== undefined && c1.zScore >= 1.85);
+  const c2PiercedUpper = c2.candle.high >= c2.upperBB * 0.9997 || c2.candle.close >= c2.upperBB || (c2.zScore !== undefined && c2.zScore >= 1.85);
+  const prevPiercedUpper = c1PiercedUpper || c2PiercedUpper;
 
-  // 2. Condition: RSI >= 55 OR Bearish Divergence OR Upper Wick >= 25%
-  const isRsiHigh = c0.rsi >= 55;
-  const hasBearishDiv = divergence.detected && divergence.bearishDivergence;
-  const hasUpperWick = c0.upperWickRatio >= 0.25 || c1.upperWickRatio >= 0.25;
+  // 3. Current candle shows rejection:
+  // Upper wick >= 35% of range OR closes back inside upper BB with RSI hooking back toward 50 (curling down).
+  const c0UpperWickRejection = c0.upperWickRatio >= 0.35;
+  const c0ClosedInsideWithRsiHookSell = c0.candle.close < c0.upperBB && c0.rsi < c1.rsi && c0.rsi >= 48;
+  const c0ShowsRejectionSell = c0UpperWickRejection || c0ClosedInsideWithRsiHookSell;
 
-  let sellConditionPts = 0;
-  if (c0.rsi >= 65) {
-    sellConditionPts += 25;
-    sellReasons.push(`Overbought RSI: RSI ${c0.rsi.toFixed(1)} >= 65 (+25pts)`);
-  } else if (isRsiHigh) {
-    sellConditionPts += 18;
-    sellReasons.push(`Relaxed RSI: RSI ${c0.rsi.toFixed(1)} >= 55 (+18pts)`);
-  }
+  const sellConfirmationHookPassed = prevPiercedUpper && c0ShowsRejectionSell && !isC0ExpandingUp;
 
-  if (hasBearishDiv) {
-    sellConditionPts += 18;
-    sellReasons.push(`Divergence: Bearish divergence active (+18pts)`);
-  }
+  if (isC0ExpandingUp) {
+    sellWaiting = 'Counter-trend SELL blocked: Strong momentum candle expanding outside Upper BB (Rocketing Outlier)';
+  } else if (!prevPiercedUpper) {
+    sellWaiting = 'Waiting for previous candle to pierce outside Upper BB or |zScore| >= 1.85';
+  } else if (!c0ShowsRejectionSell) {
+    sellWaiting = 'Waiting for rejection confirmation (Upper wick >= 35% or close back inside BB with RSI hook toward 50)';
+  } else {
+    // Confirmation Hook Passed (+40 pts)
+    sellScore += 40;
+    sellReasons.push(`Confirmation Hook: Previous candle pierced Upper BB/|zScore| >= 1.85 & C0 rejected (${c0UpperWickRejection ? `upper wick ${(c0.upperWickRatio * 100).toFixed(0)}% >= 35%` : 'closed back inside BB with RSI hook toward 50'}) (+40pts)`);
 
-  if (c0.upperWickRatio >= 0.35) {
-    sellConditionPts += 16;
-    sellReasons.push(`Rejection Wick: Upper wick ${c0.upperWickRatio.toFixed(2)} >= 0.35 (+16pts)`);
-  } else if (hasUpperWick) {
-    sellConditionPts += 10;
-    sellReasons.push(`Rejection Wick: Upper wick >= 0.25 (+10pts)`);
-  }
+    // Additional confluence points
+    if (c0.upperWickRatio >= 0.35) {
+      sellScore += 20;
+      sellReasons.push(`Rejection Wick: Strong upper rejection wick ${c0.upperWickRatio.toFixed(2)} (+20pts)`);
+    } else if (c0.upperWickRatio >= 0.25) {
+      sellScore += 10;
+      sellReasons.push(`Rejection Wick: Upper wick >= 0.25 (+10pts)`);
+    }
 
-  sellScore += Math.min(35, sellConditionPts);
+    if (c0ClosedInsideWithRsiHookSell) {
+      sellScore += 15;
+      sellReasons.push(`RSI Hook Toward 50: Closed inside BB and RSI curled (${c1.rsi.toFixed(1)} -> ${c0.rsi.toFixed(1)}) (+15pts)`);
+    }
 
-  // 3. Rejection confirmation: C0.close < C0.open OR C0.close < C1.high
-  const isC0Bearish = c0.candle.close < c0.candle.open;
-  const isBelowC1High = c0.candle.close < c1.candle.high;
-  const isRejecting = isC0Bearish || isBelowC1High;
+    if (c0.rsi >= 65) {
+      sellScore += 15;
+      sellReasons.push(`Overbought RSI: RSI ${c0.rsi.toFixed(1)} >= 65 (+15pts)`);
+    } else if (c0.rsi >= 55) {
+      sellScore += 10;
+      sellReasons.push(`Relaxed Overbought RSI: RSI ${c0.rsi.toFixed(1)} >= 55 (+10pts)`);
+    }
 
-  if (isC0Bearish && c0.candle.close < c1.candle.close) {
-    sellScore += 22;
-    sellReasons.push(`Rejection Confirmation: Strong bearish engulfing close (+22pts)`);
-  } else if (isRejecting) {
-    sellScore += 18;
-    sellReasons.push(`Rejection Confirmation: C0 rejecting (${isC0Bearish ? 'close < open' : 'close < C1 high'}) (+18pts)`);
-  }
+    if (divergence.detected && divergence.bearishDivergence) {
+      sellScore += 15;
+      sellReasons.push(`Bearish Divergence: Confirmed divergence active (+15pts)`);
+    }
 
-  // RSI Momentum curl bonus
-  if (c0.rsi < c1.rsi) {
-    sellScore += 10;
-    sellReasons.push(`Momentum Reversal: RSI curling down (-${(c1.rsi - c0.rsi).toFixed(1)}) (+10pts)`);
-  }
-
-  // Waiting condition diagnosis for SELL
-  if (!touchedUpperBB) {
-    sellWaiting = 'Waiting for Upper BB touch/pierce';
-  } else if (!isRsiHigh && !hasBearishDiv && !hasUpperWick) {
-    sellWaiting = 'Waiting for RSI >= 55, upper wick >= 25%, or bearish divergence';
-  } else if (!isRejecting) {
-    sellWaiting = 'Waiting for rejection candle (C0.close < C0.open or C0.close < C1.high)';
+    const isC0Bearish = c0.candle.close < c0.candle.open;
+    if (isC0Bearish && c0.candle.close < c1.candle.close) {
+      sellScore += 10;
+      sellReasons.push(`Bearish Engulfing: Close < C1 close (+10pts)`);
+    }
   }
 
   const sellRegime = c0.candle.close <= c0.ema200 ? 'WITH_TREND' : 'COUNTER_TREND';
@@ -718,6 +703,8 @@ export function evaluateSignalGates(
   const setupB = evaluateSetupB(indicators, pairProfile);
   const setupC = evaluateSetupC(indicators, pairProfile);
 
+  const er10 = indicators.efficiencyRatio ?? calculateKaufmanEfficiencyRatio(candles.map((c) => c.close), 10);
+
   const allCandidates: EvaluatedSetup[] = [
     setupA.buy,
     setupA.sell,
@@ -726,6 +713,46 @@ export function evaluateSignalGates(
     setupC.buy,
     setupC.sell,
   ];
+
+  // Strict Trend Veto on Forex/Gold (XAUUSDm Protection) & Kaufman ER Calibration:
+  const ema50Val = indicators.c0.ema50 || (indicators.ema50 ? indicators.ema50[indicators.ema50.length - 1] : indicators.c0.middleBB);
+  const ema50Prev = indicators.c1.ema50 || (indicators.ema50 ? indicators.ema50[indicators.ema50.length - 2] : ema50Val);
+  const ema50Slope = ema50Val - ema50Prev;
+  const isBbwExpanding = indicators.bbwExpansionPct > 0;
+
+  for (const cand of allCandidates) {
+    if (cand.regime === 'COUNTER_TREND') {
+      // 1. Kaufman ER Veto: ER > 0.52 denotes non-ranging / institutional trending flow
+      if (er10 > 0.52) {
+        cand.score = 0;
+        cand.reasons.push(`[STRICT TREND VETO] Kaufman ER ${er10.toFixed(2)} > 0.52 denotes trending regime. Counter-trend entry strictly blocked.`);
+        cand.waiting = `Counter-trend blocked by Strict Trend Veto (Kaufman ER ${er10.toFixed(2)} > 0.52)`;
+        continue;
+      }
+
+      // 2. Strong trend away from EMA50 with expanding BBW
+      const isTrendingAway = cand.side === 'BUY'
+        ? (triggerPrice < ema50Val && ema50Slope < 0 && isBbwExpanding)
+        : (triggerPrice > ema50Val && ema50Slope > 0 && isBbwExpanding);
+
+      if (isTrendingAway) {
+        cand.score = 0;
+        cand.reasons.push(`[STRICT TREND VETO] Price strongly trending away from EMA50 with expanding BBW (+${indicators.bbwExpansionPct.toFixed(1)}%). Counter-trend entry strictly blocked.`);
+        cand.waiting = `Counter-trend blocked: Trending away from EMA50 with expanding BBW`;
+        continue;
+      }
+
+      // 3. True ranging regime (ER <= 0.52): Optimal mean-reverting regime boost
+      cand.score = Math.min(100, cand.score + 8);
+      cand.reasons.push(`[ER-10 REGIME BOOST] Kaufman ER ${er10.toFixed(2)} <= 0.52 confirms true ranging regime (+8pts).`);
+    } else {
+      // With-trend entries: boost if aligned with strong momentum
+      if (er10 > 0.52) {
+        cand.score = Math.min(100, cand.score + 6);
+        cand.reasons.push(`[TREND CONFLUENCE] Aligned with strong institutional trend (ER ${er10.toFixed(2)} > 0.52, +6pts).`);
+      }
+    }
+  }
 
   // Pick highest scoring setup
   allCandidates.sort((a, b) => b.score - a.score);
@@ -772,62 +799,49 @@ export function evaluateSignalGates(
   const qualifiedRegime = bestSetup.regime;
   const activeWickRatio = qualifiedSide === 'BUY' ? c0.lowerWickRatio : c0.upperWickRatio;
 
-  // Calculate Context-Aware Initial SL and Dynamic TP with Strict $1.00 Risk Cap (10 Pips)
+  // Calculate Context-Aware Initial SL and Dynamic TP:
+  // Wider Breathing Room SL: max(2.2 * ATR, swingHighLowBuffer + spread * 2)
+  // Enforce a minimum Reward-to-Risk ratio of 1.4R (TP distance >= 1.4 * SL distance)
   let proposedSlPrice = 0;
   let proposedTpPrice = 0;
 
-  // Strict Initial SL Risk Cap per instrument (Max $1.00 Risk on 0.01 lot = 10 Pips):
-  // - Gold (XAUUSDm): max 1.00 price unit (10 pips, e.g. Entry 4134.50 -> BUY SL 4133.50 / SELL SL 4135.50)
-  // - EURUSDm / GBPUSDm: max 0.0010 price unit (10 pips)
-  // - USDJPYm: max 0.100 price unit (10 pips)
-  let maxSlDistance = 1.00;
-  if (pairProfile.symbol === 'XAUUSDm') {
-    maxSlDistance = 1.00;
-  } else if (pairProfile.symbol === 'EURUSDm' || pairProfile.symbol === 'GBPUSDm') {
-    maxSlDistance = 0.0010;
-  } else if (pairProfile.symbol === 'USDJPYm') {
-    maxSlDistance = 0.100;
-  } else {
-    maxSlDistance = 10 * pairProfile.pipValue;
-  }
+  const spreadDistance = (config.maxSpreadPips || 3.0) * pairProfile.pipValue;
 
   if (qualifiedSide === 'BUY') {
     const swingLow = Math.min(c0.candle.low, c1.candle.low, c2.candle.low);
-    const rawSlDist = triggerPrice - (swingLow - (config.atrSlMultiplier * currentAtr));
-    // Lock initial Stop Loss distance to a maximum of 1.00 price unit on Gold (10 pips)
-    const slDist = Math.min(maxSlDistance, Math.max(0.35 * maxSlDistance, rawSlDist > 0 ? rawSlDist : maxSlDistance));
+    const swingLowBuffer = Math.max(0, triggerPrice - swingLow);
+    const slDist = Math.max(2.2 * currentAtr, swingLowBuffer + spreadDistance * 2);
     proposedSlPrice = triggerPrice - slDist;
 
-    // Initial Take Profit: 2.5x to 3.0x the SL distance (+$2.50 to +$3.00 profit target per 0.01 lot)
-    let candidateTpDist = slDist * 2.8;
+    // Minimum Reward-to-Risk ratio of 1.4R (TP distance >= 1.4 * SL distance)
+    let candidateTpDist = slDist * 2.0;
     if (bestSetup.name === 'SETUP_C_MOMENTUM_BREAKOUT') {
-      candidateTpDist = Math.max(slDist * 2.5, Math.min(slDist * 3.0, 2.0 * currentAtr));
+      candidateTpDist = Math.max(slDist * 1.4, Math.max(slDist * 2.2, 2.5 * currentAtr));
     } else {
       const bbDist = c0.upperBB - triggerPrice;
       if (bbDist > 0) {
-        candidateTpDist = Math.min(slDist * 3.0, Math.max(slDist * 2.5, bbDist));
+        candidateTpDist = Math.max(slDist * 1.4, Math.min(slDist * 2.8, bbDist));
       }
     }
-    candidateTpDist = Math.min(slDist * 3.0, Math.max(slDist * 2.5, candidateTpDist));
+    candidateTpDist = Math.max(slDist * 1.4, candidateTpDist);
     proposedTpPrice = triggerPrice + candidateTpDist;
   } else {
     const swingHigh = Math.max(c0.candle.high, c1.candle.high, c2.candle.high);
-    const rawSlDist = (swingHigh + (config.atrSlMultiplier * currentAtr)) - triggerPrice;
-    // Lock initial Stop Loss distance to a maximum of 1.00 price unit on Gold (10 pips)
-    const slDist = Math.min(maxSlDistance, Math.max(0.35 * maxSlDistance, rawSlDist > 0 ? rawSlDist : maxSlDistance));
+    const swingHighBuffer = Math.max(0, swingHigh - triggerPrice);
+    const slDist = Math.max(2.2 * currentAtr, swingHighBuffer + spreadDistance * 2);
     proposedSlPrice = triggerPrice + slDist;
 
-    // Initial Take Profit: 2.5x to 3.0x the SL distance (+$2.50 to +$3.00 profit target per 0.01 lot)
-    let candidateTpDist = slDist * 2.8;
+    // Minimum Reward-to-Risk ratio of 1.4R (TP distance >= 1.4 * SL distance)
+    let candidateTpDist = slDist * 2.0;
     if (bestSetup.name === 'SETUP_C_MOMENTUM_BREAKOUT') {
-      candidateTpDist = Math.max(slDist * 2.5, Math.min(slDist * 3.0, 2.0 * currentAtr));
+      candidateTpDist = Math.max(slDist * 1.4, Math.max(slDist * 2.2, 2.5 * currentAtr));
     } else {
       const bbDist = triggerPrice - c0.lowerBB;
       if (bbDist > 0) {
-        candidateTpDist = Math.min(slDist * 3.0, Math.max(slDist * 2.5, bbDist));
+        candidateTpDist = Math.max(slDist * 1.4, Math.min(slDist * 2.8, bbDist));
       }
     }
-    candidateTpDist = Math.min(slDist * 3.0, Math.max(slDist * 2.5, candidateTpDist));
+    candidateTpDist = Math.max(slDist * 1.4, candidateTpDist);
     proposedTpPrice = triggerPrice - candidateTpDist;
   }
 
@@ -912,6 +926,9 @@ export function evaluateSignalGates(
     proposedSlPips: slPips,
     proposedTpPips: tpPips,
     riskRewardRatio,
+    marketType: 'FOREX',
+    efficiencyRatio: Number(er10.toFixed(4)),
+    pocMagnetAligned: false,
   };
 
   return {

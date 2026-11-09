@@ -18,7 +18,7 @@
 
 import { PairProfile, roundLotVolume, priceDiffToPips, formatPrice, calculatePnL, getPairProfile } from './pairConfig';
 
-export type PositionTrailingStatus = 'INITIAL' | 'PARTIAL_CLOSED_BE' | 'BREAKEVEN_LOCKED' | 'ATR_TRAILING';
+export type PositionTrailingStatus = 'INITIAL' | 'PARTIAL_CLOSED_BE' | 'BREAKEVEN_LOCKED' | 'ATR_TRAILING' | 'TIME_DECAY_PROTECT';
 
 export interface ManagedPosition {
   id: string; // Exness order / position ticket id
@@ -244,6 +244,40 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
   }
 
   // =========================================================================
+  // FREQTRADE TIME-DECAY STAGNANT TRADE EXIT (>9 candles / 45 minutes)
+  // If an open position has been active for > 45 minutes without reaching Stage 1 Mid-BB,
+  // and unrealized PnL is slightly positive (above BE + fee/spread buffer),
+  // automatically move Stop Loss to Breakeven+ or execute a protective close.
+  // =========================================================================
+  const tradeAgeMs = Date.now() - (position.openTime || Date.now());
+  const isStagnant = tradeAgeMs >= 45 * 60 * 1000; // > 45 mins (9 M5 candles)
+  const isSlightlyPositive =
+    unrealizedPnl > 0.10 ||
+    currentProfitDistance >= (profile.symbol === 'XAUUSDm' ? 0.15 : 1.5 * profile.pipValue);
+
+  if (isStagnant && !position.partialClosed && isSlightlyPositive) {
+    if (isSlImprovementToBe) {
+      return {
+        type: 'MODIFY_SL',
+        positionId: position.id,
+        symbol: position.symbol,
+        newSlPrice: numericBeSl,
+        formattedSlPrice: formattedBeSl,
+        reason: `[TIME_DECAY_PROTECT] Stagnant trade active ${(tradeAgeMs / 60000).toFixed(0)}m (>45m / 9 candles) without reaching Stage 1 Mid-BB: Moved SL to Breakeven+ (${formattedBeSl}) to eliminate drawdown.`,
+        statusUpdate: 'TIME_DECAY_PROTECT',
+      };
+    } else if (position.trailingStatus === 'TIME_DECAY_PROTECT' && unrealizedPnl >= 0.20) {
+      return {
+        type: 'HARD_SL_CLOSE',
+        positionId: position.id,
+        symbol: position.symbol,
+        reason: `[TIME_DECAY_PROTECT] Executing protective close on stagnant trade (${(tradeAgeMs / 60000).toFixed(0)}m active) at +$${unrealizedPnl.toFixed(2)} to recycle margin.`,
+        statusUpdate: 'TIME_DECAY_PROTECT',
+      };
+    }
+  }
+
+  // =========================================================================
   // PHASE 2 — TIGHT ATR TRAILING (0.40 TO 0.75 PRICE UNITS ON GOLD)
   // Locks in profits rapidly once Breakeven is locked, past Mid BB, or profit >= +$0.60
   // =========================================================================
@@ -251,7 +285,13 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
     ? (middleBB > position.entryPrice + minProfitDistance && currentBid >= middleBB)
     : (middleBB < position.entryPrice - minProfitDistance && currentAsk <= middleBB);
 
-  const canTrail = reachedValidMiddleBb || reachedProfitBe || position.trailingStatus === 'BREAKEVEN_LOCKED' || position.trailingStatus === 'PARTIAL_CLOSED_BE' || position.trailingStatus === 'ATR_TRAILING';
+  const canTrail =
+    reachedValidMiddleBb ||
+    reachedProfitBe ||
+    position.trailingStatus === 'BREAKEVEN_LOCKED' ||
+    position.trailingStatus === 'PARTIAL_CLOSED_BE' ||
+    position.trailingStatus === 'ATR_TRAILING' ||
+    position.trailingStatus === 'TIME_DECAY_PROTECT';
 
   if (canTrail) {
     let trailDist = 0.55;
@@ -354,4 +394,72 @@ export function canTriggerMidBbPartialClose(
     const rValid = riskDistance > 0 && quote.ask <= position.entryPrice - 0.6 * riskDistance;
     return hasProfit && (midBbValid || rValid);
   }
+}
+
+/**
+ * Evaluates 2-Stage Trailing Stop specifically for Crypto Perpetuals (Binance / Bitget)
+ * Stage 1: 50% partial close at Middle BB / +0.6R, lock stop loss to Breakeven (+ buffer).
+ * Stage 2: Adaptive ATR Trailing Stop beyond Middle BB.
+ */
+export function evaluateCryptoPositionTrailing(params: {
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  entryPrice: number;
+  currentPrice: number;
+  quantity: number;
+  partialClosed?: boolean;
+  currentSl?: number;
+  middleBB?: number;
+  atr14?: number;
+  exchange?: 'BINANCE' | 'BITGET';
+}): {
+  action: 'NONE' | 'PARTIAL_CLOSE' | 'MODIFY_SL' | 'HARD_SL_CLOSE';
+  closeQuantity?: number;
+  newSlPrice?: number;
+  reason?: string;
+} {
+  const isLong = params.side === 'BUY';
+  const priceMove = isLong ? params.currentPrice - params.entryPrice : params.entryPrice - params.currentPrice;
+  const pricePct = priceMove / params.entryPrice;
+
+  // Hard SL circuit breaker: loss > 3% on high leverage
+  if (pricePct <= -0.03) {
+    return {
+      action: 'HARD_SL_CLOSE',
+      closeQuantity: params.quantity,
+      reason: `[CRYPTO HARD SL] Loss reached ${(pricePct * 100).toFixed(2)}% on ${params.symbol}. Liquidating position immediately.`,
+    };
+  }
+
+  // Stage 1: 50% Partial Close at +0.6R (or >= +0.3% move)
+  const minStage1Pct = 0.003;
+  if (!params.partialClosed && pricePct >= minStage1Pct) {
+    const halfQty = params.quantity * 0.5;
+    const bePrice = isLong ? params.entryPrice * 1.0008 : params.entryPrice * 0.9992;
+    return {
+      action: 'PARTIAL_CLOSE',
+      closeQuantity: halfQty,
+      newSlPrice: Number(bePrice.toFixed(params.symbol.includes('BTC') ? 2 : 4)),
+      reason: `[STAGE-1 PARTIAL CLOSE] ${params.symbol} reached +${(pricePct * 100).toFixed(2)}%: 50% Closed (${halfQty}) & SL locked at Breakeven.`,
+    };
+  }
+
+  // Stage 2: Adaptive ATR Trailing Stop
+  if (params.partialClosed && pricePct > minStage1Pct && params.atr14) {
+    const trailDist = 1.2 * params.atr14;
+    const candidateSl = isLong ? params.currentPrice - trailDist : params.currentPrice + trailDist;
+    const isAdvancing = isLong
+      ? (!params.currentSl || candidateSl > params.currentSl)
+      : (!params.currentSl || candidateSl < params.currentSl);
+
+    if (isAdvancing) {
+      return {
+        action: 'MODIFY_SL',
+        newSlPrice: Number(candidateSl.toFixed(params.symbol.includes('BTC') ? 2 : 4)),
+        reason: `[STAGE-2 ATR TRAILING] Advanced trailing SL to ${candidateSl.toFixed(4)} on ${params.symbol}.`,
+      };
+    }
+  }
+
+  return { action: 'NONE' };
 }
