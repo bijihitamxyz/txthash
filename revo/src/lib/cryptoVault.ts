@@ -37,7 +37,7 @@ export const DEFAULT_CRYPTO_VAULT: CryptoVaultData = {
     apiKey: '',
     secretKey: '',
     passphrase: '',
-    accountType: 'DEMO',
+    accountType: 'REAL',
   },
   updatedAt: Date.now(),
 };
@@ -355,13 +355,21 @@ export function getActiveCryptoCredentials(vault?: CryptoVaultData | null): {
   const v = vault || DEFAULT_CRYPTO_VAULT;
   const exchange = v.activeCryptoExchange || 'BINANCE';
   const creds = exchange === 'BITGET' ? v.bitget : v.binance;
-  const isTestnet = creds.accountType === 'DEMO';
+  const accountType: CryptoAccountType =
+    creds?.accountType === 'DEMO'
+      ? 'DEMO'
+      : creds?.accountType === 'REAL'
+      ? 'REAL'
+      : exchange === 'BITGET'
+      ? 'REAL'
+      : 'DEMO';
+  const isTestnet = accountType === 'DEMO';
   return {
     exchange,
-    apiKey: creds.apiKey || '',
-    secretKey: creds.secretKey || '',
-    passphrase: creds.passphrase || '',
-    accountType: creds.accountType || 'DEMO',
+    apiKey: creds?.apiKey || '',
+    secretKey: creds?.secretKey || '',
+    passphrase: creds?.passphrase || '',
+    accountType,
     isTestnet,
   };
 }
@@ -436,13 +444,13 @@ export async function loadCryptoVaultFromLocalStorage(): Promise<CryptoVaultData
       binance: {
         apiKey: parsed.binance?.apiKey || '',
         secretKey: parsed.binance?.secretKey || '',
-        accountType: parsed.binance?.accountType || 'DEMO',
+        accountType: parsed.binance?.accountType === 'REAL' ? 'REAL' : 'DEMO',
       },
       bitget: {
         apiKey: parsed.bitget?.apiKey || '',
         secretKey: parsed.bitget?.secretKey || '',
         passphrase: parsed.bitget?.passphrase || '',
-        accountType: parsed.bitget?.accountType || 'DEMO',
+        accountType: parsed.bitget?.accountType === 'DEMO' ? 'DEMO' : 'REAL',
       },
       updatedAt: parsed.updatedAt || Date.now(),
     };
@@ -492,13 +500,13 @@ export async function loadServerCryptoVault(): Promise<CryptoVaultData | null> {
       binance: {
         apiKey: parsed.binance?.apiKey || '',
         secretKey: parsed.binance?.secretKey || '',
-        accountType: parsed.binance?.accountType || 'DEMO',
+        accountType: parsed.binance?.accountType === 'REAL' ? 'REAL' : 'DEMO',
       },
       bitget: {
         apiKey: parsed.bitget?.apiKey || '',
         secretKey: parsed.bitget?.secretKey || '',
         passphrase: parsed.bitget?.passphrase || '',
-        accountType: parsed.bitget?.accountType || 'DEMO',
+        accountType: parsed.bitget?.accountType === 'DEMO' ? 'DEMO' : 'REAL',
       },
       updatedAt: parsed.updatedAt || Date.now(),
     };

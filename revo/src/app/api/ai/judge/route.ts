@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { verifyAdminSecret } from '@/lib/licenseDb';
-import { testAiPing, normalizeAiEndpoint, isReasoningModel } from '@/core/aiJudge';
+import { testAiPing, normalizeAiEndpoint, isReasoningModel, isCloudProvider } from '@/core/aiJudge';
 import {
   DEFAULT_CENTRAL_AI_CONFIG,
   AiProviderSlot,
@@ -38,22 +38,33 @@ async function querySingleSetupProvider(
   userPrompt: string
 ): Promise<{ decision: 'EXECUTE' | 'REJECT'; confidence_score: number; reasoning: string; label: string }> {
   const { chatEndpoint, isAnthropic, isLocal } = normalizeAiEndpoint(slot.baseUrl);
-  const effectiveKey = (slot.apiKey || '').trim() || (isLocal ? 'sk-local-9router' : '');
+  const isCloud = isCloudProvider(slot.id, slot.baseUrl);
+  const effectiveKey = (slot.apiKey || '').trim() || (!isCloud || isLocal ? 'sk-local-9router' : '');
   const model = (slot.model || '').trim() || 'gpt-4o-mini';
   const label = `${slot.name.split(' ')[0]}:${model}`;
   const cacheKey = `${slot.id}_${slot.baseUrl}_${model}`;
 
   const cooldown = judgeProviderCooldown.get(cacheKey);
-  if (cooldown && Date.now() < cooldown.until) {
-    throw new Error(`Cooldown HTTP ${cooldown.status}`);
+  const isSelfHostedSlot = !isCloud || isLocal;
+  // Self-hosted VPS / Ollama nodes only respect cooldown for genuine HTTP 429 throttling (prevents 0ms failover)
+  if (cooldown && Date.now() < cooldown.until && (!isSelfHostedSlot || cooldown.status === 429)) {
+    throw new Error(`Cooldown HTTP ${cooldown.status} @ ${chatEndpoint}`);
   }
+
+  const isVpsOrOllama =
+    isLocal ||
+    model.toLowerCase().includes('qwen') ||
+    slot.baseUrl.includes('11434') ||
+    slot.baseUrl.includes(':8000') ||
+    slot.baseUrl.includes(':8080');
+  const timeoutMs = isVpsOrOllama ? 15000 : 15000;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
     try {
       controller.abort();
     } catch {}
-  }, 6500);
+  }, timeoutMs);
 
   const reasoning = isReasoningModel(model);
 
@@ -69,7 +80,8 @@ async function querySingleSetupProvider(
         },
         body: JSON.stringify({
           model,
-          max_tokens: 512,
+          max_tokens: 80,
+          temperature: 0.1,
           system: systemPrompt,
           messages: [{ role: 'user', content: userPrompt }],
         }),
@@ -96,11 +108,13 @@ async function querySingleSetupProvider(
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
+        max_tokens: 80,
+        temperature: 0.1,
       };
       if (reasoning) {
-        payloadBody.max_completion_tokens = 512;
+        payloadBody.max_completion_tokens = 80;
       } else {
-        payloadBody.max_tokens = 512;
+        payloadBody.max_tokens = 80;
         payloadBody.temperature = 0.1;
       }
 
@@ -251,21 +265,16 @@ async function evaluateSetupWithCentralAi(payload: {
       }
     }
 
-    const isApproved = baseScore >= threshold;
+    const rawBoundedScore = Math.max(50, Math.min(95, Math.round(baseScore)));
+    const isApproved = rawBoundedScore >= threshold;
     return {
       decision: isApproved ? 'EXECUTE' : 'REJECT',
       confidence_score: isApproved
-        ? Math.min(
-            96,
-            Math.max(
-              threshold,
-              Math.round(baseScore * 0.95 + (payload.bbWickSweepPct || 0) * 0.1)
-            )
-          )
-        : Math.round(baseScore * 0.7),
+        ? rawBoundedScore
+        : Math.min(threshold - 1, Math.max(45, Math.round(baseScore * 0.7))),
       reasoning: isApproved
-        ? `${prefix} Confluence Score ${baseScore}/100 meets ${threshold}% threshold (ER-10 ${payload.efficiencyRatio?.toFixed(2) ?? '-'}, POC Magnet ${payload.pocMagnetAligned ? 'Yes' : 'No'}).`
-        : `${prefix} Confluence Score ${baseScore}/100 below ${threshold}% threshold.`,
+        ? `${prefix} Confluence Score ${rawBoundedScore}/100 meets ${threshold}% threshold (ER-10 ${payload.efficiencyRatio?.toFixed(2) ?? '-'}, POC Magnet ${payload.pocMagnetAligned ? 'Yes' : 'No'}).`
+        : `${prefix} Confluence Score ${rawBoundedScore}/100 below ${threshold}% threshold.`,
       source: 'HEURISTIC_QUANT_FALLBACK',
       modelUsed: 'Kronos-Quant-Governance',
       modelsUsed: ['Kronos-Quant-Governance'],
@@ -344,11 +353,12 @@ ${marketType === 'CRYPTO' ? `BTC Guard Status: ${payload.btcGuardStatus || 'NORM
   let rawDecision: 'EXECUTE' | 'REJECT';
   if (executeVotes > rejectVotes) rawDecision = 'EXECUTE';
   else if (rejectVotes > executeVotes) {
-    // For Crypto setups where qwen2.5:3b outputs 56-62%, allow execution if score meets dynamic threshold (>= 56)
-    rawDecision = marketType === 'CRYPTO' && avgScore >= threshold ? 'EXECUTE' : 'REJECT';
+    // Allow execution if score meets dynamic threshold (>= threshold) across Forex and Crypto
+    rawDecision = avgScore >= threshold ? 'EXECUTE' : 'REJECT';
   } else rawDecision = payload.confluenceScore >= threshold ? 'EXECUTE' : 'REJECT';
 
   const finalDecision: 'EXECUTE' | 'REJECT' =
+    avgScore >= threshold ||
     (rawDecision === 'EXECUTE' && avgScore >= threshold) ||
     (marketType === 'CRYPTO' && avgScore >= threshold && payload.confluenceScore >= threshold)
       ? 'EXECUTE'
@@ -531,7 +541,8 @@ export async function POST(req: NextRequest) {
         : rawKey;
 
       const { isLocal } = normalizeAiEndpoint(baseUrl);
-      if (!apiKey && !isLocal) {
+      const isCloud = isCloudProvider(providerId || '', baseUrl);
+      if (!apiKey && isCloud && !isLocal) {
         return NextResponse.json({
           success: false,
           statusText: 'FAILED (API Key is empty)',

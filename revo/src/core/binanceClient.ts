@@ -435,11 +435,12 @@ export class BinanceFuturesClient {
     if (params.reduceOnly) {
       orderPayload.reduceOnly = 'true';
     }
-    if (params.price) {
+    const orderType = (params.type || 'MARKET').toUpperCase();
+    if (params.price && orderType === 'LIMIT') {
       orderPayload.price = params.price;
       orderPayload.timeInForce = 'GTC';
     }
-    if (params.stopPrice) {
+    if (params.stopPrice && orderType !== 'MARKET' && orderType !== 'LIMIT') {
       orderPayload.stopPrice = params.stopPrice;
     }
 
@@ -467,10 +468,20 @@ export class BinanceFuturesClient {
    * Closes a position (or partial closes) via reduceOnly market order
    */
   async closePosition(symbol: string, currentPositionAmt: number, quantityToClose?: number): Promise<any> {
-    const isLong = currentPositionAmt > 0;
+    let amt = Number(currentPositionAmt) || 0;
+    if (amt === 0) {
+      const account = await this.getAccountInfo();
+      const livePos = account.positions.find((p) => p.symbol === symbol && Math.abs(p.positionAmt) > 0);
+      if (!livePos) {
+        throw new Error(`No open position found on Binance for ${symbol}.`);
+      }
+      amt = livePos.positionAmt;
+    }
+
+    const isLong = amt > 0;
     const side = isLong ? 'SELL' : 'BUY';
-    const totalAbsQty = Math.abs(currentPositionAmt);
-    const qty = quantityToClose && quantityToClose < totalAbsQty ? quantityToClose : totalAbsQty;
+    const totalAbsQty = Math.abs(amt);
+    const qty = quantityToClose && quantityToClose > 0 && quantityToClose < totalAbsQty ? quantityToClose : totalAbsQty;
 
     // Get filter for stepSize formatting
     const filters = await this.getExchangeInfo();

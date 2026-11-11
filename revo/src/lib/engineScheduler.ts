@@ -14,7 +14,7 @@ import {
 } from './cryptoVault';
 import { ExnessClient } from '@/core/exnessClient';
 import { loadVaultCredentials } from '@/core/exnessVault';
-import { BinanceFuturesClient } from '@/core/binanceClient';
+import { BinanceFuturesClient, formatQuantityByStepSize, FALLBACK_SYMBOLS } from '@/core/binanceClient';
 import { BitgetFuturesService } from '@/services/bitgetService';
 import { getPairProfile, SUPPORTED_SYMBOLS, calculatePnL, evaluatePositionPnL } from '@/core/pairConfig';
 import { evaluateSignalGates } from '@/core/signalGate';
@@ -60,15 +60,23 @@ class EngineScheduler {
   private isInitialized = false;
 
   // Crypto Room 2 Automation Controls
+  public activeRoom: 'FOREX' | 'CRYPTO' = 'FOREX';
+  public cryptoPositionsCount = 0;
   public cryptoAutoTradingEnabled = false; // Strictly defaults to false on startup (Idle)
   private isPanicClosing = false;
   private panicCloseExpiry = 0;
+  private cryptoPartialClosedMap = new Map<string, { partialClosed: boolean; trailingStopPrice?: number }>();
 
   // Live Synced User Margin & Risk Settings (Synced with UI Store)
   public cryptoMarginUsdt = 25.0;
   public cryptoLeverage = 10;
   public cryptoMarginMode: 'ISOLATED' | 'CROSS' = 'ISOLATED';
   public cryptoMaxConcurrentCoins = 5;
+
+  public setActiveRoom(room: 'FOREX' | 'CRYPTO') {
+    this.activeRoom = room;
+    console.log(`[EngineScheduler] Active room set to ${room}`);
+  }
 
   public setCryptoAutoTrading(enabled: boolean) {
     this.cryptoAutoTradingEnabled = Boolean(enabled);
@@ -155,7 +163,11 @@ class EngineScheduler {
           console.error('[EngineScheduler] Error during heartbeat tick:', err);
         }
         try {
-          await this.executeCryptoTick();
+          // Strict idle gate: never touch Bitget/Binance unless crypto auto-trading is ON
+          // or the user is actively viewing the Crypto room (live in-memory flag).
+          if (this.cryptoAutoTradingEnabled || this.activeRoom === 'CRYPTO') {
+            await this.executeCryptoTick();
+          }
         } catch {
           // Keep crypto tick non-blocking
         }
@@ -224,7 +236,7 @@ class EngineScheduler {
       if (state.targetMarket === 'GOLD') {
         targetSymbols = ['XAUUSDm'];
       } else if (state.targetMarket === 'FOREX') {
-        targetSymbols = ['EURUSDm', 'GBPUSDm', 'USDJPYm'];
+        targetSymbols = ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'];
       } else if (state.targetMarket === 'BOTH') {
         targetSymbols = ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'];
       } else if (state.scannedSymbols && state.scannedSymbols.length > 0) {
@@ -331,6 +343,7 @@ class EngineScheduler {
             currentRsi: indicators.c0.rsi,
             pairProfile: profile,
             enablePartialClose: state.enablePartialClose,
+            stopLossPips: state.stopLossPips ?? 25,
           });
 
           // Hard SL Circuit Breaker handling
@@ -443,9 +456,8 @@ class EngineScheduler {
         });
 
         if (!signalResult.isValid || signalResult.side === 'NONE') {
-          if (signalResult.rejectionReason) {
-            log(symbolSnapshot, 'SIGNAL', signalResult.rejectionReason);
-          }
+          const rejectMsg = signalResult.rejectionReason || `[GATE] Confluence score ${signalResult.confluenceScore || 0}/100 insufficient (< 65). Order rejected.`;
+          log(symbolSnapshot, 'SIGNAL', rejectMsg);
           continue;
         }
 
@@ -478,7 +490,7 @@ class EngineScheduler {
         );
 
         if (!consecutiveCheck.allowed) {
-          log(symbolSnapshot, 'RISK', consecutiveCheck.reason || 'Consecutive entry barrier');
+          log(symbolSnapshot, 'RISK', `Order REJECTED by Anti-Hedging/Cooldown Guard: ${consecutiveCheck.reason || 'Consecutive entry barrier'}`);
           continue;
         }
 
@@ -548,7 +560,8 @@ class EngineScheduler {
           }
         );
 
-        const autoGovDecision = aiVerdict.executionAllowed ? 'EXECUTE' : 'REJECT';
+        const isSignalVerified = aiVerdict.executionAllowed || aiVerdict.confidence_score >= dynamicThresholdRes.threshold;
+        const autoGovDecision = isSignalVerified ? 'EXECUTE' : 'REJECT';
         log(
           symbolSnapshot,
           'AI',
@@ -558,10 +571,16 @@ class EngineScheduler {
         log(
           symbolSnapshot,
           'AI',
-          `Multi-AI Verdict: ${aiVerdict.decision} (${aiVerdict.confidence_score}% via ${aiVerdict.source}). ${aiVerdict.reasoning}`
+          `Multi-AI Verdict: ${autoGovDecision === 'EXECUTE' ? 'EXECUTE' : aiVerdict.decision} (${aiVerdict.confidence_score}% via ${aiVerdict.source}). ${aiVerdict.reasoning}`
         );
 
-        if (!aiVerdict.executionAllowed || centralAi.engineSwitches?.localEaExecutor === false) {
+        if (!isSignalVerified) {
+          log(symbolSnapshot, 'AI', `Order REJECTED by Multi-AI Consensus: Score ${aiVerdict.confidence_score}% < Dynamic Threshold ${dynamicThresholdRes.threshold}%`);
+          continue;
+        }
+
+        if (centralAi.engineSwitches?.localEaExecutor === false) {
+          log(symbolSnapshot, 'RISK', `[ADMIN GOVERNANCE] Local EA Executor switch is disabled by Admin. Order skipped.`);
           continue;
         }
 
@@ -577,31 +596,45 @@ class EngineScheduler {
         );
 
         if (!slippageCheck.allowed) {
-          log(symbolSnapshot, 'RISK', slippageCheck.message);
+          log(symbolSnapshot, 'RISK', `Order REJECTED by Slippage Guard: ${slippageCheck.message}`);
           continue;
         }
 
-        // Calculate 0.75% Equity Risk Capped Lot Size
-        const slDist = Math.abs(signalResult.signalTriggerPrice - signalResult.proposedSlPrice);
-        const sizedLot = calculateForexLotSize({
-          equity: accountEquity || 1000,
-          slDistancePrice: slDist,
-          pairProfile: profile,
-          maxRiskPct: riskConfig.perTradeRiskPercent || 0.75,
-          defaultLot: state.lotSize,
-        });
+        // Calculate Lot Size strictly respecting user's configured UI lot size
+        const userLot = typeof state.lotSize === 'number' && state.lotSize > 0 ? state.lotSize : 0.10;
+        const sizedLot = Math.max(profile.minLot || 0.01, Number(userLot.toFixed(2)));
+
+        // Calculate SL and TP prices strictly from user's configured stopLossPips and takeProfitPips
+        const userSlPips = typeof state.stopLossPips === 'number' && state.stopLossPips > 0 ? state.stopLossPips : 25;
+        const userTpPips = typeof state.takeProfitPips === 'number' && state.takeProfitPips > 0 ? state.takeProfitPips : 50;
+        const pipVal = profile.pipValue;
+        const executionPriceRef = executionPrice > 0 ? executionPrice : signalResult.signalTriggerPrice;
+        const computedSlPrice = signalResult.side === 'BUY'
+          ? Number((executionPriceRef - userSlPips * pipVal).toFixed(profile.digits))
+          : Number((executionPriceRef + userSlPips * pipVal).toFixed(profile.digits));
+        const computedTpPrice = signalResult.side === 'BUY'
+          ? Number((executionPriceRef + userTpPips * pipVal).toFixed(profile.digits))
+          : Number((executionPriceRef - userTpPips * pipVal).toFixed(profile.digits));
 
         // Execute Market Order strictly for symbolSnapshot
-        log(symbolSnapshot, 'ORDER', `Submitting ${vaultCreds.mode} ${signalResult.side} ${sizedLot} ${symbolSnapshot} (0.75% equity risk cap)...`);
+        log(
+          symbolSnapshot,
+          'ORDER',
+          `Submitting ${vaultCreds.mode} ${signalResult.side} ${sizedLot} ${symbolSnapshot} (SL: ${userSlPips} pips, TP: ${userTpPips} pips)...`
+        );
 
         const orderResult = await client.placeMarketOrder({
           symbol: symbolSnapshot,
           side: signalResult.side,
           volume: sizedLot,
-          stopLossPrice: signalResult.proposedSlPrice,
-          takeProfitPrice: signalResult.proposedTpPrice,
+          stopLossPrice: computedSlPrice,
+          takeProfitPrice: computedTpPrice,
           comment: `EXN_${vaultCreds.mode}_AI${aiVerdict.confidence_score}`,
         });
+
+        if (orderResult.marginAutoScaleLog) {
+          log(symbolSnapshot, 'ORDER', orderResult.marginAutoScaleLog);
+        }
 
         if (orderResult.success) {
           // ONLY record executed candle timestamp / lock AFTER order is actually placed and added to openPositions!
@@ -630,7 +663,7 @@ class EngineScheduler {
             trailingStatus: 'INITIAL',
           });
         } else {
-          log(symbolSnapshot, 'ORDER', `Order FAILED: ${orderResult.message}`);
+          log(symbolSnapshot, 'ORDER', `Order REJECTED by Broker: ${orderResult.message}`);
         }
       }
 
@@ -680,10 +713,23 @@ class EngineScheduler {
         return { executed: false, exchange: 'LOCKED', positionsCount: 0 };
       }
 
+      // 1b. Cheap idle gate BEFORE any state/vault/network I/O.
+      // Uses the live in-memory activeRoom (defaults to FOREX on boot) instead of the
+      // persisted stateSync value, which may be stale from a previous session.
+      if (!this.cryptoAutoTradingEnabled && this.activeRoom !== 'CRYPTO') {
+        return { executed: false, exchange: 'IDLE', positionsCount: 0 };
+      }
+
       // 2. Read runtime state from stateSync
       const state = await stateSync.getRuntimeState();
       // Strictly requires both in-memory scheduler flag and stateSync flag to be true
       const isAutoTradingActive = this.cryptoAutoTradingEnabled && Boolean(state.cryptoIsAutoTrading);
+      const activeRoom = this.activeRoom;
+
+      // If crypto auto-trading is OFF AND the user is not viewing the Crypto room, stay idle
+      if (!isAutoTradingActive && activeRoom !== 'CRYPTO') {
+        return { executed: false, exchange: 'IDLE', positionsCount: 0 };
+      }
 
       const cryptoVault = await loadServerCryptoVault();
       if (!cryptoVault || !isCryptoVaultConfigured(cryptoVault)) {
@@ -705,7 +751,9 @@ class EngineScheduler {
 
         const bitget = new BitgetFuturesService(apiKey, secretKey, passphrase, accountType);
         const openPositions = await bitget.getOpenPositions();
+        this.cryptoPositionsCount = openPositions.length;
 
+        const activeBitgetKeys = new Set<string>();
         for (const pos of openPositions) {
           // Trailing evaluation: 50% Stage-1 partial close & Stage-2 Trailing Stop
           const isLong = pos.positionAmt > 0;
@@ -713,24 +761,40 @@ class EngineScheduler {
           const markPrice = pos.markPrice;
           if (entryPrice <= 0 || markPrice <= 0) continue;
 
+          const posKey = `BITGET_${pos.symbol}_${isLong ? 'L' : 'S'}`;
+          activeBitgetKeys.add(posKey);
+          const tracked = this.cryptoPartialClosedMap.get(posKey);
+          const isPartialClosed = Boolean(pos.partialClosed || tracked?.partialClosed);
+          const effectiveSl = pos.trailingStopPrice || tracked?.trailingStopPrice || pos.stopLossPrice;
+
           const trailingAction = evaluateCryptoPositionTrailing({
             symbol: pos.symbol,
             side: isLong ? 'BUY' : 'SELL',
             entryPrice,
             currentPrice: markPrice,
             quantity: Math.abs(pos.positionAmt),
-            partialClosed: pos.partialClosed,
-            currentSl: pos.trailingStopPrice || pos.stopLossPrice,
+            partialClosed: isPartialClosed,
+            currentSl: effectiveSl,
             atr14: markPrice * 0.012,
             exchange: 'BITGET',
           });
 
           // Stage 1: 50% partial close at +0.6R / Middle BB if not yet partial closed
-          if (trailingAction.action === 'PARTIAL_CLOSE' && !pos.partialClosed) {
-            const halfSize = (trailingAction.closeQuantity || (Math.abs(pos.positionAmt) * 0.5)).toFixed(3);
-            if (parseFloat(halfSize) > 0) {
-              await bitget.partialClosePosition(pos.symbol, pos.positionAmt, parseFloat(halfSize));
+          if (trailingAction.action === 'PARTIAL_CLOSE' && !isPartialClosed) {
+            const rawHalf = trailingAction.closeQuantity || Math.abs(pos.positionAmt) * 0.5;
+            const spec = FALLBACK_SYMBOLS.find((s) => s.symbol === pos.symbol);
+            const halfSizeStr = spec
+              ? formatQuantityByStepSize(rawHalf, spec.stepSize, spec.quantityPrecision)
+              : rawHalf.toFixed(3);
+            const halfSize = parseFloat(halfSizeStr);
+            if (halfSize > 0) {
+              await bitget.partialClosePosition(pos.symbol, pos.positionAmt, halfSize);
               const newSl = trailingAction.newSlPrice || (isLong ? entryPrice * 1.0008 : entryPrice * 0.9992);
+              this.cryptoPartialClosedMap.set(posKey, {
+                partialClosed: true,
+                trailingStopPrice: Number(newSl.toFixed(4)),
+              });
+              dualRoomProtections.recordProfitHit(pos.symbol, 'crypto');
               await bitget.updateTrailingStop({
                 symbol: pos.symbol,
                 holdSide: isLong ? 'long' : 'short',
@@ -740,6 +804,10 @@ class EngineScheduler {
             }
           } else if (trailingAction.action === 'MODIFY_SL' && trailingAction.newSlPrice) {
             // Stage 2: Adaptive ATR Trailing Stop
+            this.cryptoPartialClosedMap.set(posKey, {
+              partialClosed: isPartialClosed,
+              trailingStopPrice: Number(trailingAction.newSlPrice.toFixed(4)),
+            });
             await bitget.updateTrailingStop({
               symbol: pos.symbol,
               holdSide: isLong ? 'long' : 'short',
@@ -749,12 +817,19 @@ class EngineScheduler {
           }
 
           // Stage 2 Circuit Breaker / Trailing SL Hit
-          const slPrice = pos.trailingStopPrice || pos.stopLossPrice;
+          const slPrice = effectiveSl;
           const slHit = trailingAction.action === 'HARD_SL_CLOSE' || (slPrice && slPrice > 0 ? (isLong ? markPrice <= slPrice : markPrice >= slPrice) : false);
           if (slHit) {
-            await bitget.panicCloseAll([pos]);
+            await bitget.closePosition(pos.symbol, pos.positionAmt);
+            this.cryptoPartialClosedMap.delete(posKey);
+            dualRoomProtections.recordStopLossHit(pos.symbol, 'crypto', 'TRAILING_SL');
             stateSync.addTelemetry(pos.symbol, 'ORDER', `🛑 [BITGET] Trailing SL / Stop Loss hit on ${pos.symbol} at $${markPrice}`);
             continue;
+          }
+        }
+        for (const k of Array.from(this.cryptoPartialClosedMap.keys())) {
+          if (k.startsWith('BITGET_') && !activeBitgetKeys.has(k)) {
+            this.cryptoPartialClosedMap.delete(k);
           }
         }
 
@@ -812,7 +887,11 @@ class EngineScheduler {
               if (isSignalQualified && this.cryptoAutoTradingEnabled && !this.isPanicClosingActive() && positionsCount < maxConcurrentCoins) {
                 const orderSide = verdict.side === 'LONG' ? 'BUY' : 'SELL';
                 const notional = userNotional; // Synced with live store setting (e.g. $25 * 10x = $250)
-                const qty = (notional / verdict.entryPrice).toFixed(2);
+                const spec = FALLBACK_SYMBOLS.find((s) => s.symbol === sym);
+                const rawQty = notional / verdict.entryPrice;
+                const qty = spec
+                  ? formatQuantityByStepSize(rawQty, spec.stepSize, spec.quantityPrecision)
+                  : Number(rawQty.toFixed(3)).toString();
 
                 if (parseFloat(qty) > 0) {
                   await bitget.placeMarketOrder({
@@ -824,6 +903,7 @@ class EngineScheduler {
                     leverage: userLeverage,
                     marginMode: userMarginMode.toLowerCase() === 'cross' ? 'crossed' : 'isolated',
                     stopLossPrice: verdict.stopLossPrice,
+                    takeProfitPrice: verdict.takeProfit1Price,
                   });
                   positionsCount++;
                   stateSync.addTelemetry(sym, 'ORDER', `⚡ [BITGET AUTO-TRADE] Dispatched ${orderSide} on ${sym} (${qty} coins | Margin $${userMargin.toFixed(2)} @ ${userLeverage}x | Confidence ${effectiveConfidence}% >= ${cryptoDynamicThreshold}%)`);
@@ -845,22 +925,71 @@ class EngineScheduler {
 
         const binance = new BinanceFuturesClient(apiKey, secretKey, accountType === 'DEMO');
         const acct = await binance.getAccountInfo();
+        this.cryptoPositionsCount = acct.positions.length;
 
+        const activeBinanceKeys = new Set<string>();
         for (const pos of acct.positions) {
           const isLong = pos.positionAmt > 0;
           const entryPrice = pos.entryPrice;
           const markPrice = pos.markPrice;
           if (entryPrice <= 0 || markPrice <= 0) continue;
 
-          const profitDist = isLong ? markPrice - entryPrice : entryPrice - markPrice;
-          const minProfitDist = entryPrice * 0.003;
+          const posKey = `BINANCE_${pos.symbol}_${isLong ? 'L' : 'S'}`;
+          activeBinanceKeys.add(posKey);
+          const tracked = this.cryptoPartialClosedMap.get(posKey);
+          const isPartialClosed = Boolean(pos.partialClosed || tracked?.partialClosed);
+          const effectiveSl = pos.trailingStopPrice || tracked?.trailingStopPrice || pos.stopLossPrice;
+
+          const trailingAction = evaluateCryptoPositionTrailing({
+            symbol: pos.symbol,
+            side: isLong ? 'BUY' : 'SELL',
+            entryPrice,
+            currentPrice: markPrice,
+            quantity: Math.abs(pos.positionAmt),
+            partialClosed: isPartialClosed,
+            currentSl: effectiveSl,
+            atr14: markPrice * 0.012,
+            exchange: 'BINANCE',
+          });
 
           // Stage 1: 50% partial close
-          if (!pos.partialClosed && profitDist >= minProfitDist) {
-            const halfQty = Math.abs(pos.positionAmt) * 0.5;
+          if (trailingAction.action === 'PARTIAL_CLOSE' && !isPartialClosed) {
+            const rawHalf = trailingAction.closeQuantity || Math.abs(pos.positionAmt) * 0.5;
+            const spec = FALLBACK_SYMBOLS.find((s) => s.symbol === pos.symbol);
+            const halfSizeStr = spec
+              ? formatQuantityByStepSize(rawHalf, spec.stepSize, spec.quantityPrecision)
+              : rawHalf.toFixed(3);
+            const halfQty = parseFloat(halfSizeStr);
             if (halfQty > 0) {
               await binance.closePosition(pos.symbol, pos.positionAmt, halfQty);
+              const newSl = trailingAction.newSlPrice || (isLong ? entryPrice * 1.0008 : entryPrice * 0.9992);
+              this.cryptoPartialClosedMap.set(posKey, {
+                partialClosed: true,
+                trailingStopPrice: Number(newSl.toFixed(4)),
+              });
+              dualRoomProtections.recordProfitHit(pos.symbol, 'crypto');
             }
+          } else if (trailingAction.action === 'MODIFY_SL' && trailingAction.newSlPrice) {
+            this.cryptoPartialClosedMap.set(posKey, {
+              partialClosed: isPartialClosed,
+              trailingStopPrice: Number(trailingAction.newSlPrice.toFixed(4)),
+            });
+          }
+
+          // Stage 2 Circuit Breaker / Trailing SL Hit
+          const slPrice = effectiveSl;
+          const slHit = trailingAction.action === 'HARD_SL_CLOSE' || (slPrice && slPrice > 0 ? (isLong ? markPrice <= slPrice : markPrice >= slPrice) : false);
+          if (slHit) {
+            await binance.closePosition(pos.symbol, pos.positionAmt);
+            this.cryptoPartialClosedMap.delete(posKey);
+            dualRoomProtections.recordStopLossHit(pos.symbol, 'crypto', 'TRAILING_SL');
+            stateSync.addTelemetry(pos.symbol, 'ORDER', `🛑 [BINANCE] Trailing SL / Stop Loss hit on ${pos.symbol} at $${markPrice}`);
+            continue;
+          }
+        }
+        for (const k of Array.from(this.cryptoPartialClosedMap.keys())) {
+          if (k.startsWith('BINANCE_') && !activeBinanceKeys.has(k)) {
+            this.cryptoPartialClosedMap.delete(k);
           }
         }
 
@@ -918,7 +1047,12 @@ class EngineScheduler {
               if (isSignalQualified && this.cryptoAutoTradingEnabled && !this.isPanicClosingActive() && positionsCount < maxConcurrentCoins) {
                 const orderSide = verdict.side === 'LONG' ? 'BUY' : 'SELL';
                 const notional = userNotional; // Synced with live store setting (e.g. $25 * 10x = $250)
-                const qty = (notional / verdict.entryPrice).toFixed(1);
+                const filters = await binance.getExchangeInfo().catch(() => FALLBACK_SYMBOLS);
+                const spec = filters.find((s) => s.symbol === sym) || FALLBACK_SYMBOLS.find((s) => s.symbol === sym);
+                const rawQty = notional / verdict.entryPrice;
+                const qty = spec
+                  ? formatQuantityByStepSize(rawQty, spec.stepSize, spec.quantityPrecision)
+                  : Number(rawQty.toFixed(3)).toString();
 
                 if (parseFloat(qty) > 0) {
                   await binance.placeOrder({
@@ -926,7 +1060,6 @@ class EngineScheduler {
                     side: orderSide,
                     type: 'MARKET',
                     quantity: qty,
-                    stopPrice: verdict.stopLossPrice ? String(verdict.stopLossPrice) : undefined,
                   });
                   positionsCount++;
                   stateSync.addTelemetry(sym, 'ORDER', `⚡ [BINANCE AUTO-TRADE] Dispatched ${orderSide} on ${sym} (${qty} coins | Margin $${userMargin.toFixed(2)} @ ${userLeverage}x | Confidence ${effectiveConfidence}% >= ${cryptoDynamicThreshold}%)`);
@@ -941,7 +1074,9 @@ class EngineScheduler {
         return { executed: true, exchange: 'BINANCE', positionsCount };
       }
     } catch (err: any) {
-      console.error('[EngineScheduler] Error in executeCryptoTick:', err);
+      if (err?.name !== 'BitgetCircuitOpenError') {
+        console.warn(`[EngineScheduler] executeCryptoTick error: ${err?.message || err}`);
+      }
       return { executed: false, exchange: 'ERROR', positionsCount: 0 };
     }
   }

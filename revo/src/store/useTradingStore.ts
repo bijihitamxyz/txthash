@@ -59,7 +59,7 @@ const inFlightQuotes = new Set<string>();
 const lastQuoteFetchTimes: Record<string, number> = {};
 
 export const PAIR_BASELINES: Record<string, { price: number; digits: number; pip: number }> = {
-  XAUUSDm: { price: 3875.70, digits: 2, pip: 0.10 },
+  XAUUSDm: { price: 4108.90, digits: 2, pip: 0.10 },
   EURUSDm: { price: 1.11592, digits: 5, pip: 0.0001 },
   GBPUSDm: { price: 1.33877, digits: 5, pip: 0.0001 },
   USDJPYm: { price: 157.569, digits: 3, pip: 0.01 },
@@ -71,8 +71,52 @@ export const LAST_KNOWN_PRICE_KEY = 'exness_last_known_real_prices';
 
 export const lastKnownPrice: Record<string, { price: number; timestamp: number; source?: string }> = {};
 
+export const LAST_VALID_LIVE_PRICE: Record<string, number> = {
+  XAUUSDm: 4108.90,
+  EURUSDm: 1.11592,
+  GBPUSDm: 1.33877,
+  USDJPYm: 157.569,
+};
+
+export function getValidLivePrice(symbol: string): number {
+  if (LAST_VALID_LIVE_PRICE[symbol] && LAST_VALID_LIVE_PRICE[symbol] > 0) {
+    return LAST_VALID_LIVE_PRICE[symbol];
+  }
+  const persisted = getPersistedRealPrice(symbol);
+  if (persisted > 0) {
+    LAST_VALID_LIVE_PRICE[symbol] = persisted;
+    return persisted;
+  }
+  return PAIR_BASELINES[symbol]?.price || (symbol === 'XAUUSDm' ? 4108.90 : 1.0);
+}
+
+export function isValidPriceUpdate(symbol: string, newPrice: number): boolean {
+  if (typeof newPrice !== 'number' || isNaN(newPrice) || !isFinite(newPrice) || newPrice <= 0) return false;
+  // Specific protective filters for gold against fake fallback seeds
+  if (symbol.startsWith('XAU')) {
+    if (newPrice < 1500 || newPrice > 10000) return false;
+    // Explicitly reject 3875 mock baseline seed that corrupts chart and balance
+    if (Math.abs(newPrice - 3875.70) < 1.0) return false;
+  } else if (symbol.startsWith('EUR') || symbol.startsWith('GBP')) {
+    if (newPrice < 0.5 || newPrice > 2.5) return false;
+  } else if (symbol.startsWith('USDJPY')) {
+    if (newPrice < 50 || newPrice > 300) return false;
+  }
+  const lastValid = getValidLivePrice(symbol);
+  if (lastValid > 0) {
+    const deviation = Math.abs(newPrice - lastValid) / lastValid;
+    // Protect against cross-symbol data injection (>15% jump on same symbol tick)
+    if (deviation > 0.15) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function updateStoreLastKnownPrice(symbol: string, price: number, source: string = 'live'): void {
   if (typeof price === 'number' && price > 0 && !isNaN(price)) {
+    if (!isValidPriceUpdate(symbol, price)) return;
+    LAST_VALID_LIVE_PRICE[symbol] = price;
     lastKnownPrice[symbol] = { price, timestamp: Date.now(), source };
     savePersistedRealPrice(symbol, price);
     const profile = getPairProfile(symbol);
@@ -81,11 +125,18 @@ export function updateStoreLastKnownPrice(symbol: string, price: number, source:
       digits: profile.digits,
       pip: profile.pipValue,
     };
+    if (symbol === 'XAUUSDm') {
+      LAST_VALID_LIVE_PRICE['XAUUSD'] = price;
+      lastKnownPrice['XAUUSD'] = { price, timestamp: Date.now(), source };
+    } else if (symbol === 'XAUUSD') {
+      LAST_VALID_LIVE_PRICE['XAUUSDm'] = price;
+      lastKnownPrice['XAUUSDm'] = { price, timestamp: Date.now(), source };
+    }
   }
 }
 
 export const INITIAL_QUOTES: Record<string, LiveQuote> = {
-  XAUUSDm: { symbol: 'XAUUSDm', bid: 3875.70, ask: 3875.90, spreadPips: 2.0, timestamp: Date.now() },
+  XAUUSDm: { symbol: 'XAUUSDm', bid: 4108.90, ask: 4109.10, spreadPips: 2.0, timestamp: Date.now() },
   EURUSDm: { symbol: 'EURUSDm', bid: 1.11592, ask: 1.11600, spreadPips: 0.8, timestamp: Date.now() },
   GBPUSDm: { symbol: 'GBPUSDm', bid: 1.33877, ask: 1.33885, spreadPips: 0.8, timestamp: Date.now() },
   USDJPYm: { symbol: 'USDJPYm', bid: 157.569, ask: 157.577, spreadPips: 0.8, timestamp: Date.now() },
@@ -122,7 +173,10 @@ export function savePersistedSymbolPrices(prices: Record<string, { bid: number; 
 
 export function getPersistedRealPrice(symbol: string): number {
   if (lastKnownPrice[symbol] && lastKnownPrice[symbol].price > 0) {
-    return lastKnownPrice[symbol].price;
+    const p = lastKnownPrice[symbol].price;
+    if (!symbol.startsWith('XAU') || (p >= 1500 && Math.abs(p - 3875.70) > 1.0)) {
+      return p;
+    }
   }
   if (typeof window !== 'undefined' && window.localStorage) {
     try {
@@ -130,22 +184,71 @@ export function getPersistedRealPrice(symbol: string): number {
       if (raw) {
         const parsed = JSON.parse(raw);
         if (typeof parsed[symbol] === 'number' && parsed[symbol] > 0) {
-          lastKnownPrice[symbol] = { price: parsed[symbol], timestamp: Date.now(), source: 'localStorage' };
-          return parsed[symbol];
+          const val = parsed[symbol];
+          if (!symbol.startsWith('XAU') || (val >= 1500 && Math.abs(val - 3875.70) > 1.0)) {
+            lastKnownPrice[symbol] = { price: val, timestamp: Date.now(), source: 'localStorage' };
+            return val;
+          }
         }
       }
     } catch {}
   }
-  return PAIR_BASELINES[symbol]?.price || (symbol === 'XAUUSDm' ? 3875.70 : 1.0);
+  return PAIR_BASELINES[symbol]?.price || (symbol.startsWith('XAU') ? 4108.90 : 1.0);
 }
 
 export function savePersistedRealPrice(symbol: string, price: number): void {
+  if (!isValidPriceUpdate(symbol, price)) return;
   if (typeof window !== 'undefined' && window.localStorage && price > 0) {
     try {
       const raw = window.localStorage.getItem(LAST_KNOWN_PRICE_KEY);
       const parsed = raw ? JSON.parse(raw) : {};
       parsed[symbol] = price;
       window.localStorage.setItem(LAST_KNOWN_PRICE_KEY, JSON.stringify(parsed));
+    } catch {}
+  }
+}
+
+export interface PersistedVerifiedAccount {
+  accountId: string;
+  server: string;
+  balance: number;
+  equity: number;
+  currency: string;
+  mode: AccountMode;
+  connected: boolean;
+  gatewayHost: string;
+  timestamp: number;
+}
+
+export const VERIFIED_ACCOUNT_KEY = 'exness_verified_account_cache';
+
+export function getPersistedVerifiedAccount(): PersistedVerifiedAccount | null {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      const raw = window.localStorage.getItem(VERIFIED_ACCOUNT_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.balance === 'number' && parsed.balance > 0) {
+          return parsed;
+        }
+      }
+    } catch {}
+  }
+  return null;
+}
+
+export function savePersistedVerifiedAccount(acc: PersistedVerifiedAccount): void {
+  if (typeof window !== 'undefined' && window.localStorage && acc && acc.balance > 0) {
+    try {
+      window.localStorage.setItem(VERIFIED_ACCOUNT_KEY, JSON.stringify(acc));
+    } catch {}
+  }
+}
+
+export function clearPersistedVerifiedAccount(): void {
+  if (typeof window !== 'undefined' && window.localStorage) {
+    try {
+      window.localStorage.removeItem(VERIFIED_ACCOUNT_KEY);
     } catch {}
   }
 }
@@ -165,7 +268,7 @@ function getSymbolBaselineEntry(symbol: string, digits: number, pip: number) {
     return existing;
   }
   let price = realPrice > 0 ? realPrice : 1.08500;
-  if (symbol === 'XAUUSDm') price = realPrice > 0 ? realPrice : 3995.00;
+  if (symbol === 'XAUUSDm') price = realPrice > 0 ? realPrice : 4108.90;
   else if (symbol === 'USDJPYm') price = realPrice > 0 ? realPrice : 156.840;
   else if (symbol === 'GBPUSDm') price = realPrice > 0 ? realPrice : 1.29500;
   return { price, digits, pip };
@@ -176,19 +279,33 @@ function createLocalFallbackCandles(rawSymbol: string, count: number = 50, tf: T
   const symbol = profile.symbol;
   const base = getSymbolBaselineEntry(symbol, profile.digits, profile.pipValue);
 
-  const anchor = getPersistedRealPrice(symbol) || base.price;
+  // Anchor strictly to the LAST KNOWN LIVE price first (e.g. ~4116.85), never to a stale seed (~4076 / 3875)
+  const liveAnchor = lastKnownPrice[symbol]?.price || (symbol.startsWith('XAU') ? (lastKnownPrice['XAUUSDm']?.price || lastKnownPrice['XAUUSD']?.price) : 0) || 0;
+  let anchor = liveAnchor > 0 ? liveAnchor : (getPersistedRealPrice(symbol) || base.price);
+  if (symbol.startsWith('XAU')) {
+    if (anchor < 1500 || Math.abs(anchor - 3875.70) < 1.0) {
+      anchor = LAST_VALID_LIVE_PRICE.XAUUSDm || 4116.85;
+    }
+  }
   const now = Date.now();
   const tfMs = timeframeToMs(tf);
   const candles: Candle[] = [];
+  // Never let a synthetic candle move more than 0.15% from the previous candle close
+  const maxJump = anchor * 0.0015;
+  const clampStep = (from: number, to: number) =>
+    Math.abs(to - from) > maxJump ? from + (to > from ? maxJump : -maxJump) : to;
+  let prevClose = anchor;
 
   for (let i = 0; i < count; i++) {
     const timestamp = now - ((count - 1 - i) * tfMs);
-    const wave = Math.sin((i / count) * Math.PI * 3) * (base.pip * 1.5);
-    const open = Number((anchor + wave).toFixed(base.digits));
-    const close = Number((anchor + wave + (i % 2 === 0 ? base.pip * 0.4 : -base.pip * 0.4)).toFixed(base.digits));
-    const high = Number((Math.max(open, close) + base.pip * 0.3).toFixed(base.digits));
-    const low = Number((Math.min(open, close) - base.pip * 0.3).toFixed(base.digits));
-    candles.push({ timestamp, open, high, low, close: i === count - 1 ? anchor : close, volume: 100 + (i % 30) });
+    const wave = Math.sin((i / count) * Math.PI * 3) * Math.min(base.pip * 1.5, maxJump * 0.5);
+    const open = Number(clampStep(prevClose, anchor + wave).toFixed(base.digits));
+    const rawClose = i === count - 1 ? anchor : anchor + wave + (i % 2 === 0 ? base.pip * 0.4 : -base.pip * 0.4);
+    const close = Number(clampStep(open, rawClose).toFixed(base.digits));
+    const high = Number((Math.max(open, close) + Math.min(base.pip * 0.3, maxJump * 0.3)).toFixed(base.digits));
+    const low = Number((Math.min(open, close) - Math.min(base.pip * 0.3, maxJump * 0.3)).toFixed(base.digits));
+    candles.push({ timestamp, open, high, low, close, volume: 100 + (i % 30) });
+    prevClose = close;
   }
   return candles;
 }
@@ -234,6 +351,8 @@ export interface TradingState {
 
   // 6. Strategy Parameters
   lotSize: number;
+  stopLossPips: number;
+  takeProfitPips: number;
   aiConfidenceThreshold: number;
   enablePartialClose: boolean;
 
@@ -251,6 +370,8 @@ export interface TradingState {
   toggleAutoTrading: (forceState?: boolean) => Promise<void>;
   stopAutoTrading: () => Promise<void>;
   setLotSize: (size: number) => Promise<void>;
+  setStopLossPips: (pips: number) => Promise<void>;
+  setTakeProfitPips: (pips: number) => Promise<void>;
   setAiConfidenceThreshold: (val: number) => void;
   setEnablePartialClose: (enabled: boolean) => void;
   setCredentials: (creds: Partial<StoredCredentials>) => Promise<void>;
@@ -370,7 +491,7 @@ export const useTradingStore = create<TradingState>()(
           };
         }
         const lastReal = lastKnownPrice[p.symbol]?.price || getPersistedRealPrice(p.symbol) || PAIR_BASELINES[p.symbol]?.price;
-        const basePrice = lastReal > 0 ? lastReal : (p.symbol === 'XAUUSDm' ? 3875.70 : 1.0);
+        const basePrice = lastReal > 0 ? lastReal : (p.symbol === 'XAUUSDm' ? 4108.90 : 1.0);
         const spreadPips = p.symbol === 'XAUUSDm' ? 1.6 : 0.8;
         const spreadPrice = spreadPips * p.pipValue;
         return {
@@ -385,6 +506,8 @@ export const useTradingStore = create<TradingState>()(
       telemetryLogs: [],
 
       lotSize: defaultLotSize,
+      stopLossPips: 25,
+      takeProfitPips: 50,
       aiConfidenceThreshold: defaultAiConfidence,
       enablePartialClose: defaultPartialClose,
 
@@ -425,8 +548,12 @@ export const useTradingStore = create<TradingState>()(
         const todayStr = getLocalDateString();
         const todayPnl = updatedHistory[todayStr]?.pnl ?? 0;
 
+        const isLiveAccount = Boolean(get().accountInfo?.isLiveExness || isVaultConfigured(get().credentials));
         const prevBal = get().balance;
-        const updatedBal = prevBal !== null && prevBal > 0 ? Number((prevBal + pnl).toFixed(2)) : null;
+        // Never artificially mutate real broker balance on live Exness
+        const updatedBal = isLiveAccount
+          ? prevBal
+          : (prevBal !== null && prevBal > 0 ? Number((prevBal + pnl).toFixed(2)) : null);
 
         const curPositions = get().openPositions || get().positions || [];
         const totalUnrealized = curPositions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
@@ -782,6 +909,36 @@ export const useTradingStore = create<TradingState>()(
         } catch {}
       },
 
+      setStopLossPips: async (pips: number) => {
+        const valid = Math.max(5, Math.min(500, Math.round(pips)));
+        set({ stopLossPips: valid });
+        try {
+          await fetch('/api/exness', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'sync-state',
+              payload: { stopLossPips: valid },
+            }),
+          });
+        } catch {}
+      },
+
+      setTakeProfitPips: async (pips: number) => {
+        const valid = Math.max(5, Math.min(1000, Math.round(pips)));
+        set({ takeProfitPips: valid });
+        try {
+          await fetch('/api/exness', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              action: 'sync-state',
+              payload: { takeProfitPips: valid },
+            }),
+          });
+        } catch {}
+      },
+
       setAiConfidenceThreshold: (val) => set({ aiConfidenceThreshold: val }),
       setEnablePartialClose: (enabled) => {
         set({ enablePartialClose: enabled });
@@ -820,24 +977,25 @@ export const useTradingStore = create<TradingState>()(
         const curHistory = get().dailyPnlHistory || {};
         const curDailyPnl = curHistory[todayDateStr]?.pnl ?? 0;
 
-        const isConnected = Boolean(get().accountInfo?.connected);
-        const curBal: number | null = isConnected ? (get().accountInfo?.balance ?? get().balance ?? null) : null;
+        const verified = getPersistedVerifiedAccount();
+        const isConnected = Boolean(get().accountInfo?.connected || (hasCreds && verified));
+        const curBal: number | null = get().balance ?? verified?.balance ?? (isConnected ? (get().accountInfo?.balance ?? null) : null);
         const totalUnrealized = curPositions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
-        const curEquity: number | null = isConnected && curBal !== null
+        const curEquity: number | null = (curBal !== null)
           ? (curPositions.length === 0 ? curBal : Number((curBal + totalUnrealized).toFixed(2)))
-          : null;
+          : (verified?.equity ?? null);
 
         set((prev) => ({
           credentials: updated,
           accountMode: updated.accountMode,
-          positions: isConnected ? curPositions : [],
-          openPositions: isConnected ? curPositions : [],
+          positions: curPositions,
+          openPositions: curPositions,
           balance: curBal,
           equity: curEquity,
-          dailyPnl: isConnected && hasCreds ? curDailyPnl : null,
-          accountInfo: isConnected
+          dailyPnl: hasCreds ? curDailyPnl : null,
+          accountInfo: (isConnected || hasCreds)
             ? {
-                accountNumber: activeCreds.accountId || '',
+                accountNumber: activeCreds.accountId || prev.accountInfo?.accountNumber || verified?.accountId || '',
                 server: serverName,
                 currency: 'USD',
                 balance: curBal,
@@ -848,8 +1006,9 @@ export const useTradingStore = create<TradingState>()(
                 dailyRealizedPnL: curDailyPnl,
                 dailyRealizedLossUsd: prev.accountInfo?.dailyRealizedLossUsd || 0,
                 latencyMs: 12,
-                connected: true,
+                connected: Boolean(isConnected || hasCreds),
                 mode: updated.accountMode,
+                isLiveExness: true,
               }
             : {
                 accountNumber: '',
@@ -865,6 +1024,7 @@ export const useTradingStore = create<TradingState>()(
                 latencyMs: 0,
                 connected: false,
                 mode: updated.accountMode,
+                isLiveExness: false,
               },
         }));
         await saveVaultToLocalStorage(updated);
@@ -991,11 +1151,13 @@ export const useTradingStore = create<TradingState>()(
                 token: activeCreds.apiKey,
                 password: activeCreds.password,
                 secret: activeCreds.secret,
+                privateKey: activeCreds.secret,
+                mode: activeCreds.mode || state.accountMode || 'DEMO',
                 initialBalance: activeCreds.initialBalance,
-                currentBalance: state.balance !== null && state.balance > 0 ? state.balance : undefined,
+                currentBalance: state.balance !== null && state.balance > 0 ? state.balance : (getPersistedVerifiedAccount()?.balance ?? undefined),
               },
               payload: {
-                currentBalance: state.balance !== null && state.balance > 0 ? state.balance : undefined,
+                currentBalance: state.balance !== null && state.balance > 0 ? state.balance : (getPersistedVerifiedAccount()?.balance ?? undefined),
                 dailyPnl: liveDailyPnl,
                 positions: (state.openPositions || state.positions || []).filter((p) => p && p.id !== 'F-637' && p.id !== '#F-637'),
               },
@@ -1013,12 +1175,50 @@ export const useTradingStore = create<TradingState>()(
                 snap.dailyPnl ?? data.dailyPnl ?? snap.account?.dailyRealizedPnL ?? liveDailyPnl
               );
 
-              // Server positions synchronization
-              const rawServerPositions = Array.isArray(snap.positions)
-                ? snap.positions
-                : (Array.isArray(snap.openPositions)
-                  ? snap.openPositions
-                  : (Array.isArray(data.positions) ? data.positions : (Array.isArray(data.openPositions) ? data.openPositions : [])));
+              if (liveBal > 0) {
+                savePersistedVerifiedAccount({
+                  accountId: snap.accountId || snap.account?.accountNumber || accountId,
+                  server: snap.server || snap.account?.server || serverName,
+                  balance: liveBal,
+                  equity: liveEquity,
+                  currency: snap.currency || snap.account?.currency || 'USD',
+                  mode: snap.mode || snap.account?.mode || state.accountMode || 'DEMO',
+                  connected: true,
+                  gatewayHost: 'ap-6756732d.exness-api.com',
+                  timestamp: Date.now(),
+                });
+              }
+
+              // Server positions synchronization:
+              // Only update openPositions when the Exness API response explicitly succeeds (ok: true and authenticated: true).
+              // If a poll fails, times out, or returns an unauthenticated fallback response, retain the existing openPositions array in state without wiping #6850606!
+              const isPositionsResponseExplicitSuccess = Boolean(
+                (snap.connected || data.connected) &&
+                (snap.positionsSuccess !== false) &&
+                !snap.positionsError &&
+                (Array.isArray(snap.positions) || Array.isArray(snap.openPositions) || Array.isArray(data.positions) || Array.isArray(data.openPositions))
+              );
+
+              const existingPositions = (state.openPositions || state.positions || []).filter(
+                (p: any) => p && p.id !== 'F-637' && p.id !== '#F-637'
+              );
+
+              let rawServerPositions: any[];
+              if (isPositionsResponseExplicitSuccess) {
+                const incoming = Array.isArray(snap.positions)
+                  ? snap.positions
+                  : (Array.isArray(snap.openPositions)
+                    ? snap.openPositions
+                    : (Array.isArray(data.positions) ? data.positions : data.openPositions));
+                // Extra guard: If incoming is empty but we previously had open positions, verify it is truly a successful empty list from broker
+                if (incoming.length === 0 && existingPositions.length > 0 && snap.positionsSuccess === false) {
+                  rawServerPositions = existingPositions;
+                } else {
+                  rawServerPositions = incoming;
+                }
+              } else {
+                rawServerPositions = existingPositions;
+              }
 
               const cleanServerPositions: ManagedPosition[] = rawServerPositions.filter(
                 (p: any) => p && p.id !== 'F-637' && p.id !== '#F-637'
@@ -1029,9 +1229,19 @@ export const useTradingStore = create<TradingState>()(
 
               const evaluatedPositions = cleanServerPositions.map((pos: any) => {
                 const q = currentQuotes[pos.symbol] || currentPrices[pos.symbol];
-                if (!q) return pos;
-                const curPrice = pos.side === 'BUY' ? q.bid : q.ask;
-                const pnlRes = evaluatePositionPnL(pos, q);
+                const validPrice = getValidLivePrice(pos.symbol);
+                const prof = getPairProfile(pos.symbol);
+                const safeQ = (q && isValidPriceUpdate(pos.symbol, q.bid))
+                  ? q
+                  : {
+                      symbol: pos.symbol,
+                      bid: validPrice,
+                      ask: Number((validPrice + (pos.symbol.startsWith('XAU') ? 0.20 : prof.pipValue)).toFixed(prof.digits)),
+                      spreadPips: pos.symbol.startsWith('XAU') ? 2.0 : 0.8,
+                      timestamp: Date.now(),
+                    };
+                const curPrice = pos.side === 'BUY' ? safeQ.bid : safeQ.ask;
+                const pnlRes = evaluatePositionPnL(pos, safeQ);
                 return {
                   ...pos,
                   currentPrice: curPrice,
@@ -1065,6 +1275,64 @@ export const useTradingStore = create<TradingState>()(
               isFetchingAccountLock = false;
               return;
             } else {
+              const persisted = getPersistedVerifiedAccount();
+              const hasVault = isVaultConfigured(state.credentials);
+              const hasBalance = state.balance !== null && state.balance > 0;
+              if (hasVault || persisted || hasBalance) {
+                // PRESERVE active balance, equity, and positions during transient poll hiccup on serverless
+                const preservedBal = (state.balance !== null && state.balance > 0) ? state.balance : (persisted?.balance ?? null);
+                const preservedPositions = (state.openPositions || state.positions || []).filter(
+                  (p: any) => p && p.id !== 'F-637' && p.id !== '#F-637'
+                );
+                const currentQuotes = get().quotes;
+                const currentPrices = get().symbolPrices || {};
+                const evaluatedPositions = preservedPositions.map((pos: any) => {
+                  const q = currentQuotes[pos.symbol] || currentPrices[pos.symbol];
+                  const validPrice = getValidLivePrice(pos.symbol);
+                  const prof = getPairProfile(pos.symbol);
+                  const safeQ = (q && isValidPriceUpdate(pos.symbol, q.bid))
+                    ? q
+                    : {
+                        symbol: pos.symbol,
+                        bid: validPrice,
+                        ask: Number((validPrice + (pos.symbol.startsWith('XAU') ? 0.20 : prof.pipValue)).toFixed(prof.digits)),
+                        spreadPips: pos.symbol.startsWith('XAU') ? 2.0 : 0.8,
+                        timestamp: Date.now(),
+                      };
+                  const curPrice = pos.side === 'BUY' ? safeQ.bid : safeQ.ask;
+                  const pnlRes = evaluatePositionPnL(pos, safeQ);
+                  return {
+                    ...pos,
+                    currentPrice: curPrice,
+                    unrealizedPnl: pnlRes.pnlUsd,
+                  };
+                });
+                const totalUnrealized = evaluatedPositions.reduce((sum: number, p: any) => sum + (p.unrealizedPnl || 0), 0);
+                const preservedEquity = preservedBal !== null
+                  ? (evaluatedPositions.length === 0 ? preservedBal : Number((preservedBal + totalUnrealized).toFixed(2)))
+                  : (persisted?.equity ?? null);
+
+                set((prev) => ({
+                  balance: preservedBal,
+                  equity: preservedEquity,
+                  positions: evaluatedPositions,
+                  openPositions: evaluatedPositions,
+                  accountInfo: {
+                    ...(prev.accountInfo || defaultAccountInfo),
+                    accountNumber: snap?.accountId || prev.accountInfo?.accountNumber || persisted?.accountId || accountId,
+                    server: snap?.server || prev.accountInfo?.server || persisted?.server || serverName,
+                    currency: snap?.currency || prev.accountInfo?.currency || 'USD',
+                    balance: preservedBal,
+                    equity: preservedEquity,
+                    connected: true,
+                    mode: snap?.mode || prev.accountInfo?.mode || state.accountMode || 'DEMO',
+                    isLiveExness: true,
+                  },
+                }));
+                isFetchingAccountLock = false;
+                return;
+              }
+
               set((prev) => ({
                 balance: null,
                 equity: null,
@@ -1093,6 +1361,63 @@ export const useTradingStore = create<TradingState>()(
           }
         } catch (err) {
           console.warn('fetchAccountInfo error:', err);
+          const persisted = getPersistedVerifiedAccount();
+          const hasVault = isVaultConfigured(state.credentials);
+          const hasBalance = state.balance !== null && state.balance > 0;
+          if (hasVault || persisted || hasBalance) {
+            const preservedBal = (state.balance !== null && state.balance > 0) ? state.balance : (persisted?.balance ?? null);
+            const preservedPositions = (state.openPositions || state.positions || []).filter(
+              (p: any) => p && p.id !== 'F-637' && p.id !== '#F-637'
+            );
+            const currentQuotes = get().quotes;
+            const currentPrices = get().symbolPrices || {};
+            const evaluatedPositions = preservedPositions.map((pos: any) => {
+              const q = currentQuotes[pos.symbol] || currentPrices[pos.symbol];
+              const validPrice = getValidLivePrice(pos.symbol);
+              const prof = getPairProfile(pos.symbol);
+              const safeQ = (q && isValidPriceUpdate(pos.symbol, q.bid))
+                ? q
+                : {
+                    symbol: pos.symbol,
+                    bid: validPrice,
+                    ask: Number((validPrice + (pos.symbol.startsWith('XAU') ? 0.20 : prof.pipValue)).toFixed(prof.digits)),
+                    spreadPips: pos.symbol.startsWith('XAU') ? 2.0 : 0.8,
+                    timestamp: Date.now(),
+                  };
+              const curPrice = pos.side === 'BUY' ? safeQ.bid : safeQ.ask;
+              const pnlRes = evaluatePositionPnL(pos, safeQ);
+              return {
+                ...pos,
+                currentPrice: curPrice,
+                unrealizedPnl: pnlRes.pnlUsd,
+              };
+            });
+            const totalUnrealized = evaluatedPositions.reduce((sum: number, p: any) => sum + (p.unrealizedPnl || 0), 0);
+            const preservedEquity = preservedBal !== null
+              ? (evaluatedPositions.length === 0 ? preservedBal : Number((preservedBal + totalUnrealized).toFixed(2)))
+              : (persisted?.equity ?? null);
+
+            set((prev) => ({
+              balance: preservedBal,
+              equity: preservedEquity,
+              positions: evaluatedPositions,
+              openPositions: evaluatedPositions,
+              accountInfo: {
+                ...(prev.accountInfo || defaultAccountInfo),
+                accountNumber: prev.accountInfo?.accountNumber || persisted?.accountId || accountId,
+                server: prev.accountInfo?.server || persisted?.server || serverName,
+                currency: prev.accountInfo?.currency || 'USD',
+                balance: preservedBal,
+                equity: preservedEquity,
+                connected: true,
+                mode: prev.accountInfo?.mode || state.accountMode || 'DEMO',
+                isLiveExness: true,
+              },
+            }));
+            isFetchingAccountLock = false;
+            return;
+          }
+
           set((prev) => ({
             balance: null,
             equity: null,
@@ -1173,8 +1498,12 @@ export const useTradingStore = create<TradingState>()(
                 accountId: activeCreds.accountId,
                 server: activeCreds.server,
                 token: activeCreds.apiKey,
+                apiKey: activeCreds.apiKey,
+                secret: activeCreds.secret,
+                privateKey: activeCreds.secret,
                 password: activeCreds.password,
                 initialBalance: activeCreds.initialBalance,
+                mode: state.accountMode || 'DEMO',
               },
               payload: { timeframe: get().timeframe || 'M5', limit: 250 },
             }),
@@ -1187,6 +1516,10 @@ export const useTradingStore = create<TradingState>()(
             let serverCandles: Candle[] = json.data;
             const lastServerC = serverCandles[serverCandles.length - 1];
             if (lastServerC && lastServerC.close > 0) {
+              if (!isValidPriceUpdate(targetSymbol, lastServerC.close)) {
+                // Stale or deviated candle data (e.g. 3875 mock seed) - reject to protect chart y-axis
+                return;
+              }
               savePersistedRealPrice(targetSymbol, lastServerC.close);
               updateStoreLastKnownPrice(targetSymbol, lastServerC.close, 'candles');
 
@@ -1255,8 +1588,12 @@ export const useTradingStore = create<TradingState>()(
                 accountId: activeCreds.accountId,
                 server: activeCreds.server,
                 token: activeCreds.apiKey,
+                apiKey: activeCreds.apiKey,
+                secret: activeCreds.secret,
+                privateKey: activeCreds.secret,
                 password: activeCreds.password,
                 initialBalance: activeCreds.initialBalance,
+                mode: state.accountMode || 'DEMO',
               },
             }),
           });
@@ -1265,13 +1602,17 @@ export const useTradingStore = create<TradingState>()(
             if (json.success && json.data) {
               const newQuote: LiveQuote = json.data;
 
-              // Basic sanity check: valid non-zero finite bid price
+              // Basic sanity check: valid non-zero finite bid price and 3% deviation guard
               if (!newQuote || typeof newQuote.bid !== 'number' || isNaN(newQuote.bid) || newQuote.bid <= 0) {
                 return;
               }
 
-              // Overwrite PAIR_BASELINES and lastKnownPrice immediately with live price
               const midPrice = (newQuote.bid + newQuote.ask) / 2;
+              if (!isValidPriceUpdate(targetSymbol, midPrice)) {
+                return;
+              }
+
+              // Overwrite PAIR_BASELINES and lastKnownPrice immediately with live price
               PAIR_BASELINES[targetSymbol] = { price: midPrice, digits: profile.digits, pip: profile.pipValue };
               updateStoreLastKnownPrice(targetSymbol, midPrice, 'live');
               savePersistedRealPrice(targetSymbol, midPrice);
@@ -1335,9 +1676,11 @@ export const useTradingStore = create<TradingState>()(
                 }
 
                 // Single source of truth: recalculate unrealizedPnL for all open positions using live quotes
-                const isConn = Boolean(prev.accountInfo?.connected);
-                const balance: number | null = isConn ? (prev.balance ?? prev.accountInfo?.balance ?? null) : null;
-                const sourcePositions = isConn ? (prev.openPositions || prev.positions || []) : [];
+                const isConn = Boolean(prev.accountInfo?.connected || isVaultConfigured(prev.credentials));
+                const balance: number | null = prev.balance ?? prev.accountInfo?.balance ?? (isConn ? getPersistedVerifiedAccount()?.balance ?? null : null);
+                const sourcePositions = (prev.openPositions && prev.openPositions.length > 0)
+                  ? prev.openPositions
+                  : (prev.positions && prev.positions.length > 0 ? prev.positions : []);
                 const updatedPositions = sourcePositions.map((pos) => {
                   const q = updatedQuotes[pos.symbol] || prev.quotes[pos.symbol];
                   if (!q) return pos;
@@ -1359,8 +1702,8 @@ export const useTradingStore = create<TradingState>()(
                   quotes: updatedQuotes,
                   symbolPrices: updatedSymbolPrices,
                   candles: updatedCandles,
-                  positions: isConn ? updatedPositions : [],
-                  openPositions: isConn ? updatedPositions : [],
+                  positions: updatedPositions,
+                  openPositions: updatedPositions,
                   equity: calculatedEquity,
                   accountInfo: prev.accountInfo
                     ? {
@@ -1506,6 +1849,19 @@ export const useTradingStore = create<TradingState>()(
         const currentOpenPositions = freshState.openPositions || freshState.positions || [];
         if (currentOpenPositions.length === 0) return;
 
+        const liveCreds = getActiveExnessCredentials(freshState.credentials);
+        const credsPayload = {
+          accountId: liveCreds.accountId || '30000143146',
+          server: liveCreds.server,
+          apiKey: liveCreds.apiKey,
+          token: liveCreds.apiKey,
+          secret: liveCreds.secret,
+          privateKey: liveCreds.secret,
+          password: liveCreds.password,
+          mode: liveCreds.mode || freshState.accountMode || 'DEMO',
+          initialBalance: liveCreds.initialBalance,
+        };
+
         let hasModifiedPosition = false;
         const updatedPositions: ManagedPosition[] = [];
 
@@ -1519,29 +1875,39 @@ export const useTradingStore = create<TradingState>()(
 
           const isBuy = pos.side === 'BUY';
           const curPrice = isBuy ? q.bid : q.ask;
-          if (curPrice <= 0 || isNaN(curPrice)) {
+          if (curPrice <= 0 || isNaN(curPrice) || !isValidPriceUpdate(pos.symbol, curPrice)) {
             updatedPositions.push(pos);
             continue;
           }
           pos.currentPrice = curPrice;
+          const isLiveExness = Boolean(freshState.accountInfo?.isLiveExness || isVaultConfigured(freshState.credentials));
 
           // Check Take Profit hit
           if (pos.currentTp > 0 && (isBuy ? curPrice >= pos.currentTp : curPrice <= pos.currentTp)) {
             const pnlData = evaluatePositionPnL(pos, q);
             const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
             get().addTelemetryLog(pos.symbol, 'ORDER', `[TAKE PROFIT HIT] #${pos.id} ${pos.side} @ ${curPrice} (+$${realizedPnl.toFixed(2)})`);
-            get().recordTradePnL(realizedPnl);
+            if (!isLiveExness) {
+              get().recordTradePnL(realizedPnl);
+            }
             fetch('/api/exness', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 action: 'CLOSE_POSITION',
-                credentials: { accountId: getActiveExnessCredentials(freshState.credentials).accountId },
+                credentials: credsPayload,
                 payload: { positionId: pos.id, symbol: pos.symbol },
               }),
+            }).then(() => {
+              get().fetchAccountInfo();
             }).catch(() => {});
             hasModifiedPosition = true;
-            continue;
+            if (!isLiveExness) {
+              continue;
+            } else {
+              updatedPositions.push(pos);
+              continue;
+            }
           }
 
           // Check Stop Loss / Trailing Stop hit
@@ -1549,18 +1915,27 @@ export const useTradingStore = create<TradingState>()(
             const pnlData = evaluatePositionPnL(pos, q);
             const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
             get().addTelemetryLog(pos.symbol, 'ORDER', `[STOP LOSS / TRAILING STOP HIT] #${pos.id} ${pos.side} @ ${curPrice} (${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)})`);
-            get().recordTradePnL(realizedPnl);
+            if (!isLiveExness) {
+              get().recordTradePnL(realizedPnl);
+            }
             fetch('/api/exness', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 action: 'CLOSE_POSITION',
-                credentials: { accountId: getActiveExnessCredentials(freshState.credentials).accountId },
+                credentials: credsPayload,
                 payload: { positionId: pos.id, symbol: pos.symbol },
               }),
+            }).then(() => {
+              get().fetchAccountInfo();
             }).catch(() => {});
             hasModifiedPosition = true;
-            continue;
+            if (!isLiveExness) {
+              continue;
+            } else {
+              updatedPositions.push(pos);
+              continue;
+            }
           }
 
           // Compute ATR(14) and Middle BB for advancing Tight ATR Trailing Stop
@@ -1583,31 +1958,43 @@ export const useTradingStore = create<TradingState>()(
             atr14,
             pairProfile: profile,
             enablePartialClose: freshState.enablePartialClose,
+            stopLossPips: freshState.stopLossPips ?? 25,
           });
 
           if (trailingAction.type === 'HARD_SL_CLOSE') {
             const pnlData = evaluatePositionPnL(pos, q);
             const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
             get().addTelemetryLog(pos.symbol, 'RISK', trailingAction.reason);
-            get().recordTradePnL(realizedPnl);
+            if (!isLiveExness) {
+              get().recordTradePnL(realizedPnl);
+            }
             fetch('/api/exness', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 action: 'CLOSE_POSITION',
-                credentials: { accountId: getActiveExnessCredentials(freshState.credentials).accountId },
+                credentials: credsPayload,
                 payload: { positionId: pos.id, symbol: pos.symbol },
               }),
+            }).then(() => {
+              get().fetchAccountInfo();
             }).catch(() => {});
             hasModifiedPosition = true;
-            continue;
+            if (!isLiveExness) {
+              continue;
+            } else {
+              updatedPositions.push(pos);
+              continue;
+            }
           }
 
           if (trailingAction.type === 'PARTIAL_CLOSE' || trailingAction.type === 'PARTIAL_AND_MODIFY_SL') {
             get().addTelemetryLog(pos.symbol, 'TRAILING', trailingAction.reason);
             const closeVol = trailingAction.closeVolume || (pos.volume * 0.5);
             const partialPnl = Number(evaluatePositionPnL({ ...pos, volume: closeVol }, q).pnlUsd.toFixed(2));
-            get().recordTradePnL(partialPnl);
+            if (!isLiveExness) {
+              get().recordTradePnL(partialPnl);
+            }
             pos.volume = trailingAction.remainingVolume || (pos.volume - closeVol);
             pos.partialClosed = true;
             pos.trailingStatus = trailingAction.statusUpdate;
@@ -1616,7 +2003,7 @@ export const useTradingStore = create<TradingState>()(
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 action: 'CLOSE_POSITION',
-                credentials: { accountId: getActiveExnessCredentials(freshState.credentials).accountId },
+                credentials: credsPayload,
                 payload: { positionId: pos.id, volumeToClose: closeVol, symbol: pos.symbol },
               }),
             }).catch(() => {});
@@ -1633,7 +2020,7 @@ export const useTradingStore = create<TradingState>()(
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   action: 'MODIFY_POSITION',
-                  credentials: { accountId: getActiveExnessCredentials(freshState.credentials).accountId },
+                  credentials: credsPayload,
                   payload: { positionId: pos.id, stopLoss: trailingAction.newSlPrice, symbol: pos.symbol },
                 }),
               }).catch(() => {});
@@ -1645,15 +2032,15 @@ export const useTradingStore = create<TradingState>()(
         }
 
         if (hasModifiedPosition) {
-          const isConn = Boolean(freshState.accountInfo?.connected);
-          const balance = isConn ? (freshState.balance ?? freshState.accountInfo?.balance ?? null) : null;
+          const isConn = Boolean(freshState.accountInfo?.connected || isVaultConfigured(freshState.credentials));
+          const balance = freshState.balance ?? freshState.accountInfo?.balance ?? (isConn ? getPersistedVerifiedAccount()?.balance ?? null : null);
           const totalUnrealized = updatedPositions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
           const calculatedEquity = balance !== null
             ? (updatedPositions.length === 0 ? balance : Number((balance + totalUnrealized).toFixed(2)))
             : null;
           set({
-            positions: isConn ? updatedPositions : [],
-            openPositions: isConn ? updatedPositions : [],
+            positions: updatedPositions,
+            openPositions: updatedPositions,
             equity: calculatedEquity,
           });
         }
@@ -1668,11 +2055,12 @@ export const useTradingStore = create<TradingState>()(
         if (state.isTickRunning) return;
 
         set({ isTickRunning: true });
+        const currentActive = state.focusSymbol || state.selectedSymbol || 'XAUUSDm';
         const symbolsToScan = state.targetMarket === 'GOLD'
           ? ['XAUUSDm']
           : (state.targetMarket === 'FOREX'
-              ? ['EURUSDm', 'GBPUSDm', 'USDJPYm']
-              : (state.isMultiPairMode ? state.scannedSymbols : [state.selectedSymbol]));
+              ? Array.from(new Set([currentActive, 'XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm']))
+              : (state.isMultiPairMode ? state.scannedSymbols : [currentActive]));
         const activeCreds = getActiveExnessCredentials(state.credentials);
         const previousPositions = state.openPositions || state.positions || [];
 
@@ -1685,13 +2073,19 @@ export const useTradingStore = create<TradingState>()(
                 accountId: activeCreds.accountId,
                 server: activeCreds.server,
                 token: activeCreds.apiKey,
+                apiKey: activeCreds.apiKey,
+                secret: activeCreds.secret,
+                privateKey: activeCreds.secret,
                 password: activeCreds.password,
                 initialBalance: activeCreds.initialBalance,
+                mode: state.accountMode || 'DEMO',
               },
               symbols: symbolsToScan,
               targetMarket: state.targetMarket,
               timeframe: state.timeframe || 'M5',
               orderVolume: state.lotSize,
+              stopLossPips: state.stopLossPips ?? 25,
+              takeProfitPips: state.takeProfitPips ?? 50,
               enablePartialClose: state.enablePartialClose,
               activePositions: state.openPositions || state.positions,
               dailyRealizedLossUsd: state.accountInfo?.dailyRealizedLossUsd || 0,
@@ -1944,7 +2338,10 @@ export const useTradingStore = create<TradingState>()(
                 server: activeCreds.server,
                 apiKey: activeCreds.apiKey,
                 token: activeCreds.apiKey,
+                secret: activeCreds.secret,
+                privateKey: activeCreds.secret,
                 password: activeCreds.password,
+                mode: activeCreds.mode || state.accountMode || 'DEMO',
                 initialBalance: activeCreds.initialBalance,
               },
               payload: { positionId, volumeToClose: closeVol, symbol: pos?.symbol },
@@ -1965,15 +2362,30 @@ export const useTradingStore = create<TradingState>()(
 
         get().addTelemetryLog(symbol, 'ORDER', `Submitting manual test ${side} order: ${lot} lots on ${symbol}...`);
 
+        const activeCreds = getActiveExnessCredentials(get().credentials);
         try {
           const res = await fetch('/api/exness', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              ...(activeCreds.apiKey ? { 'Authorization': `Bearer ${activeCreds.apiKey}`, 'x-api-key': activeCreds.apiKey } : {}),
+            },
             body: JSON.stringify({
               action: 'openOrder',
               symbol,
               side,
               lot,
+              credentials: {
+                accountId: activeCreds.accountId || '30000143146',
+                server: activeCreds.server,
+                apiKey: activeCreds.apiKey,
+                token: activeCreds.apiKey,
+                secret: activeCreds.secret,
+                privateKey: activeCreds.secret,
+                password: activeCreds.password,
+                mode: activeCreds.mode || get().accountMode || 'DEMO',
+                initialBalance: activeCreds.initialBalance,
+              },
               payload: {
                 symbol,
                 side,
@@ -1997,7 +2409,8 @@ export const useTradingStore = create<TradingState>()(
           const data = await res.json();
           if ((data.success || data.ok) && (data.data || data.order)) {
             const orderRes = data.data || data.order;
-            const fillPrice = orderRes.fillPrice || (quote ? (side === 'BUY' ? quote.ask : quote.bid) : 3995.00);
+            const fallbackPrice = symbol.startsWith('XAU') ? 4108.90 : (symbol.startsWith('USDJPY') ? 157.569 : (symbol.startsWith('GBPUSD') ? 1.33877 : 1.11592));
+            const fillPrice = orderRes.fillPrice || (quote ? (side === 'BUY' ? quote.ask : quote.bid) : fallbackPrice);
 
             // Required telemetry log
             get().addTelemetryLog(
@@ -2130,7 +2543,10 @@ export const useTradingStore = create<TradingState>()(
                 server: activeCreds.server,
                 apiKey: activeCreds.apiKey,
                 token: activeCreds.apiKey,
+                secret: activeCreds.secret,
+                privateKey: activeCreds.secret,
                 password: activeCreds.password,
+                mode: activeCreds.mode || state.accountMode || 'DEMO',
                 initialBalance: activeCreds.initialBalance,
               },
               payload: { positions: curPositions },
@@ -2180,11 +2596,26 @@ export const useTradingStore = create<TradingState>()(
           const localPositions = isConn ? (get().openPositions || get().positions || []) : [];
           const curBal = isConn ? (get().balance ?? get().accountInfo?.balance ?? null) : null;
 
+          const activeCreds = getActiveExnessCredentials(get().credentials);
           const res = await fetch('/api/exness', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              ...(activeCreds.apiKey ? { 'Authorization': `Bearer ${activeCreds.apiKey}`, 'x-api-key': activeCreds.apiKey } : {}),
+            },
             body: JSON.stringify({
               action: 'sync-state',
+              credentials: {
+                accountId: activeCreds.accountId || '30000143146',
+                server: activeCreds.server,
+                apiKey: activeCreds.apiKey,
+                token: activeCreds.apiKey,
+                secret: activeCreds.secret,
+                privateKey: activeCreds.secret,
+                password: activeCreds.password,
+                mode: activeCreds.mode || get().accountMode || 'DEMO',
+                initialBalance: activeCreds.initialBalance,
+              },
               payload: {
                 positions: localPositions,
                 currentBalance: curBal,
@@ -2254,8 +2685,9 @@ export const useTradingStore = create<TradingState>()(
             : (Array.isArray(state.positions) && state.positions.length > 0 ? state.positions : []);
           const curPositions = rawCurPositions.filter((p) => p && p.id !== 'F-637' && p.id !== '#F-637');
 
-          const isConn = Boolean(state.accountInfo?.connected);
-          let resolvedBal: number | null = isConn ? (state.accountInfo?.balance ?? state.balance ?? null) : null;
+          const verified = getPersistedVerifiedAccount();
+          const isConn = Boolean(state.accountInfo?.connected || (hasCreds && verified));
+          let resolvedBal: number | null = state.accountInfo?.balance ?? state.balance ?? verified?.balance ?? null;
           if (resolvedBal !== null && (resolvedBal < 0 || resolvedBal === 500 || resolvedBal === 100)) {
             resolvedBal = null;
           }
@@ -2263,21 +2695,21 @@ export const useTradingStore = create<TradingState>()(
           const totalUnrealized = curPositions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
           const resolvedEquity: number | null = resolvedBal !== null
             ? (curPositions.length === 0 ? resolvedBal : Number((resolvedBal + totalUnrealized).toFixed(2)))
-            : null;
-          const resolvedDailyPnl: number | null = isConn ? curDailyPnl : null;
+            : (verified?.equity ?? null);
+          const resolvedDailyPnl: number | null = (isConn || hasCreds) ? curDailyPnl : null;
 
           // Immediately sync balance, equity, and connection status into store (<1ms)
           set((prev) => ({
             credentials: saved,
             accountMode: saved.accountMode || prev.accountMode || 'DEMO',
-            positions: isConn ? curPositions : [],
-            openPositions: isConn ? curPositions : [],
+            positions: curPositions,
+            openPositions: curPositions,
             balance: resolvedBal,
             equity: resolvedEquity,
             dailyPnl: resolvedDailyPnl,
-            accountInfo: isConn
+            accountInfo: (isConn || hasCreds)
               ? {
-                  accountNumber: activeCreds.accountId || prev.accountInfo?.accountNumber || '',
+                  accountNumber: activeCreds.accountId || prev.accountInfo?.accountNumber || verified?.accountId || '',
                   server: serverName,
                   currency: 'USD',
                   balance: resolvedBal,
@@ -2290,6 +2722,7 @@ export const useTradingStore = create<TradingState>()(
                   latencyMs: 12,
                   connected: true,
                   mode: saved.accountMode || prev.accountMode || 'DEMO',
+                  isLiveExness: true,
                 }
               : {
                   accountNumber: '',
@@ -2308,7 +2741,9 @@ export const useTradingStore = create<TradingState>()(
                 },
           }));
 
-          get().addTelemetryLog('VAULT', 'INFO', `[SECURITY] Decrypted credentials loaded from AES-256 Vault (${saved.accountMode || 'DEMO'} Mode)`);
+          if (get().telemetryLogs.every((l) => !l.message.includes('AES-256 Vault'))) {
+            get().addTelemetryLog('VAULT', 'INFO', `[SECURITY] Decrypted credentials loaded from AES-256 Vault (${saved.accountMode || 'DEMO'} Mode)`);
+          }
 
           // Reset throttle lock so immediate live account verification succeeds
           lastAccountFetchTime = 0;
@@ -2364,6 +2799,8 @@ export const useTradingStore = create<TradingState>()(
         isMultiPairMode: state.isMultiPairMode,
         scannedSymbols: state.scannedSymbols,
         lotSize: state.lotSize,
+        stopLossPips: state.stopLossPips,
+        takeProfitPips: state.takeProfitPips,
         aiConfidenceThreshold: state.aiConfidenceThreshold,
         enablePartialClose: state.enablePartialClose,
         credentials: state.credentials,
@@ -2386,8 +2823,11 @@ export const useTradingStore = create<TradingState>()(
           rehydratedState.openPositions = valid;
           rehydratedState.positions = valid;
 
-          const isConn = Boolean(rehydratedState.accountInfo?.connected);
-          if (!isConn) {
+          const verifiedAcc = getPersistedVerifiedAccount();
+          const hasVaultCreds = isVaultConfigured(rehydratedState.credentials);
+          const isConn = Boolean(rehydratedState.accountInfo?.connected || (hasVaultCreds && verifiedAcc));
+
+          if (!isConn && !hasVaultCreds) {
             rehydratedState.balance = null;
             rehydratedState.equity = null;
             rehydratedState.dailyPnl = null;
@@ -2400,19 +2840,23 @@ export const useTradingStore = create<TradingState>()(
               rehydratedState.accountInfo.margin = 0;
             }
           } else {
-            const isCorrupted = typeof rehydratedState.balance === 'number' && (rehydratedState.balance < 0 || rehydratedState.balance === 500 || rehydratedState.balance === 100);
-            if (isCorrupted) {
-              rehydratedState.balance = null;
-              rehydratedState.equity = null;
-              rehydratedState.dailyPnl = null;
+            if (rehydratedState.balance === null && verifiedAcc && verifiedAcc.balance > 0) {
+              rehydratedState.balance = verifiedAcc.balance;
+              rehydratedState.equity = verifiedAcc.equity || verifiedAcc.balance;
+            }
+            if (rehydratedState.accountInfo && (isConn || hasVaultCreds)) {
+              rehydratedState.accountInfo.connected = true;
+              rehydratedState.accountInfo.balance = rehydratedState.balance;
+              rehydratedState.accountInfo.equity = rehydratedState.equity;
+              rehydratedState.accountInfo.isLiveExness = true;
             }
 
-            const valid = (Array.isArray(rehydratedState.openPositions)
-              ? rehydratedState.openPositions
-              : (Array.isArray(rehydratedState.positions) ? rehydratedState.positions : [])
-            ).filter((p: any) => p && p.id !== 'F-637' && p.id !== '#F-637');
-            rehydratedState.openPositions = valid;
-            rehydratedState.positions = valid;
+            const isCorrupted = typeof rehydratedState.balance === 'number' && (rehydratedState.balance < 0 || rehydratedState.balance === 500 || rehydratedState.balance === 100);
+            if (isCorrupted) {
+              rehydratedState.balance = verifiedAcc?.balance ?? null;
+              rehydratedState.equity = verifiedAcc?.equity ?? null;
+              rehydratedState.dailyPnl = null;
+            }
 
             const todayStr = getLocalDateString();
             const todayPnl = rehydratedState.dailyPnlHistory[todayStr]?.pnl ?? rehydratedState.dailyPnl ?? 0;

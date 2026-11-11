@@ -35,7 +35,7 @@ export const TradingChart: React.FC = () => {
   const [panOffset, setPanOffset] = useState<number>(0);
 
   const maxPan = Math.max(0, candles.length - visibleCandleCount);
-  const safePan = Math.max(0, Math.min(panOffset, maxPan));
+  const safePan = panOffset <= 5 ? 0 : Math.max(0, Math.min(panOffset, maxPan));
 
   // Reset pan offset when switching symbol or timeframe
   useEffect(() => {
@@ -139,7 +139,9 @@ export const TradingChart: React.FC = () => {
   // Touch and mouse drag/pinch state tracking
   const isDraggingRef = useRef(false);
   const dragStartXRef = useRef(0);
+  const dragStartYRef = useRef(0);
   const dragStartPanRef = useRef(0);
+  const touchGestureDirectionRef = useRef<'horizontal' | 'vertical' | null>(null);
 
   const isPinchingRef = useRef(false);
   const pinchStartDistRef = useRef(0);
@@ -208,11 +210,14 @@ export const TradingChart: React.FC = () => {
       if (e.touches.length === 1) {
         isDraggingRef.current = true;
         isPinchingRef.current = false;
+        touchGestureDirectionRef.current = null;
         dragStartXRef.current = e.touches[0].clientX;
+        dragStartYRef.current = e.touches[0].clientY;
         dragStartPanRef.current = panOffset;
       } else if (e.touches.length === 2) {
         isDraggingRef.current = false;
         isPinchingRef.current = true;
+        touchGestureDirectionRef.current = null;
         const dist = Math.hypot(
           e.touches[0].clientX - e.touches[1].clientX,
           e.touches[0].clientY - e.touches[1].clientY
@@ -235,15 +240,38 @@ export const TradingChart: React.FC = () => {
           setVisibleCandleCount(Math.max(15, Math.min(150, nextCount)));
         }
       } else if (isDraggingRef.current && e.touches.length === 1) {
+        const deltaX = e.touches[0].clientX - dragStartXRef.current;
+        const deltaY = e.touches[0].clientY - dragStartYRef.current;
+        const absX = Math.abs(deltaX);
+        const absY = Math.abs(deltaY);
+
+        // Disambiguate vertical page scrolling from intentional horizontal chart panning
+        if (!touchGestureDirectionRef.current) {
+          if (absY > 8 && absY >= absX) {
+            touchGestureDirectionRef.current = 'vertical';
+          } else if (absX > 20 && absX > absY * 2.2) {
+            touchGestureDirectionRef.current = 'horizontal';
+          }
+        }
+
+        // If user is scrolling vertically or hasn't decisively dragged horizontally, strictly DO NOT pan chart!
+        if (touchGestureDirectionRef.current !== 'horizontal') {
+          return;
+        }
+
         e.preventDefault();
-        const dx = e.touches[0].clientX - dragStartXRef.current;
         const width = sizeRef.current.width || container.clientWidth || 360;
         const rightAxisWidth = width < 540 ? 56 : 70;
         const mainChartWidth = Math.max(100, width - rightAxisWidth);
         const candleSlotWidth = Math.max(2, mainChartWidth / visibleCandleCount);
-        const candleDelta = Math.round(dx / candleSlotWidth);
+        const candleDelta = Math.round(deltaX / candleSlotWidth);
         const maxP = Math.max(0, candles.length - visibleCandleCount);
-        const nextPan = Math.max(0, Math.min(maxP, dragStartPanRef.current + candleDelta));
+        let nextPan = Math.max(0, Math.min(maxP, dragStartPanRef.current + candleDelta));
+
+        // Auto-lock to live edge if within <= 5 bars of live edge
+        if (nextPan <= 5) {
+          nextPan = 0;
+        }
         setPanOffset(nextPan);
       }
     };
@@ -251,6 +279,9 @@ export const TradingChart: React.FC = () => {
     const handleTouchEnd = () => {
       isDraggingRef.current = false;
       isPinchingRef.current = false;
+      touchGestureDirectionRef.current = null;
+      // Auto-snap back to 0 (LIVE) if released within <= 5 bars of live edge
+      setPanOffset((prev) => (prev <= 5 ? 0 : prev));
     };
 
     container.addEventListener('touchstart', handleTouchStart, { passive: true });
@@ -285,11 +316,12 @@ export const TradingChart: React.FC = () => {
     const candleDelta = Math.round(dx / candleSlotWidth);
     const maxP = Math.max(0, candles.length - visibleCandleCount);
     const nextPan = Math.max(0, Math.min(maxP, dragStartPanRef.current + candleDelta));
-    setPanOffset(nextPan);
+    setPanOffset(nextPan <= 5 ? 0 : nextPan);
   };
 
   const handleMouseUp = () => {
     isDraggingRef.current = false;
+    setPanOffset((prev) => (prev <= 5 ? 0 : prev));
   };
 
   useEffect(() => {
@@ -333,7 +365,7 @@ export const TradingChart: React.FC = () => {
     // Validate if candles match the current activeSymbol to prevent cross-symbol price desync
     const isGold = profile.symbol === 'XAUUSDm';
     const isStaleData = candles.length > 0 && (
-      (isGold && candles[0].close < 1000) ||
+      (isGold && (candles[0].close < 1000 || candles[0].close > 10000 || Math.abs(candles[0].close - 3875.70) < 1.0)) ||
       (!isGold && profile.symbol !== 'USDJPYm' && candles[0].close > 50) ||
       (profile.symbol === 'USDJPYm' && (candles[0].close < 50 || candles[0].close > 500))
     );
@@ -341,14 +373,14 @@ export const TradingChart: React.FC = () => {
     // Instant Lightweight Skeleton Renderer: Clear canvas instantly & render new symbol's scale without locking main thread
     if (candles.length < 2 || isStaleData) {
       const baselines: Record<string, number> = {
-        XAUUSDm: 3875.70,
+        XAUUSDm: 4108.90,
         EURUSDm: 1.11592,
         GBPUSDm: 1.33877,
         USDJPYm: 157.569,
       };
       const baseline = (currentQuote && currentQuote.symbol === activeSymbol && currentQuote.bid > 0)
         ? currentQuote.bid
-        : (baselines[activeSymbol] || (profile.digits === 5 ? 1.11592 : profile.digits === 3 ? 157.569 : 3875.70));
+        : (baselines[activeSymbol] || (profile.digits === 5 ? 1.11592 : profile.digits === 3 ? 157.569 : 4108.90));
 
       const skeletonRange = profile.pipValue * (isGold ? 50 : 30);
       const sMinPrice = baseline - skeletonRange / 2;
@@ -514,6 +546,9 @@ export const TradingChart: React.FC = () => {
 
     for (let i = 0; i < visibleCandles.length; i++) {
       const c = visibleCandles[i];
+      if (isGold && (c.low < 1000 || c.high > 10000 || Math.abs(c.close - 3875.70) < 1.0)) {
+        continue;
+      }
       if (c.low < minPrice) minPrice = c.low;
       if (c.high > maxPrice) maxPrice = c.high;
 
@@ -551,10 +586,20 @@ export const TradingChart: React.FC = () => {
 
     // Include live Bid/Ask quote in price bounds so price line and candle close never clip
     if (currentQuote && currentQuote.symbol === activeSymbol && currentQuote.bid > 0) {
-      if (currentQuote.bid < minPrice) minPrice = currentQuote.bid;
-      if (currentQuote.bid > maxPrice) maxPrice = currentQuote.bid;
-      if (currentQuote.ask < minPrice) minPrice = currentQuote.ask;
-      if (currentQuote.ask > maxPrice) maxPrice = currentQuote.ask;
+      const isQuoteValid = !isGold || (currentQuote.bid >= 1000 && currentQuote.bid <= 10000 && Math.abs(currentQuote.bid - 3875.70) > 1.0);
+      if (isQuoteValid) {
+        if (currentQuote.bid < minPrice) minPrice = currentQuote.bid;
+        if (currentQuote.bid > maxPrice) maxPrice = currentQuote.bid;
+        if (currentQuote.ask < minPrice) minPrice = currentQuote.ask;
+        if (currentQuote.ask > maxPrice) maxPrice = currentQuote.ask;
+      }
+    }
+
+    if (!isFinite(minPrice) || !isFinite(maxPrice) || minPrice >= maxPrice) {
+      const fallbackPrice = (currentQuote && currentQuote.bid > 0) ? currentQuote.bid : (profile.digits === 5 ? 1.11592 : profile.digits === 3 ? 157.569 : 4108.90);
+      const range = profile.pipValue * (isGold ? 50 : 30);
+      minPrice = fallbackPrice - range / 2;
+      maxPrice = fallbackPrice + range / 2;
     }
 
     // Padding
@@ -1112,10 +1157,11 @@ export const TradingChart: React.FC = () => {
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
+        style={{ touchAction: 'pan-y' }}
         className="relative flex-1 min-h-[360px] sm:min-h-[400px] w-full max-w-full overflow-hidden bg-white dark:bg-zinc-950 cursor-grab active:cursor-grabbing select-none transition-colors"
       >
         {(candles.length < 2 || (candles.length > 0 && (
-          (activeSymbol === 'XAUUSDm' && candles[0].close < 1000) ||
+          (activeSymbol === 'XAUUSDm' && (candles[0].close < 1000 || candles[0].close > 10000 || Math.abs(candles[0].close - 3875.70) < 1.0)) ||
           (activeSymbol !== 'XAUUSDm' && activeSymbol !== 'USDJPYm' && candles[0].close > 100) ||
           (activeSymbol === 'USDJPYm' && (candles[0].close < 50 || candles[0].close > 300))
         ))) && (

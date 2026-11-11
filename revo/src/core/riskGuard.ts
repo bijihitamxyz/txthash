@@ -482,7 +482,7 @@ export function calculateForexLotSize(params: {
   const safeLot = Math.max(minLot, Number(stepped.toFixed(2)));
 
   if (params.defaultLot !== undefined && params.defaultLot > 0) {
-    return Number(Math.min(params.defaultLot, safeLot).toFixed(2));
+    return Math.max(minLot, Number(params.defaultLot.toFixed(2)));
   }
   return safeLot;
 }

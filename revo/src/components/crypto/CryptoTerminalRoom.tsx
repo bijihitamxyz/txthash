@@ -6,15 +6,16 @@ import { useRoomStore } from '@/store/useRoomStore';
 
 export interface CryptoTerminalRoomProps {
   onSwitchToForex?: () => void;
+  isActiveRoom?: boolean;
 }
 
-export const CryptoTerminalRoom: React.FC<CryptoTerminalRoomProps> = ({ onSwitchToForex }) => {
+export const CryptoTerminalRoom: React.FC<CryptoTerminalRoomProps> = ({ onSwitchToForex, isActiveRoom = true }) => {
   const setActiveRoom = useRoomStore((s) => s.setActiveRoom);
   const handleSwitchToForex = onSwitchToForex || (() => setActiveRoom('FOREX'));
 
   return (
     <div className="flex flex-1 w-full min-h-0">
-      <BinanceFuturesRoom onSwitchToForex={handleSwitchToForex} />
+      <BinanceFuturesRoom onSwitchToForex={handleSwitchToForex} isActiveRoom={isActiveRoom} />
     </div>
   );
 };

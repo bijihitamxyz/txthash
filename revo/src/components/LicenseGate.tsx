@@ -1,6 +1,6 @@
 'use client';
 
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { InstitutionalFooter, ThemeToggle } from './InstitutionalChrome';
 import {
   ShieldCheck,
@@ -79,7 +79,7 @@ function buildValidatedLicense(data: any, fallbackKey: string): LicenseInfo {
 
 export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [license, setLicense] = useState<LicenseInfo | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState<boolean>(false);
   const [authTab, setAuthTab] = useState<'LOGIN' | 'REGISTER'>('LOGIN');
 
   // Login via Key state
@@ -95,9 +95,14 @@ export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children 
   const [registeredLicense, setRegisteredLicense] = useState<LicenseInfo | null>(null);
   const [copiedKey, setCopiedKey] = useState(false);
 
+  const licenseRef = useRef(license);
+  useEffect(() => {
+    licenseRef.current = license;
+  }, [license]);
+
   const reverify = useCallback(
     async (keyToVerify?: string): Promise<boolean> => {
-      const key = keyToVerify || license?.licenseKey;
+      const key = keyToVerify || licenseRef.current?.licenseKey;
       if (!key) return false;
 
       try {
@@ -115,7 +120,8 @@ export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children 
             localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(validatedLicense));
           }
           return true;
-        } else {
+        } else if (res.status === 401 || data.status === 'REVOKED' || data.status === 'EXPIRED') {
+          // Explicitly revoked or expired by server
           if (typeof window !== 'undefined') {
             localStorage.removeItem(LOCAL_STORAGE_KEY);
           }
@@ -123,15 +129,16 @@ export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children 
           setErrorMessage(data.message || 'Access key is invalid, revoked, or expired.');
           return false;
         }
+        return false;
       } catch {
-        setErrorMessage('Unable to reach license verification service. Check connection.');
+        // Network timeout / connection error -> preserve cached valid session
         return false;
       }
     },
-    [license?.licenseKey]
+    []
   );
 
-  // Initial check on mount
+  // Initial check on mount: instantly restore cached session without stalling on loading screen
   useEffect(() => {
     let isMounted = true;
 
@@ -151,14 +158,24 @@ export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children 
           return;
         }
 
+        // If local cache is valid and not expired, unlock immediately!
+        if (calculateRemainingDays(parsed.expiresAt) > 0) {
+          if (isMounted) {
+            setLicense(parsed);
+            setIsLoading(false);
+          }
+          // Re-verify in background without stalling UI
+          reverify(parsed.licenseKey).catch(() => {});
+          return;
+        }
+
+        // Only block/await if local cache was expired
         const isValid = await reverify(parsed.licenseKey);
         if (!isValid && isMounted) {
           localStorage.removeItem(LOCAL_STORAGE_KEY);
         }
       } catch {
-        if (typeof window !== 'undefined') {
-          localStorage.removeItem(LOCAL_STORAGE_KEY);
-        }
+        // preserve cache on unexpected error
       } finally {
         if (isMounted) {
           setIsLoading(false);
@@ -311,7 +328,13 @@ export const LicenseGate: React.FC<{ children: React.ReactNode }> = ({ children 
   }
 
   // Authenticated: unlock Client Terminal
-  if (license && license.valid) {
+  if (
+    license &&
+    license.valid &&
+    remainingDays > 0 &&
+    license.status !== 'REVOKED' &&
+    license.status !== 'EXPIRED'
+  ) {
     return (
       <LicenseContext.Provider
         value={{

@@ -138,177 +138,201 @@ interface EvaluatedSetup {
  * SELL: Price < EMA200 (or EMA200 slope is falling), price rallies near/above Middle BB within last 3 candles,
  *       RSI(14) between 42 and 65 curling down, C0 or C1 is bearish.
  */
-function evaluateSetupA(indicators: IndicatorSnapshot, pairProfile: PairProfile): { buy: EvaluatedSetup; sell: EvaluatedSetup } {
+function evaluateSetupA(
+  indicators: IndicatorSnapshot,
+  pairProfile: PairProfile,
+  isBearishRegimeHint?: boolean,
+  isBullishRegimeHint?: boolean
+): { buy: EvaluatedSetup; sell: EvaluatedSetup } {
   const { c0, c1, c2, ema200Slope, divergence } = indicators;
   const digits = pairProfile.digits;
+
+  const isPriceAboveEma = c0.candle.close >= c0.ema200;
+  const isPriceBelowEma = c0.candle.close < c0.ema200;
+  const isEmaRising = ema200Slope >= 0 || c0.ema200 >= c1.ema200;
+  const isEmaFalling = ema200Slope <= 0 || c0.ema200 <= c1.ema200;
+
+  // Align Setup A strictly with market regime:
+  // If regime is Bearish (Price < EMA200 or Bearish hint), Setup A Trend Pullback strictly seeks SELL, not BUY!
+  const isBearishTrend = isBearishRegimeHint ?? isPriceBelowEma;
+  const isBullishTrend = isBullishRegimeHint ?? isPriceAboveEma;
 
   // --- BUY EVALUATION ---
   let buyScore = 0;
   const buyReasons: string[] = [];
-  let buyWaiting = 'Waiting for bullish/bearish trigger candle';
+  let buyWaiting = 'Waiting for bullish trigger candle';
 
-  const isPriceAboveEma = c0.candle.close > c0.ema200;
-  const isEmaRising = ema200Slope >= 0 || c0.ema200 >= c1.ema200;
-  const trendBuyAligned = isPriceAboveEma || isEmaRising;
-
-  if (isPriceAboveEma && isEmaRising) {
-    buyScore += 30;
-    buyReasons.push(`Trend Alignment: Price (${formatPrice(c0.candle.close, digits)}) > EMA200 (${formatPrice(c0.ema200, digits)}) & EMA200 rising (+30pts)`);
-  } else if (isPriceAboveEma) {
-    buyScore += 22;
-    buyReasons.push(`Trend Alignment: Price > EMA200 (+22pts)`);
-  } else if (isEmaRising) {
-    buyScore += 18;
-    buyReasons.push(`Trend Alignment: EMA200 slope rising (+18pts)`);
-  }
-
-  // Middle BB Pullback within last 3 candles
-  const minLow3 = Math.min(c0.candle.low, c1.candle.low, c2.candle.low);
-  const minClose3 = Math.min(c0.candle.close, c1.candle.close, c2.candle.close);
-  const isBelowMidBB = minLow3 <= c0.middleBB;
-  const isNearMidBB = minLow3 <= c0.middleBB * 1.002 || minClose3 <= c0.middleBB * 1.0025;
-
-  if (isBelowMidBB) {
-    buyScore += 25;
-    buyReasons.push(`Middle BB Pullback: Candle low (${formatPrice(minLow3, digits)}) pierced/bounced below Middle BB (${formatPrice(c0.middleBB, digits)}) (+25pts)`);
-  } else if (isNearMidBB) {
-    buyScore += 20;
-    buyReasons.push(`Middle BB Pullback: Candle low (${formatPrice(minLow3, digits)}) pulled back within 0.2% of Middle BB (+20pts)`);
-  }
-
-  // RSI(14) 35 - 58 and curling up
-  const rsiInRangeBuy = c0.rsi >= 35 && c0.rsi <= 58;
-  const rsiCurlingUp = c0.rsi > c1.rsi;
-
-  if (rsiInRangeBuy && rsiCurlingUp) {
-    buyScore += 25;
-    buyReasons.push(`RSI Pullback & Curl: RSI ${c0.rsi.toFixed(1)} in [35, 58] and curling up (+${(c0.rsi - c1.rsi).toFixed(1)}) (+25pts)`);
-  } else if (rsiInRangeBuy) {
-    buyScore += 15;
-    buyReasons.push(`RSI Pullback: RSI ${c0.rsi.toFixed(1)} in [35, 58] (+15pts)`);
-  } else if (rsiCurlingUp && c0.rsi >= 30 && c0.rsi <= 62) {
-    buyScore += 12;
-    buyReasons.push(`RSI Curling Up: RSI ${c0.rsi.toFixed(1)} curling up (+12pts)`);
-  }
-
-  // Trigger Candle: C0 or C1 bullish
-  const isC0Bullish = c0.candle.close > c0.candle.open;
-  const isC1Bullish = c1.candle.close > c1.candle.open;
-
-  if (isC0Bullish) {
-    buyScore += 15;
-    buyReasons.push(`Trigger Candle: Current C0 is bullish close > open (+15pts)`);
-    if (c0.lowerWickRatio >= 0.25) {
-      buyScore += 5;
-      buyReasons.push(`Wick Confluence: C0 lower absorption wick ${c0.lowerWickRatio.toFixed(2)} (+5pts)`);
+  if (isBearishTrend) {
+    buyScore = 0;
+    buyWaiting = 'Setup A Trend Pullback strictly emits SELL in Bearish regime (Price < EMA200)';
+    buyReasons.push(`Regime Alignment Veto: Price < EMA200 denotes Bearish regime. Setup A Trend Pullback strictly emits SELL.`);
+  } else {
+    const trendBuyAligned = isPriceAboveEma && isEmaRising;
+    if (isPriceAboveEma && isEmaRising) {
+      buyScore += 30;
+      buyReasons.push(`Trend Alignment: Price (${formatPrice(c0.candle.close, digits)}) > EMA200 (${formatPrice(c0.ema200, digits)}) & EMA200 rising (+30pts)`);
+    } else if (isPriceAboveEma) {
+      buyScore += 22;
+      buyReasons.push(`Trend Alignment: Price > EMA200 (+22pts)`);
+    } else if (isEmaRising) {
+      buyScore += 14;
+      buyReasons.push(`Trend Alignment: EMA200 slope rising (+14pts)`);
     }
-  } else if (isC1Bullish) {
-    buyScore += 10;
-    buyReasons.push(`Trigger Candle: Prior C1 is bullish (+10pts)`);
-  }
 
-  // Bonus: Hidden or Regular Bullish Divergence
-  if (divergence.detected && divergence.bullishDivergence) {
-    buyScore += 10;
-    buyReasons.push(`Divergence Confluence: Bullish divergence active (+10pts)`);
-  }
+    // Middle BB Pullback within last 3 candles
+    const minLow3 = Math.min(c0.candle.low, c1.candle.low, c2.candle.low);
+    const minClose3 = Math.min(c0.candle.close, c1.candle.close, c2.candle.close);
+    const isBelowMidBB = minLow3 <= c0.middleBB;
+    const isNearMidBB = minLow3 <= c0.middleBB * 1.002 || minClose3 <= c0.middleBB * 1.0025;
 
-  // Waiting condition diagnosis for BUY
-  if (!trendBuyAligned) {
-    buyWaiting = 'Waiting for Price > EMA200 or rising slope';
-  } else if (!isNearMidBB) {
-    buyWaiting = 'Waiting for Middle BB pullback';
-  } else if (!rsiCurlingUp) {
-    buyWaiting = 'Waiting for RSI upward curl';
-  } else if (!isC0Bullish && !isC1Bullish) {
-    buyWaiting = 'Waiting for bullish trigger candle';
-  } else if (!rsiInRangeBuy) {
-    buyWaiting = `Waiting for RSI in [35, 58] range (current ${c0.rsi.toFixed(1)})`;
+    if (isBelowMidBB) {
+      buyScore += 25;
+      buyReasons.push(`Middle BB Pullback: Candle low (${formatPrice(minLow3, digits)}) pierced/bounced below Middle BB (${formatPrice(c0.middleBB, digits)}) (+25pts)`);
+    } else if (isNearMidBB) {
+      buyScore += 20;
+      buyReasons.push(`Middle BB Pullback: Candle low (${formatPrice(minLow3, digits)}) pulled back within 0.2% of Middle BB (+20pts)`);
+    }
+
+    // RSI(14) 35 - 58 and curling up
+    const rsiInRangeBuy = c0.rsi >= 35 && c0.rsi <= 58;
+    const rsiCurlingUp = c0.rsi > c1.rsi;
+
+    if (rsiInRangeBuy && rsiCurlingUp) {
+      buyScore += 25;
+      buyReasons.push(`RSI Pullback & Curl: RSI ${c0.rsi.toFixed(1)} in [35, 58] and curling up (+${(c0.rsi - c1.rsi).toFixed(1)}) (+25pts)`);
+    } else if (rsiInRangeBuy) {
+      buyScore += 15;
+      buyReasons.push(`RSI Pullback: RSI ${c0.rsi.toFixed(1)} in [35, 58] (+15pts)`);
+    } else if (rsiCurlingUp && c0.rsi >= 30 && c0.rsi <= 62) {
+      buyScore += 12;
+      buyReasons.push(`RSI Curling Up: RSI ${c0.rsi.toFixed(1)} curling up (+12pts)`);
+    }
+
+    // Trigger Candle: C0 or C1 bullish
+    const isC0Bullish = c0.candle.close > c0.candle.open;
+    const isC1Bullish = c1.candle.close > c1.candle.open;
+
+    if (isC0Bullish) {
+      buyScore += 15;
+      buyReasons.push(`Trigger Candle: Current C0 is bullish close > open (+15pts)`);
+      if (c0.lowerWickRatio >= 0.25) {
+        buyScore += 5;
+        buyReasons.push(`Wick Confluence: C0 lower absorption wick ${c0.lowerWickRatio.toFixed(2)} (+5pts)`);
+      }
+    } else if (isC1Bullish) {
+      buyScore += 10;
+      buyReasons.push(`Trigger Candle: Prior C1 is bullish (+10pts)`);
+    }
+
+    // Bonus: Hidden or Regular Bullish Divergence
+    if (divergence.detected && divergence.bullishDivergence) {
+      buyScore += 10;
+      buyReasons.push(`Divergence Confluence: Bullish divergence active (+10pts)`);
+    }
+
+    // Waiting condition diagnosis for BUY
+    if (!trendBuyAligned && !isPriceAboveEma) {
+      buyWaiting = 'Waiting for Price > EMA200';
+    } else if (!isNearMidBB) {
+      buyWaiting = 'Waiting for Middle BB pullback';
+    } else if (!rsiCurlingUp) {
+      buyWaiting = 'Waiting for RSI upward curl';
+    } else if (!isC0Bullish && !isC1Bullish) {
+      buyWaiting = 'Waiting for bullish trigger candle';
+    } else if (!rsiInRangeBuy) {
+      buyWaiting = `Waiting for RSI in [35, 58] range (current ${c0.rsi.toFixed(1)})`;
+    }
   }
 
   // --- SELL EVALUATION ---
   let sellScore = 0;
   const sellReasons: string[] = [];
-  let sellWaiting = 'Waiting for bullish/bearish trigger candle';
+  let sellWaiting = 'Waiting for bearish trigger candle';
 
-  const isPriceBelowEma = c0.candle.close < c0.ema200;
-  const isEmaFalling = ema200Slope <= 0 || c0.ema200 <= c1.ema200;
-  const trendSellAligned = isPriceBelowEma || isEmaFalling;
-
-  if (isPriceBelowEma && isEmaFalling) {
-    sellScore += 30;
-    sellReasons.push(`Trend Alignment: Price (${formatPrice(c0.candle.close, digits)}) < EMA200 (${formatPrice(c0.ema200, digits)}) & EMA200 falling (+30pts)`);
-  } else if (isPriceBelowEma) {
-    sellScore += 22;
-    sellReasons.push(`Trend Alignment: Price < EMA200 (+22pts)`);
-  } else if (isEmaFalling) {
-    sellScore += 18;
-    sellReasons.push(`Trend Alignment: EMA200 slope falling (+18pts)`);
-  }
-
-  // Middle BB Rally within last 3 candles
-  const maxHigh3 = Math.max(c0.candle.high, c1.candle.high, c2.candle.high);
-  const maxClose3 = Math.max(c0.candle.close, c1.candle.close, c2.candle.close);
-  const isAboveMidBB = maxHigh3 >= c0.middleBB;
-  const isNearMidBBRally = maxHigh3 >= c0.middleBB * 0.998 || maxClose3 >= c0.middleBB * 0.9975;
-
-  if (isAboveMidBB) {
-    sellScore += 25;
-    sellReasons.push(`Middle BB Rally: Candle high (${formatPrice(maxHigh3, digits)}) pierced/tested above Middle BB (${formatPrice(c0.middleBB, digits)}) (+25pts)`);
-  } else if (isNearMidBBRally) {
-    sellScore += 20;
-    sellReasons.push(`Middle BB Rally: Candle high (${formatPrice(maxHigh3, digits)}) rallied within 0.2% of Middle BB (+20pts)`);
-  }
-
-  // RSI(14) 42 - 65 and curling down
-  const rsiInRangeSell = c0.rsi >= 42 && c0.rsi <= 65;
-  const rsiCurlingDown = c0.rsi < c1.rsi;
-
-  if (rsiInRangeSell && rsiCurlingDown) {
-    sellScore += 25;
-    sellReasons.push(`RSI Rally & Curl: RSI ${c0.rsi.toFixed(1)} in [42, 65] and curling down (-${(c1.rsi - c0.rsi).toFixed(1)}) (+25pts)`);
-  } else if (rsiInRangeSell) {
-    sellScore += 15;
-    sellReasons.push(`RSI Rally: RSI ${c0.rsi.toFixed(1)} in [42, 65] (+15pts)`);
-  } else if (rsiCurlingDown && c0.rsi >= 38 && c0.rsi <= 70) {
-    sellScore += 12;
-    sellReasons.push(`RSI Curling Down: RSI ${c0.rsi.toFixed(1)} curling down (+12pts)`);
-  }
-
-  // Trigger Candle: C0 or C1 bearish
-  const isC0Bearish = c0.candle.close < c0.candle.open;
-  const isC1Bearish = c1.candle.close < c1.candle.open;
-
-  if (isC0Bearish) {
-    sellScore += 15;
-    sellReasons.push(`Trigger Candle: Current C0 is bearish close < open (+15pts)`);
-    if (c0.upperWickRatio >= 0.25) {
-      sellScore += 5;
-      sellReasons.push(`Wick Confluence: C0 upper rejection wick ${c0.upperWickRatio.toFixed(2)} (+5pts)`);
+  if (isBullishTrend && !isBearishTrend) {
+    sellScore = 0;
+    sellWaiting = 'Setup A Trend Pullback strictly emits BUY in Bullish regime (Price >= EMA200)';
+    sellReasons.push(`Regime Alignment Veto: Price >= EMA200 denotes Bullish regime. Setup A Trend Pullback strictly emits BUY.`);
+  } else {
+    const trendSellAligned = isPriceBelowEma && isEmaFalling;
+    if (isPriceBelowEma && isEmaFalling) {
+      sellScore += 30;
+      sellReasons.push(`Trend Alignment: Price (${formatPrice(c0.candle.close, digits)}) < EMA200 (${formatPrice(c0.ema200, digits)}) & EMA200 falling (+30pts)`);
+    } else if (isPriceBelowEma) {
+      sellScore += 22;
+      sellReasons.push(`Trend Alignment: Price < EMA200 (+22pts)`);
+    } else if (isEmaFalling) {
+      sellScore += 14;
+      sellReasons.push(`Trend Alignment: EMA200 slope falling (+14pts)`);
     }
-  } else if (isC1Bearish) {
-    sellScore += 10;
-    sellReasons.push(`Trigger Candle: Prior C1 is bearish (+10pts)`);
+
+    // Middle BB Rally within last 3 candles
+    const maxHigh3 = Math.max(c0.candle.high, c1.candle.high, c2.candle.high);
+    const maxClose3 = Math.max(c0.candle.close, c1.candle.close, c2.candle.close);
+    const isAboveMidBB = maxHigh3 >= c0.middleBB;
+    const isNearMidBBRally = maxHigh3 >= c0.middleBB * 0.998 || maxClose3 >= c0.middleBB * 0.9975;
+
+    if (isAboveMidBB) {
+      sellScore += 25;
+      sellReasons.push(`Middle BB Rally: Candle high (${formatPrice(maxHigh3, digits)}) pierced/tested above Middle BB (${formatPrice(c0.middleBB, digits)}) (+25pts)`);
+    } else if (isNearMidBBRally) {
+      sellScore += 20;
+      sellReasons.push(`Middle BB Rally: Candle high (${formatPrice(maxHigh3, digits)}) rallied within 0.2% of Middle BB (+20pts)`);
+    }
+
+    // RSI(14) 42 - 65 and curling down
+    const rsiInRangeSell = c0.rsi >= 42 && c0.rsi <= 65;
+    const rsiCurlingDown = c0.rsi < c1.rsi;
+
+    if (rsiInRangeSell && rsiCurlingDown) {
+      sellScore += 25;
+      sellReasons.push(`RSI Rally & Curl: RSI ${c0.rsi.toFixed(1)} in [42, 65] and curling down (-${(c1.rsi - c0.rsi).toFixed(1)}) (+25pts)`);
+    } else if (rsiInRangeSell) {
+      sellScore += 15;
+      sellReasons.push(`RSI Rally: RSI ${c0.rsi.toFixed(1)} in [42, 65] (+15pts)`);
+    } else if (rsiCurlingDown && c0.rsi >= 38 && c0.rsi <= 70) {
+      sellScore += 12;
+      sellReasons.push(`RSI Curling Down: RSI ${c0.rsi.toFixed(1)} curling down (+12pts)`);
+    }
+
+    // Trigger Candle: C0 or C1 bearish
+    const isC0Bearish = c0.candle.close < c0.candle.open;
+    const isC1Bearish = c1.candle.close < c1.candle.open;
+
+    if (isC0Bearish) {
+      sellScore += 15;
+      sellReasons.push(`Trigger Candle: Current C0 is bearish close < open (+15pts)`);
+      if (c0.upperWickRatio >= 0.25) {
+        sellScore += 5;
+        sellReasons.push(`Wick Confluence: C0 upper rejection wick ${c0.upperWickRatio.toFixed(2)} (+5pts)`);
+      }
+    } else if (isC1Bearish) {
+      sellScore += 10;
+      sellReasons.push(`Trigger Candle: Prior C1 is bearish (+10pts)`);
+    }
+
+    // Bonus: Hidden or Regular Bearish Divergence
+    if (divergence.detected && divergence.bearishDivergence) {
+      sellScore += 10;
+      sellReasons.push(`Divergence Confluence: Bearish divergence active (+10pts)`);
+    }
+
+    // Waiting condition diagnosis for SELL
+    if (!trendSellAligned && !isPriceBelowEma) {
+      sellWaiting = 'Waiting for Price < EMA200';
+    } else if (!isNearMidBBRally) {
+      sellWaiting = 'Waiting for Middle BB rally';
+    } else if (!rsiCurlingDown) {
+      sellWaiting = 'Waiting for RSI downward curl';
+    } else if (!isC0Bearish && !isC1Bearish) {
+      sellWaiting = 'Waiting for bearish trigger candle';
+    } else if (!rsiInRangeSell) {
+      sellWaiting = `Waiting for RSI in [42, 65] range (current ${c0.rsi.toFixed(1)})`;
+    }
   }
 
-  // Bonus: Hidden or Regular Bearish Divergence
-  if (divergence.detected && divergence.bearishDivergence) {
-    sellScore += 10;
-    sellReasons.push(`Divergence Confluence: Bearish divergence active (+10pts)`);
-  }
-
-  // Waiting condition diagnosis for SELL
-  if (!trendSellAligned) {
-    sellWaiting = 'Waiting for Price < EMA200 or falling slope';
-  } else if (!isNearMidBBRally) {
-    sellWaiting = 'Waiting for Middle BB rally';
-  } else if (!rsiCurlingDown) {
-    sellWaiting = 'Waiting for RSI downward curl';
-  } else if (!isC0Bearish && !isC1Bearish) {
-    sellWaiting = 'Waiting for bearish trigger candle';
-  } else if (!rsiInRangeSell) {
-    sellWaiting = `Waiting for RSI in [42, 65] range (current ${c0.rsi.toFixed(1)})`;
-  }
+  const buyRegime = isPriceAboveEma ? 'WITH_TREND' : 'COUNTER_TREND';
+  const sellRegime = isPriceBelowEma ? 'WITH_TREND' : 'COUNTER_TREND';
 
   return {
     buy: {
@@ -317,7 +341,7 @@ function evaluateSetupA(indicators: IndicatorSnapshot, pairProfile: PairProfile)
       score: Math.min(100, buyScore),
       reasons: buyReasons,
       waiting: buyWaiting,
-      regime: 'WITH_TREND',
+      regime: buyRegime,
       signalType: 'WITH_TREND_BUY',
     },
     sell: {
@@ -326,7 +350,7 @@ function evaluateSetupA(indicators: IndicatorSnapshot, pairProfile: PairProfile)
       score: Math.min(100, sellScore),
       reasons: sellReasons,
       waiting: sellWaiting,
-      regime: 'WITH_TREND',
+      regime: sellRegime,
       signalType: 'WITH_TREND_SELL',
     },
   };
@@ -699,7 +723,7 @@ export function evaluateSignalGates(
   const bbPosVal = Math.round(indicators.bbPositionPct);
 
   // Evaluate the 3 distinct institutional setups across BUY and SELL
-  const setupA = evaluateSetupA(indicators, pairProfile);
+  const setupA = evaluateSetupA(indicators, pairProfile, !isBullishRegime, isBullishRegime);
   const setupB = evaluateSetupB(indicators, pairProfile);
   const setupC = evaluateSetupC(indicators, pairProfile);
 

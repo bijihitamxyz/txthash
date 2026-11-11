@@ -157,7 +157,12 @@ export async function saveVaultCredentials(creds: ExnessVaultCredentials): Promi
   // Update in-memory process cache
   globalThis.__exnessVaultCache = normalized;
   globalThis.__exnessVaultLogged = true;
-  console.log(`[SECURITY] Decrypted credentials loaded from AES-256 Vault (${normalized.mode} Mode)`);
+
+  const signature = `${normalized.accountId}_${normalized.mode}_${normalized.server}_${normalized.apiKey}_${normalized.privateKey}`;
+  if ((globalThis as any).__lastLoggedVaultSignature !== signature) {
+    (globalThis as any).__lastLoggedVaultSignature = signature;
+    console.log(`[SECURITY] Decrypted credentials loaded from AES-256 Vault (${normalized.mode} Mode)`);
+  }
 }
 
 /**
@@ -229,8 +234,10 @@ export async function loadVaultCredentials(): Promise<ExnessVaultCredentials | n
     nemesis['exness-vault.enc'] = payload;
     nemesis['exness-vault.json'] = creds;
 
-    // Log ONLY ONCE on initial load to eliminate terminal spam
-    if (!globalThis.__exnessVaultLogged) {
+    // Log ONLY ONCE on initial load or when credentials change to eliminate terminal spam
+    const signature = `${creds.accountId}_${creds.mode}_${creds.server}_${creds.apiKey}_${creds.privateKey}`;
+    if ((globalThis as any).__lastLoggedVaultSignature !== signature) {
+      (globalThis as any).__lastLoggedVaultSignature = signature;
       globalThis.__exnessVaultLogged = true;
       const telemetryMsg = `[SECURITY] Decrypted credentials loaded from AES-256 Vault (${creds.mode} Mode)`;
       console.log(telemetryMsg);

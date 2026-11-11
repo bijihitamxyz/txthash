@@ -174,7 +174,7 @@ export function computeRealTimeKronosForecast(params: {
 
   let bullishPct = 56;
   let rsiVal = 51.5;
-  let pocPrice = candles.length > 0 ? candles[candles.length - 1].close : (symbol === 'XAUUSDm' ? 3875.7 : 1.1159);
+  let pocPrice = candles.length > 0 ? candles[candles.length - 1].close : (symbol === 'XAUUSDm' ? 4108.90 : 1.1159);
   let vahPrice = pocPrice;
   let valPrice = pocPrice;
   let zScore = 0;
@@ -251,10 +251,19 @@ export function computeRealTimeKronosForecast(params: {
       if (candles.length >= 25) {
         const gate = evaluateSignalGates(candles, { pairProfile: profile, timeframe });
         if (gate.isValid && (gate.side === 'BUY' || gate.side === 'SELL')) {
-          signal = gate.side;
-          gateSummary = `${gate.setupName || gate.signalType} (${gate.confluenceScore || 75}/100)`;
-          if (signal === 'BUY' && bullishPct < 60) bullishPct = Math.min(88, bullishPct + 12);
-          if (signal === 'SELL' && bullishPct > 40) bullishPct = Math.max(14, bullishPct - 12);
+          // Strictly prevent counter-regime Setup A: if TRENDING_BEAR, Setup A must not force BUY
+          const isBearishRegime = regime === 'TRENDING_BEAR' || bullishPct <= 45;
+          const isBullishRegime = regime === 'TRENDING_BULL' || bullishPct >= 55;
+          if (isBearishRegime && gate.side === 'BUY' && gate.setupName === 'SETUP_A_TREND_PULLBACK') {
+            // Skip counter-regime Setup A buy in trending bear
+          } else if (isBullishRegime && gate.side === 'SELL' && gate.setupName === 'SETUP_A_TREND_PULLBACK') {
+            // Skip counter-regime Setup A sell in trending bull
+          } else {
+            signal = gate.side;
+            gateSummary = `${gate.setupName || gate.signalType} (${gate.confluenceScore || 75}/100)`;
+            if (signal === 'BUY' && bullishPct < 60) bullishPct = Math.min(88, bullishPct + 12);
+            if (signal === 'SELL' && bullishPct > 40) bullishPct = Math.max(14, bullishPct - 12);
+          }
         }
       }
 

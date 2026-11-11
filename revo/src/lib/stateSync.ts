@@ -31,6 +31,7 @@ export interface StateTelemetryItem {
 }
 
 export interface BotRuntimeState {
+  activeRoom?: 'FOREX' | 'CRYPTO';
   isAutoTrading: boolean;
   cryptoIsAutoTrading: boolean;
   cryptoMarginUsdt?: number;
@@ -43,6 +44,8 @@ export interface BotRuntimeState {
   isMultiPairMode: boolean;
   scannedSymbols: string[];
   lotSize: number;
+  stopLossPips?: number;
+  takeProfitPips?: number;
   aiConfidenceThreshold: number;
   enablePartialClose: boolean;
   positions: ManagedPosition[];
@@ -55,6 +58,7 @@ export interface BotRuntimeState {
 }
 
 export const DEFAULT_STATE: BotRuntimeState = {
+  activeRoom: 'FOREX',
   isAutoTrading: false,
   cryptoIsAutoTrading: false,
   cryptoMarginUsdt: 25.0,
@@ -66,7 +70,9 @@ export const DEFAULT_STATE: BotRuntimeState = {
   selectedSymbol: 'XAUUSDm',
   isMultiPairMode: false,
   scannedSymbols: ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'],
-  lotSize: 0.05,
+  lotSize: 0.10,
+  stopLossPips: 25,
+  takeProfitPips: 50,
   aiConfidenceThreshold: 70,
   enablePartialClose: true,
   positions: [],
@@ -137,16 +143,16 @@ class StateSyncManager {
     // If targetMarket is updated, synchronize scannedSymbols and selectedSymbol (unless selectedSymbol is explicitly specified)
     if (partial.targetMarket) {
       if (partial.targetMarket === 'GOLD') {
-        this.inMemoryState.scannedSymbols = ['XAUUSDm'];
+        this.inMemoryState.scannedSymbols = partial.scannedSymbols || ['XAUUSDm'];
         this.inMemoryState.selectedSymbol = partial.selectedSymbol || 'XAUUSDm';
         this.inMemoryState.isMultiPairMode = false;
       } else if (partial.targetMarket === 'FOREX') {
-        this.inMemoryState.scannedSymbols = ['EURUSDm', 'GBPUSDm', 'USDJPYm'];
-        this.inMemoryState.selectedSymbol = partial.selectedSymbol || 'EURUSDm';
+        this.inMemoryState.scannedSymbols = partial.scannedSymbols || ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'];
+        this.inMemoryState.selectedSymbol = partial.selectedSymbol || this.inMemoryState.selectedSymbol || 'XAUUSDm';
         this.inMemoryState.isMultiPairMode = true;
       } else if (partial.targetMarket === 'BOTH') {
-        this.inMemoryState.scannedSymbols = ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'];
-        this.inMemoryState.selectedSymbol = partial.selectedSymbol || 'XAUUSDm';
+        this.inMemoryState.scannedSymbols = partial.scannedSymbols || ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'];
+        this.inMemoryState.selectedSymbol = partial.selectedSymbol || this.inMemoryState.selectedSymbol || 'XAUUSDm';
         this.inMemoryState.isMultiPairMode = true;
       }
     } else if (partial.selectedSymbol) {

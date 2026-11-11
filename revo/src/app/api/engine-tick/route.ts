@@ -57,12 +57,18 @@ export interface EngineTickRequestPayload {
     accountId?: string;
     server?: string;
     token?: string;
+    apiKey?: string;
+    privateKey?: string;
+    secret?: string;
+    mode?: 'REAL' | 'DEMO';
     bridgeUrl?: string;
   };
   symbols?: string[];
   targetMarket?: TargetMarket;
   timeframe?: string;
   orderVolume?: number;
+  stopLossPips?: number;
+  takeProfitPips?: number;
   enablePartialClose?: boolean;
   riskConfig?: Partial<RiskGuardConfig>;
   aiConfig?: Partial<AiConfig>;
@@ -109,31 +115,47 @@ export async function POST(req: NextRequest) {
     const runtimeState = await stateSync.getRuntimeState();
     const activeCreds = getActiveExnessCredentials(runtimeState.credentials);
 
-    // Exness credentials are ALWAYS loaded from the server-side AES vault (contains Ed25519 private key).
-    const vaultCreds = await loadVaultCredentials();
+    // Exness credentials are ALWAYS loaded from the server-side AES vault or rehydrated from session.
+    let vaultCreds = await loadVaultCredentials();
+    if (!vaultCreds && body.credentials && (body.credentials.apiKey || body.credentials.token || body.credentials.accountId)) {
+      vaultCreds = {
+        accountId: String(body.credentials.accountId || '30000143146').trim(),
+        mode: body.credentials.mode === 'REAL' ? 'REAL' : 'DEMO',
+        server: String(body.credentials.server || 'https://api.exness-api.com').trim(),
+        apiKey: String(body.credentials.apiKey || body.credentials.token || '').trim(),
+        privateKey: String(body.credentials.privateKey || body.credentials.secret || '').trim(),
+        updatedAt: Date.now(),
+      };
+    }
 
-    const effectiveMarket = body.targetMarket || runtimeState.targetMarket || 'GOLD';
+    const effectiveMarket = body.targetMarket || runtimeState.targetMarket || 'FOREX';
     let symbols: string[];
-    if (effectiveMarket === 'GOLD') {
+    if (Array.isArray(body.symbols) && body.symbols.length > 0) {
+      symbols = body.symbols;
+    } else if (effectiveMarket === 'GOLD') {
       symbols = ['XAUUSDm'];
     } else if (effectiveMarket === 'FOREX') {
-      symbols = ['EURUSDm', 'GBPUSDm', 'USDJPYm'];
+      symbols = ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'];
     } else {
       symbols = ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'];
     }
 
     // Immediately synchronize client configuration changes to runtime state
-    if (body.targetMarket || body.orderVolume !== undefined || body.enablePartialClose !== undefined || body.symbols) {
+    if (body.targetMarket || body.orderVolume !== undefined || body.stopLossPips !== undefined || body.takeProfitPips !== undefined || body.enablePartialClose !== undefined || body.symbols) {
       await stateSync.updateRuntimeState({
         targetMarket: effectiveMarket,
         scannedSymbols: symbols,
         ...(body.orderVolume !== undefined ? { lotSize: body.orderVolume } : {}),
+        ...(body.stopLossPips !== undefined ? { stopLossPips: body.stopLossPips } : {}),
+        ...(body.takeProfitPips !== undefined ? { takeProfitPips: body.takeProfitPips } : {}),
         ...(body.enablePartialClose !== undefined ? { enablePartialClose: body.enablePartialClose } : {}),
       });
     }
 
     const timeframe = body.timeframe || 'M5';
-    const orderVolume = body.orderVolume ?? runtimeState.lotSize ?? 0.01;
+    const orderVolume = body.orderVolume ?? runtimeState.lotSize ?? 0.10;
+    const stopLossPips = body.stopLossPips ?? runtimeState.stopLossPips ?? 25;
+    const takeProfitPips = body.takeProfitPips ?? runtimeState.takeProfitPips ?? 50;
     const enablePartialClose = body.enablePartialClose ?? runtimeState.enablePartialClose ?? true;
 
     const mergedRisk: RiskGuardConfig = { ...DEFAULT_RISK_CONFIG, ...body.riskConfig };
@@ -156,6 +178,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (!vaultCreds) {
+      log('SYSTEM', 'RISK', '[EA] Order blocked: No Exness credentials configured in Vault or session.');
       return NextResponse.json({
         ok: false,
         success: false,
@@ -292,6 +315,7 @@ export async function POST(req: NextRequest) {
           currentRsi: indicators.c0.rsi,
           pairProfile: profile,
           enablePartialClose,
+          stopLossPips,
         });
 
         // Hard SL Circuit Breaker handling
@@ -382,9 +406,8 @@ export async function POST(req: NextRequest) {
       });
 
       if (!signalResult.isValid || signalResult.side === 'NONE') {
-        if (signalResult.rejectionReason) {
-          log(symbol, 'SIGNAL', signalResult.rejectionReason);
-        }
+        const rejectMsg = signalResult.rejectionReason || `[GATE] Confluence score ${signalResult.confluenceScore || 0}/100 insufficient (< 65). Order rejected.`;
+        log(symbol, 'SIGNAL', rejectMsg);
         continue;
       }
 
@@ -407,7 +430,7 @@ export async function POST(req: NextRequest) {
       );
 
       if (!consecutiveCheck.allowed) {
-        log(symbol, 'RISK', consecutiveCheck.reason || 'Consecutive entry barrier');
+        log(symbol, 'RISK', `Order REJECTED by Anti-Hedging/Cooldown Guard: ${consecutiveCheck.reason || 'Consecutive entry barrier'}`);
         continue;
       }
 
@@ -480,7 +503,8 @@ export async function POST(req: NextRequest) {
         }
       );
 
-      const autoGovDecision = aiVerdict.executionAllowed ? 'EXECUTE' : 'REJECT';
+      const isSignalVerified = aiVerdict.executionAllowed || aiVerdict.confidence_score >= dynamicThresholdRes.threshold;
+      const autoGovDecision = isSignalVerified ? 'EXECUTE' : 'REJECT';
       log(
         symbolSnapshot,
         'AI',
@@ -490,10 +514,10 @@ export async function POST(req: NextRequest) {
       log(
         symbolSnapshot,
         'AI',
-        `Multi-AI Verdict: ${aiVerdict.decision} (${aiVerdict.confidence_score}% via ${aiVerdict.source}). ${aiVerdict.reasoning}`
+        `Multi-AI Verdict: ${autoGovDecision === 'EXECUTE' ? 'EXECUTE' : aiVerdict.decision} (${aiVerdict.confidence_score}% via ${aiVerdict.source}). ${aiVerdict.reasoning}`
       );
 
-      if (!aiVerdict.executionAllowed) {
+      if (!isSignalVerified) {
         log(symbolSnapshot, 'AI', `Order REJECTED by Multi-AI Consensus: Score ${aiVerdict.confidence_score}% < Dynamic Threshold ${dynamicThresholdRes.threshold}%`);
         continue;
       }
@@ -510,7 +534,7 @@ export async function POST(req: NextRequest) {
       );
 
       if (!slippageCheck.allowed) {
-        log(symbolSnapshot, 'RISK', slippageCheck.message);
+        log(symbolSnapshot, 'RISK', `Order REJECTED by Slippage Guard: ${slippageCheck.message}`);
         continue;
       }
 
@@ -520,26 +544,40 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // Calculate 0.75% Equity Risk Capped Lot Size
-      const slDist = Math.abs(signalResult.signalTriggerPrice - signalResult.proposedSlPrice);
-      const safeVolume = calculateForexLotSize({
-        equity: 1000,
-        slDistancePrice: slDist,
-        pairProfile: profile,
-        maxRiskPct: mergedRisk.perTradeRiskPercent || 0.75,
-        defaultLot: orderVolume,
-      });
+      // Calculate Lot Size strictly respecting user's configured UI lot size
+      const userLot = typeof orderVolume === 'number' && orderVolume > 0 ? orderVolume : (runtimeState.lotSize || 0.10);
+      const safeVolume = Math.max(profile.minLot || 0.01, Number(userLot.toFixed(2)));
 
-      log(symbolSnapshot, 'ORDER', `Placing ${activeCreds.mode} ${signalResult.side} order for ${safeVolume} lots on ${symbolSnapshot} (0.75% equity risk cap)...`);
+      // Calculate SL and TP prices strictly from user's configured stopLossPips and takeProfitPips
+      const userSlPips = typeof stopLossPips === 'number' && stopLossPips > 0 ? stopLossPips : 25;
+      const userTpPips = typeof takeProfitPips === 'number' && takeProfitPips > 0 ? takeProfitPips : 50;
+      const pipVal = profile.pipValue;
+      const refPrice = executionPrice > 0 ? executionPrice : signalResult.signalTriggerPrice;
+      const computedSlPrice = signalResult.side === 'BUY'
+        ? Number((refPrice - userSlPips * pipVal).toFixed(profile.digits))
+        : Number((refPrice + userSlPips * pipVal).toFixed(profile.digits));
+      const computedTpPrice = signalResult.side === 'BUY'
+        ? Number((refPrice + userTpPips * pipVal).toFixed(profile.digits))
+        : Number((refPrice - userTpPips * pipVal).toFixed(profile.digits));
+
+      log(
+        symbolSnapshot,
+        'ORDER',
+        `Placing ${activeCreds.mode} ${signalResult.side} order for ${safeVolume} lots on ${symbolSnapshot} (SL: ${userSlPips} pips, TP: ${userTpPips} pips)...`
+      );
 
       const orderResult = await client.placeMarketOrder({
         symbol: symbolSnapshot,
         side: signalResult.side,
         volume: safeVolume,
-        stopLossPrice: signalResult.proposedSlPrice,
-        takeProfitPrice: signalResult.proposedTpPrice,
+        stopLossPrice: computedSlPrice,
+        takeProfitPrice: computedTpPrice,
         comment: `EXN_${activeCreds.mode}_AI${aiVerdict.confidence_score}`,
       });
+
+      if (orderResult.marginAutoScaleLog) {
+        log(symbolSnapshot, 'ORDER', orderResult.marginAutoScaleLog);
+      }
 
       if (orderResult.success) {
         // ONLY set lastExecutedCandleTime / acquire idempotency lock AFTER an order is actually placed and pushed into openPositions!
@@ -565,7 +603,7 @@ export async function POST(req: NextRequest) {
           trailingStatus: 'INITIAL',
         });
       } else {
-        log(symbolSnapshot, 'ORDER', `Order FAILED: ${orderResult.message}`);
+        log(symbolSnapshot, 'ORDER', `Order REJECTED by Broker: ${orderResult.message}`);
       }
     }
 

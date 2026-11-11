@@ -42,11 +42,12 @@ import { useTheme } from '@/components/InstitutionalChrome';
 
 interface BinanceFuturesRoomProps {
   onSwitchToForex?: () => void;
+  isActiveRoom?: boolean;
 }
 
 const QUICK_MAJORS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'] as const;
 
-export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitchToForex }) => {
+export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitchToForex, isActiveRoom = true }) => {
   const { isDark } = useTheme();
   const [isMounted, setIsMounted] = useState(false);
   const [isCoinSelectorOpen, setIsCoinSelectorOpen] = useState(false);
@@ -126,13 +127,21 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   useEffect(() => {
     setIsMounted(true);
     useBinanceStore.getState().loadSavedCredentials();
-    useBinanceStore.getState().fetchSymbolsAndTickers(true);
-    useBinanceStore.getState().fetchKlines(useBinanceStore.getState().selectedSymbol);
-    useBinanceStore.getState().fetchAccountInfo();
+    if (isActiveRoom || isAutoTrading || (positions && positions.length > 0)) {
+      useBinanceStore.getState().fetchSymbolsAndTickers(true);
+      useBinanceStore.getState().fetchKlines(useBinanceStore.getState().selectedSymbol);
+      useBinanceStore.getState().fetchAccountInfo();
+    }
 
     let tickerInterval: NodeJS.Timeout | null = null;
     let klineInterval: NodeJS.Timeout | null = null;
     let accountInterval: NodeJS.Timeout | null = null;
+
+    const shouldPollCrypto = () => {
+      if (isActiveRoom) return true;
+      const st = useBinanceStore.getState();
+      return Boolean(st.isAutoTrading || (st.positions && st.positions.length > 0));
+    };
 
     const startIntervals = () => {
       if (tickerInterval) clearInterval(tickerInterval);
@@ -141,17 +150,20 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
 
       tickerInterval = setInterval(() => {
         if (typeof document !== 'undefined' && document.hidden) return;
+        if (!shouldPollCrypto()) return;
         useBinanceStore.getState().fetchSymbolsAndTickers();
       }, 2500);
 
       klineInterval = setInterval(() => {
         if (typeof document !== 'undefined' && document.hidden) return;
+        if (!shouldPollCrypto()) return;
         const sym = useBinanceStore.getState().selectedSymbol;
         useBinanceStore.getState().fetchKlines(sym);
       }, 3500);
 
       accountInterval = setInterval(() => {
         if (typeof document !== 'undefined' && document.hidden) return;
+        if (!shouldPollCrypto()) return;
         useBinanceStore.getState().fetchAccountInfo();
       }, 4500);
     };
@@ -172,11 +184,12 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
       if (document.hidden) {
         stopIntervals();
       } else {
-        // Tab / app regained focus: fetch fresh snapshot once and restart background intervals
-        const sym = useBinanceStore.getState().selectedSymbol;
-        useBinanceStore.getState().fetchSymbolsAndTickers();
-        useBinanceStore.getState().fetchKlines(sym);
-        useBinanceStore.getState().fetchAccountInfo();
+        if (shouldPollCrypto()) {
+          const sym = useBinanceStore.getState().selectedSymbol;
+          useBinanceStore.getState().fetchSymbolsAndTickers();
+          useBinanceStore.getState().fetchKlines(sym);
+          useBinanceStore.getState().fetchAccountInfo();
+        }
         setCanvasWidthTick((v) => v + 1);
         startIntervals();
       }
@@ -192,14 +205,26 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('resize', handleResize);
     };
-  }, []);
+  }, [isActiveRoom]);
+
+  // When room becomes active from background, fetch fresh crypto data immediately
+  useEffect(() => {
+    if (isActiveRoom) {
+      useBinanceStore.getState().fetchSymbolsAndTickers();
+      useBinanceStore.getState().fetchKlines(useBinanceStore.getState().selectedSymbol);
+      useBinanceStore.getState().fetchAccountInfo();
+      setCanvasWidthTick((v) => v + 1);
+    }
+  }, [isActiveRoom]);
 
   // Poll Multi-AI + Kronos forecast via POST /api/kronos for active Crypto pair
   const lastKlineClose = klines.length > 0 ? klines[klines.length - 1]?.close : 0;
   useEffect(() => {
+    if (!isActiveRoom && !isAutoTrading && (!positions || positions.length === 0)) return;
     let cancelled = false;
     const syncCryptoKronos = async () => {
       if (typeof document !== 'undefined' && document.hidden) return;
+      if (!isActiveRoom && !useBinanceStore.getState().isAutoTrading && (!useBinanceStore.getState().positions || useBinanceStore.getState().positions.length === 0)) return;
       try {
         const mappedCandles = klines.slice(-60).map((k) => ({
           time: k.timestamp > 1e11 ? Math.floor(k.timestamp / 1000) : k.timestamp,
@@ -247,7 +272,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
     return () => {
       cancelled = true;
     };
-  }, [selectedSymbol, timeframe, lastKlineClose]);
+  }, [isActiveRoom, isAutoTrading, positions, selectedSymbol, timeframe, lastKlineClose]);
 
   // Background auto-scanner loop
   useEffect(() => {
@@ -776,7 +801,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
           </div>
           <div className="font-mono text-[10px] text-slate-500 dark:text-slate-400 truncate">
             {activeExchange === 'BITGET'
-              ? 'api.bitget.com (V2)'
+              ? isTestnet ? 'api.bitget.com (Demo V2)' : 'api.bitget.com (Live V2)'
               : isTestnet ? 'testnet.binancefuture.com' : 'fapi.binance.com'}
           </div>
         </div>
@@ -793,7 +818,9 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                 USDT BALANCE
               </span>
               <span className="bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border border-emerald-200/80 dark:border-emerald-800/60 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold">
-                {isTestnet ? 'TESTNET' : 'MAINNET'}
+                {activeExchange === 'BITGET'
+                  ? isTestnet ? 'DEMO V2' : 'MAINNET'
+                  : isTestnet ? 'TESTNET' : 'MAINNET'}
               </span>
             </div>
             <div className="my-2">
@@ -874,7 +901,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
             <div className="my-1.5">
               <div className="font-mono text-xs font-bold text-[#0F172A] dark:text-slate-100 truncate">
                 {activeExchange === 'BITGET'
-                  ? 'api.bitget.com (USDT-M V2)'
+                  ? isTestnet ? 'api.bitget.com (Demo V2 · paptrading:1)' : 'api.bitget.com (USDT-M V2)'
                   : isTestnet ? 'testnet.binancefuture.com' : 'fapi.binance.com'}
               </div>
               <div className="font-mono text-[11px] text-slate-500 dark:text-slate-400">

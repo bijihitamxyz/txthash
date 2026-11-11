@@ -98,21 +98,24 @@ function ensureDbFileExists(filePath: string): void {
  */
 export async function readLicenses(): Promise<LicenseRecord[]> {
   try {
+    let licenses: LicenseRecord[] | null = null;
     try {
       const nemesis = getNemesisMemoryStore();
       if (nemesis['licenses_db.json']) {
         const cached = nemesis['licenses_db.json'];
         const list = Array.isArray(cached) ? cached : (Array.isArray(cached?.licenses) ? cached.licenses : null);
-        if (list) return list;
+        if (list) licenses = list;
       }
     } catch {}
 
-    const content = await readDataFileAsync('licenses_db.json', JSON.stringify({ licenses: [] }, null, 2));
-    if (!content.trim()) {
-      return [];
+    if (!licenses) {
+      const content = await readDataFileAsync('licenses_db.json', JSON.stringify({ licenses: [] }, null, 2));
+      if (!content.trim()) {
+        return [];
+      }
+      const parsed: LicenseDbData = JSON.parse(content);
+      licenses = Array.isArray(parsed.licenses) ? parsed.licenses : [];
     }
-    const parsed: LicenseDbData = JSON.parse(content);
-    const licenses = Array.isArray(parsed.licenses) ? parsed.licenses : [];
 
     // Check expiration timestamps and auto-update
     const now = Date.now();

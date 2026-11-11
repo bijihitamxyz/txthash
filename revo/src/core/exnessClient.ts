@@ -104,6 +104,7 @@ export interface OrderExecutionResult {
   takeProfit: number;
   timestamp: number;
   message: string;
+  marginAutoScaleLog?: string;
 }
 
 export interface ForexBaselineConfig {
@@ -115,29 +116,61 @@ export interface ForexBaselineConfig {
 }
 
 export const PAIR_BASELINES: Record<string, ForexBaselineConfig> = {
-  XAUUSDm: { baseline: 3875.70, digits: 2, pipValue: 0.10, min: 2000.00, max: 6000.00 },
-  EURUSDm: { baseline: 1.11592, digits: 5, pipValue: 0.0001, min: 0.80000, max: 1.50000 },
-  GBPUSDm: { baseline: 1.33877, digits: 5, pipValue: 0.0001, min: 0.90000, max: 1.70000 },
-  USDJPYm: { baseline: 157.569, digits: 3, pipValue: 0.01, min: 100.000, max: 220.000 },
+  XAUUSDm: { baseline: 4116.85, digits: 2, pipValue: 0.10, min: 1500.00, max: 10000.00 },
+  XAUUSD: { baseline: 4116.85, digits: 2, pipValue: 0.10, min: 1500.00, max: 10000.00 },
+  EURUSDm: { baseline: 1.11592, digits: 5, pipValue: 0.0001, min: 0.50000, max: 2.50000 },
+  GBPUSDm: { baseline: 1.33877, digits: 5, pipValue: 0.0001, min: 0.50000, max: 2.50000 },
+  USDJPYm: { baseline: 157.569, digits: 3, pipValue: 0.01, min: 50.000, max: 300.000 },
 };
 
 export const FOREX_BASELINES = PAIR_BASELINES;
 export const LAST_KNOWN_PRICE_KEY = 'exness_last_known_real_prices';
 export const lastKnownPrice: Record<string, { price: number; timestamp: number; source?: string }> = {};
 
+export function isValidPriceUpdate(symbol: string, newPrice: number): boolean {
+  if (typeof newPrice !== 'number' || isNaN(newPrice) || !isFinite(newPrice) || newPrice <= 0) return false;
+  if (symbol.startsWith('XAU')) {
+    if (newPrice < 1500 || newPrice > 10000) return false;
+    // Explicitly reject 3875 mock baseline or 4076/4077 corrupted seeds
+    if (Math.abs(newPrice - 3875.70) < 5.0 || Math.abs(newPrice - 4076.77) < 5.0) return false;
+  } else if (symbol.startsWith('EUR') || symbol.startsWith('GBP')) {
+    if (newPrice < 0.5 || newPrice > 2.5) return false;
+  } else if (symbol.startsWith('USDJPY')) {
+    if (newPrice < 50 || newPrice > 300) return false;
+  }
+  const lastValid = lastKnownPrice[symbol]?.price || PAIR_BASELINES[symbol]?.baseline || (symbol.startsWith('XAU') ? 4116.85 : 0);
+  if (lastValid > 0) {
+    const deviation = Math.abs(newPrice - lastValid) / lastValid;
+    // Protect against cross-symbol data injection (>15% jump on same symbol tick)
+    if (deviation > 0.15) return false;
+  }
+  return true;
+}
+
 export function updateLastKnownPrice(symbol: string, price: number, source: string = 'live'): void {
   if (typeof price === 'number' && price > 0 && !isNaN(price)) {
+    if (!isValidPriceUpdate(symbol, price)) return;
     lastKnownPrice[symbol] = { price, timestamp: Date.now(), source };
     savePersistedRealPrice(symbol, price);
     if (PAIR_BASELINES[symbol]) {
       PAIR_BASELINES[symbol].baseline = price;
+    }
+    if (symbol === 'XAUUSDm') {
+      lastKnownPrice['XAUUSD'] = { price, timestamp: Date.now(), source };
+      if (PAIR_BASELINES['XAUUSD']) PAIR_BASELINES['XAUUSD'].baseline = price;
+    } else if (symbol === 'XAUUSD') {
+      lastKnownPrice['XAUUSDm'] = { price, timestamp: Date.now(), source };
+      if (PAIR_BASELINES['XAUUSDm']) PAIR_BASELINES['XAUUSDm'].baseline = price;
     }
   }
 }
 
 export function getPersistedRealPrice(symbol: string): number {
   if (lastKnownPrice[symbol] && lastKnownPrice[symbol].price > 0) {
-    return lastKnownPrice[symbol].price;
+    const p = lastKnownPrice[symbol].price;
+    if (!symbol.startsWith('XAU') || (p >= 1500 && p <= 10000 && Math.abs(p - 3875.70) > 5.0 && Math.abs(p - 4076.77) > 5.0)) {
+      return p;
+    }
   }
   const filename = `${LAST_KNOWN_PRICE_KEY}.json`;
   try {
@@ -145,8 +178,11 @@ export function getPersistedRealPrice(symbol: string): number {
     if (filename in nemesis) {
       const data = nemesis[filename];
       if (data && typeof data[symbol] === 'number' && data[symbol] > 0) {
-        lastKnownPrice[symbol] = { price: data[symbol], timestamp: Date.now(), source: 'memory-cache' };
-        return data[symbol];
+        const val = data[symbol];
+        if (!symbol.startsWith('XAU') || (val >= 1500 && val <= 10000 && Math.abs(val - 3875.70) > 5.0 && Math.abs(val - 4076.77) > 5.0)) {
+          lastKnownPrice[symbol] = { price: val, timestamp: Date.now(), source: 'memory-cache' };
+          return val;
+        }
       }
     }
   } catch {}
@@ -166,19 +202,23 @@ export function getPersistedRealPrice(symbol: string): number {
     if (content) {
       const data = JSON.parse(content);
       if (data && typeof data[symbol] === 'number' && data[symbol] > 0) {
-        lastKnownPrice[symbol] = { price: data[symbol], timestamp: Date.now(), source: 'disk-cache' };
-        try {
-          const nemesis = getNemesisMemoryStore();
-          nemesis[filename] = data;
-        } catch {}
-        return data[symbol];
+        const val = data[symbol];
+        if (!symbol.startsWith('XAU') || (val >= 1500 && val <= 10000 && Math.abs(val - 3875.70) > 5.0 && Math.abs(val - 4076.77) > 5.0)) {
+          lastKnownPrice[symbol] = { price: val, timestamp: Date.now(), source: 'disk-cache' };
+          try {
+            const nemesis = getNemesisMemoryStore();
+            nemesis[filename] = data;
+          } catch {}
+          return val;
+        }
       }
     }
   } catch {}
-  return PAIR_BASELINES[symbol]?.baseline || 0;
+  return PAIR_BASELINES[symbol]?.baseline || (symbol.startsWith('XAU') ? 4108.90 : 0);
 }
 
 export function savePersistedRealPrice(symbol: string, price: number): void {
+  if (!isValidPriceUpdate(symbol, price)) return;
   const filename = `${LAST_KNOWN_PRICE_KEY}.json`;
   try {
     const nemesis = getNemesisMemoryStore();
@@ -343,17 +383,16 @@ export function updateExnessTimeOffsetFromHeaders(
     let serverTimeMs: number | null = null;
 
     if (xRequestStart) {
-      // Exness format: "t=1794216010.802" or "1794216010.802"
-      const match = String(xRequestStart).match(/t?=?([0-9.]+)/);
-      if (match && match[1]) {
-        const sec = parseFloat(match[1]);
-        if (!isNaN(sec) && sec > 0) {
-          // If in seconds (e.g. ~1.7e9), multiply by 1000; if already in ms (> 1e11), use directly
-          serverTimeMs = sec < 1e11 ? Math.floor(sec * 1000) : Math.floor(sec);
-        }
+      // Exness format: "t=1794216010.802" (unix seconds with ms precision) — preferred over
+      // the HTTP `date` header, which truncates milliseconds (up to 999ms error).
+      const sec = parseFloat(String(xRequestStart).trim().replace(/^t=/, ''));
+      if (!isNaN(sec) && sec > 0) {
+        // If in seconds (e.g. ~1.7e9), multiply by 1000; if already in ms (> 1e11), use directly
+        serverTimeMs = sec < 1e11 ? Math.round(sec * 1000) : Math.round(sec);
       }
     }
 
+    // Fallback only: `date` header has 1-second resolution
     if (!serverTimeMs && dateHeader) {
       const parsed = Date.parse(dateHeader);
       if (!isNaN(parsed) && parsed > 0) {
@@ -362,7 +401,7 @@ export function updateExnessTimeOffsetFromHeaders(
     }
 
     if (serverTimeMs) {
-      const newOffset = serverTimeMs - Date.now();
+      const newOffset = Math.round(serverTimeMs - Date.now());
       if (Math.abs(newOffset - exnessTimeOffsetMs) > 500) {
         console.log(
           `[ExnessClockSync] Synced Exness clock offset: ${newOffset}ms (Server Time: ${new Date(
@@ -603,11 +642,203 @@ export interface ExnessCoreState {
     updatedAt?: number;
     isVerified?: boolean;
   };
+  activeForexPositions?: Record<string, ManagedPosition[]>;
 }
 
 declare global {
   // eslint-disable-next-line no-var
   var __exnessCoreState: ExnessCoreState | undefined;
+  // eslint-disable-next-line no-var
+  var __activeForexPositions: Record<string, ManagedPosition[]> | undefined;
+}
+
+export function getActiveForexPositionsMap(): Record<string, ManagedPosition[]> {
+  if (!globalThis.__activeForexPositions) {
+    globalThis.__activeForexPositions = {};
+  }
+  return globalThis.__activeForexPositions;
+}
+
+export function getActiveForexPositionsForAccount(accountId: string): ManagedPosition[] {
+  const map = getActiveForexPositionsMap();
+  const cleanId = String(accountId || '').trim();
+  if (!cleanId) return [];
+  if (!map[cleanId]) map[cleanId] = [];
+  return map[cleanId];
+}
+
+export function saveActiveForexPosition(accountId: string, pos: ManagedPosition): void {
+  const cleanId = String(accountId || '').trim();
+  if (!cleanId || !pos || !pos.id) return;
+  const map = getActiveForexPositionsMap();
+  if (!map[cleanId]) map[cleanId] = [];
+  const norm = (id: string) => String(id || '').replace(/^#+/, '').trim();
+  const targetId = norm(pos.id);
+  const existingIdx = map[cleanId].findIndex((p) => norm(p.id) === targetId);
+  if (existingIdx >= 0) {
+    map[cleanId][existingIdx] = { ...map[cleanId][existingIdx], ...pos };
+  } else {
+    map[cleanId].push({ ...pos });
+  }
+  try {
+    if (typeof realTimeFeed !== 'undefined' && realTimeFeed) {
+      realTimeFeed.addPosition(pos);
+    }
+  } catch {}
+}
+
+export function removeActiveForexPosition(accountId: string, positionId: string): void {
+  const cleanId = String(accountId || '').trim();
+  if (!cleanId) return;
+  const map = getActiveForexPositionsMap();
+  if (!map[cleanId]) return;
+  const norm = (id: string) => String(id || '').replace(/^#+/, '').trim();
+  const targetId = norm(positionId);
+  map[cleanId] = map[cleanId].filter((p) => norm(p.id) !== targetId);
+  try {
+    if (typeof realTimeFeed !== 'undefined' && realTimeFeed) {
+      realTimeFeed.removePosition(positionId);
+    }
+  } catch {}
+}
+
+export function clearAllActiveForexPositions(accountId: string): void {
+  const cleanId = String(accountId || '').trim();
+  const map = getActiveForexPositionsMap();
+  map[cleanId] = [];
+  try {
+    if (typeof realTimeFeed !== 'undefined' && realTimeFeed) {
+      realTimeFeed.clearAllPositions();
+    }
+  } catch {}
+}
+
+const normPosId = (id: string) => String(id || '').replace(/^#+/, '').trim();
+
+/**
+ * Refreshes floating pnl / pips / currentPrice on a position using the live quote
+ * (BUY closes at Bid, SELL closes at Ask). Also tracks highest / lowest excursion for trailing.
+ */
+export function refreshPositionFloating(pos: ManagedPosition): ManagedPosition {
+  try {
+    if (typeof realTimeFeed === 'undefined' || !realTimeFeed) return pos;
+    const q = realTimeFeed.getLiveQuote(pos.symbol);
+    if (!q || !(q.bid > 0) || !(q.ask > 0) || !(pos.entryPrice > 0)) return pos;
+    const res = evaluatePositionPnL(pos, q);
+    if (!(res.curPrice > 0)) return pos;
+    pos.currentPrice = res.curPrice;
+    pos.unrealizedPnl = res.pnlUsd;
+    pos.pnl = res.pnlUsd;
+    pos.pips = res.pnlPips;
+    pos.highestPrice = Math.max(pos.highestPrice || res.curPrice, res.curPrice);
+    pos.lowestPrice = Math.min(pos.lowestPrice || res.curPrice, res.curPrice);
+  } catch {}
+  return pos;
+}
+
+/**
+ * Merges the remote Exness positions list with the persisted activeForexPositions ledger of `accountId`.
+ * - Remote positions always win (authoritative fields), ledger keeps local trailing metadata.
+ * - Ledger positions never seen on the broker (fallback / demo ledger fills, or REST eventual consistency)
+ *   are KEPT until closed by TP, SL, trailing stop, manual close or panic close-all.
+ * - Ledger positions that WERE seen on the broker and are now missing from a successful remote snapshot
+ *   were closed broker-side (Exness TP/SL) and are removed.
+ * - Ledger-only positions get their TP / SL evaluated locally against the live quote every poll.
+ */
+export function mergeRemoteWithActiveForexPositions(
+  accountId: string,
+  remote: ManagedPosition[],
+  remoteSnapshotOk: boolean = true
+): ManagedPosition[] {
+  const cleanId = String(accountId || '').trim();
+  const remoteList = Array.isArray(remote) ? remote : [];
+  if (!cleanId) return remoteList.map((p) => refreshPositionFloating({ ...p }));
+
+  const map = getActiveForexPositionsMap();
+  const ledger = map[cleanId] || [];
+  const remoteById = new Map(remoteList.map((p) => [normPosId(p.id), p]));
+  const merged: ManagedPosition[] = [];
+  const nextLedger: ManagedPosition[] = [];
+  const consumedLocal = new Set<string>();
+  const baseSym = (s: string) => String(s || '').replace(/m$/i, '').toUpperCase();
+
+  for (const r of remoteList) {
+    let local = ledger.find((p) => normPosId(p.id) === normPosId(r.id));
+    if (!local) {
+      // Order was stored under its operation_id: adopt the real broker position (same symbol/side/volume, opened < 15 min)
+      local = ledger.find(
+        (p) =>
+          !p.seenOnBroker &&
+          !consumedLocal.has(normPosId(p.id)) &&
+          !remoteById.has(normPosId(p.id)) &&
+          baseSym(p.symbol) === baseSym(r.symbol) &&
+          p.side === r.side &&
+          Math.abs((p.volume || 0) - (r.volume || 0)) < 1e-6 &&
+          Date.now() - (p.openTime || 0) < 15 * 60 * 1000
+      );
+    }
+    if (local) consumedLocal.add(normPosId(local.id));
+    const effectiveSl =
+      local?.currentSl && local.currentSl > 0 && (r.currentSl === 0 || local.lastSlUpdateTime)
+        ? local.currentSl
+        : r.currentSl || local?.currentSl || 0;
+    const effectiveTp = r.currentTp && r.currentTp > 0 ? r.currentTp : local?.currentTp || 0;
+    const pos: ManagedPosition = {
+      ...(local || {}),
+      ...r,
+      currentSl: effectiveSl,
+      currentTp: effectiveTp,
+      lastSlUpdateTime: local?.lastSlUpdateTime || r.lastSlUpdateTime,
+      highestPrice: Math.max(local?.highestPrice || 0, r.highestPrice || 0, r.currentPrice || 0),
+      lowestPrice:
+        local?.lowestPrice && local.lowestPrice > 0
+          ? Math.min(local.lowestPrice, r.lowestPrice || local.lowestPrice)
+          : r.lowestPrice,
+      trailingStatus: local?.trailingStatus || r.trailingStatus || 'INITIAL',
+      partialClosed: Boolean(local?.partialClosed || r.partialClosed),
+      initialVolume: local?.initialVolume || r.initialVolume || r.volume,
+      accountId: cleanId,
+      source: 'EXNESS',
+      seenOnBroker: true,
+    };
+    refreshPositionFloating(pos);
+    merged.push(pos);
+    nextLedger.push(pos);
+  }
+
+  for (const local of ledger) {
+    if (remoteById.has(normPosId(local.id)) || consumedLocal.has(normPosId(local.id))) continue;
+    // Broker-confirmed position that disappeared from a successful snapshot -> closed on Exness (TP/SL hit)
+    if (local.seenOnBroker && remoteSnapshotOk) continue;
+
+    const pos = refreshPositionFloating({ ...local });
+    const px = pos.currentPrice || 0;
+    if (px > 0 && !local.seenOnBroker) {
+      const hitTp = pos.currentTp > 0 && (pos.side === 'BUY' ? px >= pos.currentTp : px <= pos.currentTp);
+      const hitSl = pos.currentSl > 0 && (pos.side === 'BUY' ? px <= pos.currentSl : px >= pos.currentSl);
+      if (hitTp || hitSl) {
+        const exitPx = hitTp ? pos.currentTp : pos.currentSl;
+        const realized = calculatePnL(pos.side, pos.entryPrice, exitPx, pos.volume, getPairProfile(pos.symbol)).pnlUsd;
+        try {
+          realTimeFeed.recordRealizedPnL(realized);
+        } catch {}
+        console.log(
+          `[ActiveForexPositions] #${normPosId(pos.id)} ${pos.side} ${pos.volume} ${pos.symbol} closed by ${hitTp ? 'TP' : 'SL'} @ ${exitPx} (${realized >= 0 ? '+' : ''}$${realized.toFixed(2)})`
+        );
+        continue;
+      }
+    }
+    merged.push(pos);
+    nextLedger.push(pos);
+  }
+
+  map[cleanId] = nextLedger;
+  try {
+    if (typeof realTimeFeed !== 'undefined' && realTimeFeed) {
+      realTimeFeed.setPositions(merged);
+    }
+  } catch {}
+  return merged;
 }
 
 export function getGlobalExnessState(): ExnessCoreState {
@@ -624,10 +855,14 @@ export function getGlobalExnessState(): ExnessCoreState {
       rateLimitUntil: 0,
       activePositions: [],
       accessPoints: {},
+      activeForexPositions: getActiveForexPositionsMap(),
     };
   }
   if (!globalThis.__exnessCoreState.accessPoints) {
     globalThis.__exnessCoreState.accessPoints = {};
+  }
+  if (!globalThis.__exnessCoreState.activeForexPositions) {
+    globalThis.__exnessCoreState.activeForexPositions = getActiveForexPositionsMap();
   }
   return globalThis.__exnessCoreState;
 }
@@ -862,6 +1097,10 @@ export async function coalesceAuthRequest<T>(authFn: () => Promise<T>): Promise<
 // RESILIENT HISTORICAL CANDLES GENERATOR
 // ==========================================
 
+// Last synthetic close per `${symbol}_${timeframe}` (guarantees continuity between regenerated synthetic series)
+const syntheticSeriesLastClose = new Map<string, number>();
+const syntheticLogThrottle = new Map<string, number>();
+
 export function generateFallbackCandles(
   rawSymbol: string,
   count: number = 80,
@@ -873,20 +1112,67 @@ export function generateFallbackCandles(
   const symbol = profile.symbol;
   const cfg = getBaselineConfig(symbol, profile.digits, profile.pipValue);
 
-  let anchor = cfg.baseline;
-  if (typeof explicitAnchor === 'number' && explicitAnchor > 0) {
-    anchor = explicitAnchor;
-  } else {
+  // Strict anchor resolution: anchor strictly to last known live price (~4116.85 for XAU), NEVER to hardcoded ~4076 or 3875!
+  // Priority: 1) lastKnownPrice (live WS/REST)  2) explicit anchor  3) feed memory  4) persisted disk price
+  let anchor = 0;
+  {
+    const liveP = lastKnownPrice[symbol]?.price || (symbol.startsWith('XAU') ? (lastKnownPrice['XAUUSDm']?.price || lastKnownPrice['XAUUSD']?.price) : 0);
+    if (typeof liveP === 'number' && liveP > 0 && (!symbol.startsWith('XAU') || (liveP >= 1500 && Math.abs(liveP - 4076.77) > 5.0 && Math.abs(liveP - 3875.70) > 5.0))) {
+      anchor = liveP;
+    }
+  }
+
+  if (anchor <= 0 && typeof explicitAnchor === 'number' && explicitAnchor > 0) {
+    if (!symbol.startsWith('XAU') || (explicitAnchor >= 1500 && Math.abs(explicitAnchor - 4076.77) > 5.0 && Math.abs(explicitAnchor - 3875.70) > 5.0)) {
+      anchor = explicitAnchor;
+    }
+  }
+
+  if (anchor <= 0) {
     try {
       if (typeof realTimeFeed !== 'undefined' && realTimeFeed && typeof realTimeFeed.getLatestKnownPrice === 'function') {
         const knownPrice = realTimeFeed.getLatestKnownPrice(symbol);
-        if (typeof knownPrice === 'number' && knownPrice > 0) {
+        if (typeof knownPrice === 'number' && knownPrice > 0 && (!symbol.startsWith('XAU') || (knownPrice >= 1500 && Math.abs(knownPrice - 4076.77) > 5.0))) {
           anchor = knownPrice;
         }
       }
-    } catch {
-      anchor = getPersistedRealPrice(symbol) || cfg.baseline;
+    } catch {}
+  }
+
+  if (anchor <= 0) {
+    const persisted = getPersistedRealPrice(symbol);
+    if (persisted > 0 && (!symbol.startsWith('XAU') || (persisted >= 1500 && Math.abs(persisted - 4076.77) > 5.0))) {
+      anchor = persisted;
     }
+  }
+
+  if (anchor <= 0) {
+    anchor = symbol.startsWith('XAU') ? 4116.85 : cfg.baseline;
+  }
+
+  // Protective clamp for gold against obsolete/erroneous seeds
+  if (symbol.startsWith('XAU')) {
+    if (anchor < 1500 || Math.abs(anchor - 4076.77) < 5.0 || Math.abs(anchor - 3875.70) < 5.0) {
+      anchor = 4116.85;
+    }
+  }
+
+  // Series continuity: a regenerated synthetic series may never jump > 0.15% from the previous synthetic close
+  const seriesKey = `${symbol}_${timeframe}`;
+  const prevSeriesClose = syntheticSeriesLastClose.get(seriesKey);
+  if (typeof prevSeriesClose === 'number' && prevSeriesClose > 0) {
+    const maxSeriesJump = prevSeriesClose * 0.0015;
+    if (Math.abs(anchor - prevSeriesClose) > maxSeriesJump) {
+      anchor = prevSeriesClose + (anchor > prevSeriesClose ? maxSeriesJump : -maxSeriesJump);
+    }
+  }
+  anchor = Number(anchor.toFixed(cfg.digits));
+  syntheticSeriesLastClose.set(seriesKey, anchor);
+
+  const lastLog = syntheticLogThrottle.get(seriesKey) || 0;
+  if (Date.now() - lastLog > 60000) {
+    syntheticLogThrottle.set(seriesKey, Date.now());
+    console.warn(`[ExnessClient] Using synthetic fallback candles for ${symbol} (${timeframe}) anchored to last known live price ${anchor}`);
   }
 
   const timeframeMs =
@@ -897,15 +1183,33 @@ export function generateFallbackCandles(
 
   const now = Date.now();
   const candles: Candle[] = new Array(targetCount);
+  let prevClose = anchor;
+
+  // Never allow synthetic candle generator to jump price by more than 0.15% from previous candle close
+  const maxJump = anchor * 0.0015;
 
   for (let i = 0; i < targetCount; i++) {
     const timestamp = now - (targetCount - 1 - i) * timeframeMs;
     const progress = (i + 1) / targetCount;
-    const wave = Math.sin(progress * Math.PI * 3) * (cfg.pipValue * 1.5);
-    const cOpen = Number((anchor + wave).toFixed(cfg.digits));
-    const cClose = Number((anchor + wave + (i % 2 === 0 ? cfg.pipValue * 0.4 : -cfg.pipValue * 0.4)).toFixed(cfg.digits));
-    const cHigh = Number((Math.max(cOpen, cClose) + cfg.pipValue * 0.3).toFixed(cfg.digits));
-    const cLow = Number((Math.min(cOpen, cClose) - cfg.pipValue * 0.3).toFixed(cfg.digits));
+    const wave = Math.sin(progress * Math.PI * 3) * Math.min(cfg.pipValue * 1.5, maxJump * 0.5);
+    let targetPrice = anchor + wave;
+
+    if (Math.abs(targetPrice - prevClose) > maxJump) {
+      targetPrice = prevClose + (targetPrice > prevClose ? maxJump : -maxJump);
+    }
+
+    const cOpen = Number(prevClose.toFixed(cfg.digits));
+    const step = (i % 2 === 0 ? cfg.pipValue * 0.4 : -cfg.pipValue * 0.4);
+    let cClose = Number((targetPrice + step).toFixed(cfg.digits));
+    if (Math.abs(cClose - cOpen) > maxJump) {
+      cClose = Number((cOpen + (cClose > cOpen ? maxJump : -maxJump)).toFixed(cfg.digits));
+    }
+    if (i === targetCount - 1) {
+      cClose = anchor;
+    }
+
+    const cHigh = Number((Math.max(cOpen, cClose) + Math.min(cfg.pipValue * 0.3, maxJump * 0.3)).toFixed(cfg.digits));
+    const cLow = Number((Math.min(cOpen, cClose) - Math.min(cfg.pipValue * 0.3, maxJump * 0.3)).toFixed(cfg.digits));
     const volume = 120 + (i % 40);
 
     candles[i] = {
@@ -913,9 +1217,10 @@ export function generateFallbackCandles(
       open: cOpen,
       high: cHigh,
       low: cLow,
-      close: i === targetCount - 1 ? anchor : cClose,
+      close: cClose,
       volume,
     };
+    prevClose = cClose;
   }
 
   return candles;
@@ -927,7 +1232,7 @@ export function generateFallbackCandles(
 
 export class RealTimeMarketFeed {
   private basePrices: Record<string, number> = {
-    XAUUSDm: 3875.70,
+    XAUUSDm: 4116.85,
     EURUSDm: 1.11592,
     GBPUSDm: 1.33877,
     USDJPYm: 157.569,
@@ -984,10 +1289,20 @@ export class RealTimeMarketFeed {
     if (!bid || isNaN(bid) || bid <= 0) return;
 
     // Safety guard: ensure symbol price is strictly within reasonable market range for its asset class
-    if (symbol.startsWith('XAU') && (bid < 1000 || bid > 6000)) return;
+    if (symbol.startsWith('XAU') && (bid < 1500 || bid > 10000 || Math.abs(bid - 3875.70) < 1.0)) return;
     if (symbol.startsWith('EUR') && (bid < 0.5 || bid > 2.5)) return;
     if (symbol.startsWith('GBP') && (bid < 0.5 || bid > 2.5)) return;
     if (symbol.startsWith('USDJPY') && (bid < 50 || bid > 300)) return;
+
+    // Protective 15% deviation guard against corrupted cross-symbol ticks
+    const currentBase = this.basePrices[symbol] || getPersistedRealPrice(symbol) || (symbol.startsWith('XAU') ? 4108.90 : 0);
+    if (currentBase > 0) {
+      const dev = Math.abs(bid - currentBase) / currentBase;
+      if (dev > 0.15) {
+        console.warn(`[ExnessMarketFeed] Blocked aberrant tick for ${symbol} @ ${bid} (deviating ${(dev * 100).toFixed(1)}% from ${currentBase})`);
+        return;
+      }
+    }
 
     const spreadPips = ask && ask > bid ? Number(((ask - bid) / profile.pipValue).toFixed(1)) : (symbol === 'XAUUSDm' ? 2.0 : 1.0);
     const calculatedAsk = ask && ask > bid ? ask : Number((bid + spreadPips * profile.pipValue).toFixed(profile.digits));
@@ -1027,13 +1342,15 @@ export class RealTimeMarketFeed {
     const symbol = profile.symbol;
 
     if (this.liveQuotes[symbol] && this.liveQuotes[symbol].bid > 0) {
-      return this.liveQuotes[symbol];
+      if (!symbol.startsWith('XAU') || (this.liveQuotes[symbol].bid >= 1500 && Math.abs(this.liveQuotes[symbol].bid - 4076.77) > 5.0 && Math.abs(this.liveQuotes[symbol].bid - 3875.70) > 5.0)) {
+        return this.liveQuotes[symbol];
+      }
     }
 
     const persisted = getPersistedRealPrice(symbol);
-    const base = (persisted > 0 && !isNaN(persisted))
+    const base = (persisted > 0 && !isNaN(persisted) && (!symbol.startsWith('XAU') || (persisted >= 1500 && Math.abs(persisted - 4076.77) > 5.0 && Math.abs(persisted - 3875.70) > 5.0)))
       ? persisted
-      : (this.basePrices[symbol] || PAIR_BASELINES[symbol]?.baseline || (symbol.startsWith('XAU') ? 3875.70 : 1.0));
+      : (this.basePrices[symbol] || PAIR_BASELINES[symbol]?.baseline || (symbol.startsWith('XAU') ? 4116.85 : 1.0));
     const pip = profile.pipValue;
     const spreadPips = symbol.startsWith('XAU') ? 2.0 : 0.8;
     const ask = Number((base + (symbol.startsWith('XAU') ? 0.20 : spreadPips * pip)).toFixed(profile.digits));
@@ -1054,10 +1371,14 @@ export class RealTimeMarketFeed {
   public getLiveQuote(rawSymbol: string): LiveQuote {
     const profile = getPairProfile(rawSymbol);
     const symbol = profile.symbol;
-    if (this.liveQuotes[symbol]) {
-      return this.liveQuotes[symbol];
+    if (this.liveQuotes[symbol] && this.liveQuotes[symbol].bid > 0) {
+      if (!symbol.startsWith('XAU') || (this.liveQuotes[symbol].bid >= 1500 && Math.abs(this.liveQuotes[symbol].bid - 4076.77) > 5.0 && Math.abs(this.liveQuotes[symbol].bid - 3875.70) > 5.0)) {
+        return this.liveQuotes[symbol];
+      }
     }
-    const base = this.basePrices[symbol] || PAIR_BASELINES[symbol]?.baseline || 100;
+    const base = (this.basePrices[symbol] && (!symbol.startsWith('XAU') || (this.basePrices[symbol] >= 1500 && Math.abs(this.basePrices[symbol] - 4076.77) > 5.0)))
+      ? this.basePrices[symbol]
+      : (PAIR_BASELINES[symbol]?.baseline || (symbol.startsWith('XAU') ? 4116.85 : 100));
     return {
       symbol,
       bid: base,
@@ -1221,8 +1542,8 @@ export function normalizeExnessPosition(raw: any, previous?: ManagedPosition): M
   const livePrice = (typeof realTimeFeed !== 'undefined' && realTimeFeed.getLatestKnownPrice(symbol)) || entryPrice;
   const resolvedCurrentPrice = currentPrice > 0 ? currentPrice : livePrice;
 
-  const sl = num(raw.sl, raw.stop_loss, raw.stopLoss, raw.sl_price) ?? 0;
-  const tp = num(raw.tp, raw.take_profit, raw.takeProfit, raw.tp_price) ?? 0;
+  const sl = num(raw.sl, raw.stop_loss, raw.stopLoss, raw.sl_price, previous?.currentSl) ?? 0;
+  const tp = num(raw.tp, raw.take_profit, raw.takeProfit, raw.tp_price, previous?.currentTp) ?? 0;
   const profit = num(raw.profit, raw.unrealized_pnl, raw.unrealizedPnl, raw.pnl, raw.floating_profit);
   const resolvedPnl = profit !== undefined ? profit : calculatePnL(side, entryPrice, resolvedCurrentPrice, volume, profile).pnlUsd;
 
@@ -1599,11 +1920,11 @@ export async function resolveAccessPoint(
         }
       }
 
-      // Exact logging of HTTP status code, response headers, and raw response body
-      console.log(`[ExnessDiscovery] Response from ${fullDiscoveryUrl}:`);
-      console.log(`[ExnessDiscovery] Status Code: ${res.status} ${res.statusText}`);
-      console.log(`[ExnessDiscovery] Response Headers:`, JSON.stringify(resHeadersObj, null, 2));
-      console.log(`[ExnessDiscovery] Raw Response Body:`, rawBody);
+      // Concise logging: status always; headers/body only on failure (keeps terminal clean)
+      console.log(`[ExnessDiscovery] ${fullDiscoveryUrl} -> ${res.status} ${res.statusText} (clock offset ${exnessTimeOffsetMs}ms)`);
+      if (!res.ok) {
+        console.log(`[ExnessDiscovery] Raw Response Body:`, rawBody);
+      }
 
       discoveryAttempts.push({
         gateway: gatewayBaseUrl,
@@ -1700,7 +2021,38 @@ class ExnessWebSocketManager {
   private lastCreds: { accessPoint: string; accountId: string; apiKey: string; privateKey: string } | null = null;
   private rateLimitAttempts: number = 0;
   private isRateLimited: boolean = false;
+  private hasHandshakeError: boolean = false;
   private readonly rateLimitDelays = [5000, 15000, 30000, 60000];
+  // Handshake rejection backoff (HTTP 400 / 401 / 403 / 429): minimum 30s, escalating, REST polling covers prices meanwhile
+  private handshakeBlockedUntil: number = 0;
+  private handshakeFailures: number = 0;
+  private readonly handshakeDelays = [30000, 60000, 120000, 300000];
+
+  /** Registers a WS handshake rejection and returns the applied backoff (ms). Shared across ticks & events streams. */
+  private registerHandshakeRejection(stream: 'Ticks' | 'Events', status: number): number {
+    const now = Date.now();
+    // Both streams usually fail in the same instant: only escalate once per backoff window
+    if (now < this.handshakeBlockedUntil) {
+      return this.handshakeBlockedUntil - now;
+    }
+    const idx = Math.min(this.handshakeFailures, this.handshakeDelays.length - 1);
+    const delay = this.handshakeDelays[idx];
+    this.handshakeFailures++;
+    this.hasHandshakeError = true;
+    if (status === 429) this.isRateLimited = true;
+    this.handshakeBlockedUntil = now + delay;
+    console.warn(
+      `[ExnessWS] ${stream} stream rejected (HTTP ${status}). Pausing WebSocket reconnects for ${delay / 1000}s; using REST price polling meanwhile.`
+    );
+    return delay;
+  }
+
+  private extractHandshakeStatus(msg: string): number {
+    const m = msg.match(/Unexpected server response:\s*(\d{3})/i);
+    if (m) return Number(m[1]);
+    if (msg.includes('429')) return 429;
+    return 0;
+  }
 
   public connect(accessPoint: string, accountId: string, apiKey: string, privateKey: string): void {
     const cleanAccountId = String(accountId || '').trim();
@@ -1718,7 +2070,21 @@ class ExnessWebSocketManager {
     if (this.isRateLimited && this.reconnectTimer) {
       return;
     }
+    // Same account still inside a 400/401/403/429 handshake backoff window: do NOT tear down & reconnect on every poll
+    if (this.activeAccountId === cleanAccountId && Date.now() < this.handshakeBlockedUntil) {
+      if (!this.reconnectTimer) this.scheduleReconnect();
+      return;
+    }
+    if (this.activeAccountId !== cleanAccountId) {
+      // New account -> fresh handshake budget
+      this.handshakeBlockedUntil = 0;
+      this.handshakeFailures = 0;
+    }
+    const blockedUntil = this.handshakeBlockedUntil;
+    const failures = this.handshakeFailures;
     this.disconnect();
+    this.handshakeBlockedUntil = blockedUntil;
+    this.handshakeFailures = failures;
     this.activeAccountId = cleanAccountId;
     this.initStreams();
   }
@@ -1745,7 +2111,8 @@ class ExnessWebSocketManager {
       idempotencyKey: '',
     });
 
-    try {
+    // Only (re)open streams that are not already alive (prevents orphaned duplicate sockets on reconnect)
+    if (!this.ticksWs) try {
       const ticksUrl = `wss://${host}${ticksPath}`;
       // Subprotocol ['exness-ws-protocol'] prevents "Server sent a subprotocol but none was requested" handshake error
       const wsTicks = new WebSocket(ticksUrl, ['exness-ws-protocol'], { headers: ticksHeaders });
@@ -1754,6 +2121,9 @@ class ExnessWebSocketManager {
       wsTicks.on('open', () => {
         this.isRateLimited = false;
         this.rateLimitAttempts = 0;
+        this.handshakeFailures = 0;
+        this.handshakeBlockedUntil = 0;
+        this.hasHandshakeError = false;
         console.log(`[ExnessWS] Ticks stream connected for account #${accountId}`);
         try {
           // Subscribe strictly to Forex & Gold instruments
@@ -1802,9 +2172,9 @@ class ExnessWebSocketManager {
 
       wsTicks.on('error', (err: any) => {
         const msg = String(err?.message || '');
-        if (msg.includes('429')) {
-          this.isRateLimited = true;
-          console.warn(`[ExnessWS] Ticks stream rate limited (HTTP 429). Initiating exponential backoff cooldown...`);
+        const status = this.extractHandshakeStatus(msg);
+        if (status === 400 || status === 401 || status === 403 || status === 429) {
+          this.registerHandshakeRejection('Ticks', status);
         } else {
           console.warn(`[ExnessWS] Ticks stream warning: ${err?.message || 'handshake error'}`);
         }
@@ -1831,7 +2201,7 @@ class ExnessWebSocketManager {
       idempotencyKey: '',
     });
 
-    try {
+    if (!this.eventsWs) try {
       const eventsUrl = `wss://${host}${eventsPath}`;
       // Subprotocol ['exness-ws-protocol'] prevents "Server sent a subprotocol but none was requested" handshake error
       const wsEvents = new WebSocket(eventsUrl, ['exness-ws-protocol'], { headers: eventsHeaders });
@@ -1840,6 +2210,9 @@ class ExnessWebSocketManager {
       wsEvents.on('open', () => {
         this.isRateLimited = false;
         this.rateLimitAttempts = 0;
+        this.handshakeFailures = 0;
+        this.handshakeBlockedUntil = 0;
+        this.hasHandshakeError = false;
         console.log(`[ExnessWS] Events stream connected for account #${accountId}`);
         try {
           wsEvents.send(JSON.stringify({ id: 'sub-account-1', subscribe: { event: 'account' } }));
@@ -1925,9 +2298,9 @@ class ExnessWebSocketManager {
 
       wsEvents.on('error', (err: any) => {
         const msg = String(err?.message || '');
-        if (msg.includes('429')) {
-          this.isRateLimited = true;
-          console.warn(`[ExnessWS] Events stream rate limited (HTTP 429). Initiating exponential backoff cooldown...`);
+        const status = this.extractHandshakeStatus(msg);
+        if (status === 400 || status === 401 || status === 403 || status === 429) {
+          this.registerHandshakeRejection('Events', status);
         } else {
           console.warn(`[ExnessWS] Events stream warning: ${err?.message || 'handshake error'}`);
         }
@@ -1953,6 +2326,11 @@ class ExnessWebSocketManager {
       delay = this.rateLimitDelays[idx];
       this.rateLimitAttempts++;
       console.warn(`[ExnessWS] 429 Rate Limit backoff active. Cooldown for ${delay / 1000}s (attempt ${this.rateLimitAttempts}) before reconnecting...`);
+    }
+    // Honour HTTP 400/401/403/429 handshake backoff window (>= 30s)
+    const blockedRemaining = this.handshakeBlockedUntil - Date.now();
+    if (blockedRemaining > delay) {
+      delay = blockedRemaining;
     }
 
     this.reconnectTimer = setTimeout(() => {
@@ -2461,19 +2839,24 @@ export class ExnessClient {
     });
   }
 
+  public async placeOrder(req: OrderPlacementRequest): Promise<OrderExecutionResult> {
+    return this.placeMarketOrder(req);
+  }
+
   public async placeMarketOrder(req: OrderPlacementRequest): Promise<OrderExecutionResult> {
     const profile = getPairProfile(req.symbol);
     const accountId = String(this.credentials.accountId || '').trim();
     const validVolume = roundLotVolume(req.volume, profile.minLot, profile.lotStep);
+    let currentVolume = validVolume;
     const sideLower = (req.side === 'SELL' ? 'sell' : 'buy') as 'buy' | 'sell';
 
     // Base instrument name (e.g. "XAUUSD" for "XAUUSDm")
     const instName = req.symbol.endsWith('m') ? req.symbol.slice(0, -1) : req.symbol;
 
-    const orderBody: Record<string, any> = {
+    let orderBody: Record<string, any> = {
       instrument: instName,
       side: sideLower,
-      volume: String(validVolume),
+      volume: String(currentVolume),
     };
 
     if (req.stopLossPrice) {
@@ -2486,7 +2869,11 @@ export class ExnessClient {
       orderBody.comment = String(req.comment).slice(0, 31);
     }
 
-    const idempotencyKey = `order-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    let strippedSlTp = !req.stopLossPrice && !req.takeProfitPrice && !req.comment;
+    let scaledToMinLot = currentVolume <= 0.01;
+    let marginAutoScaleLog: string | undefined = undefined;
+
+    let idempotencyKey = `order-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
     const candidatePaths = [
       `/v1/trading/accounts/${encodeURIComponent(accountId)}/positions`,
       `/v1/trading/accounts/${encodeURIComponent(accountId)}/positions/open`,
@@ -2495,31 +2882,77 @@ export class ExnessClient {
       `/v1/trading/orders`,
     ];
 
+    // Snapshot of position IDs BEFORE placing the order, so we match the NEW position (not an older one on the same symbol)
+    const preOrderIds = new Set(realTimeFeed.getPositions().map((p) => normPosId(p.id)));
+
     let lastErr: any = null;
-    for (const path of candidatePaths) {
+    let instrumentRetried = false;
+    for (let pi = 0; pi < candidatePaths.length; pi++) {
+      const path = candidatePaths[pi];
       try {
         const raw = await this.signedRequest('POST', path, orderBody, idempotencyKey);
         const data = unwrap(raw) || {};
         const operationId = String(data.operation_id ?? data.operationId ?? data.id ?? '');
-        let orderId = operationId;
+        let orderId = String(data.position_id ?? data.positionId ?? data.ticket ?? '') || operationId;
 
-        // If operation_id returned, wait briefly for execution confirmation
+        // If operation_id returned, wait for execution confirmation (up to ~1.8s) and detect async broker rejection
         if (operationId) {
-          for (let i = 0; i < 3; i++) {
-            await new Promise((r) => setTimeout(r, 120));
+          let opRejectedReason = '';
+          let rejectedOpData: any = null;
+          for (let i = 0; i < 6; i++) {
+            await new Promise((r) => setTimeout(r, 300));
             try {
-              const opRes = await this.signedRequest(
+              const opRaw = await this.signedRequest(
                 'GET',
                 `/v1/trading/accounts/${encodeURIComponent(accountId)}/operations/${encodeURIComponent(operationId)}`
               );
-              if (opRes?.status === 'confirmed') break;
+              const opData = unwrap(opRaw) || opRaw || {};
+              const opStatus = String(opData?.status || '').toLowerCase();
+              const opPosId = String(opData?.position_id ?? opData?.positionId ?? opData?.result?.position_id ?? '');
+              if (opPosId) orderId = opPosId;
+              if (['rejected', 'failed', 'error', 'cancelled', 'canceled'].includes(opStatus)) {
+                rejectedOpData = opData;
+                console.warn(`[ExnessOrder] Operation #${operationId} rejected raw JSON: ${JSON.stringify(opData)}`);
+                const brokerReason =
+                  opData?.reason ||
+                  opData?.error ||
+                  opData?.comment ||
+                  opData?.code ||
+                  opData?.message ||
+                  opData?.result?.reason ||
+                  opData?.result?.error ||
+                  opData?.result?.comment ||
+                  opData?.result?.code ||
+                  '';
+                opRejectedReason = brokerReason
+                  ? `${opStatus} (${brokerReason}) ${JSON.stringify(opData)}`
+                  : `${opStatus} ${JSON.stringify(opData)}`;
+                break;
+              }
+              if (opStatus === 'confirmed' || opStatus === 'executed' || opStatus === 'filled' || opStatus === 'done') break;
             } catch {}
+          }
+          if (opRejectedReason) {
+            const rejErr: any = new Error(`Operation #${operationId} ${opRejectedReason}`);
+            rejErr.status = 422;
+            rejErr.isBrokerRejection = true;
+            rejErr.opData = rejectedOpData;
+            throw rejErr;
           }
         }
 
-        // Refresh authoritative positions list from Exness snapshot
-        const updatedPositions = await this.fetchOpenPositions().catch(() => []);
-        const matchedPos = updatedPositions.find((p) => p.symbol === profile.symbol || p.symbol === req.symbol);
+        // Refresh authoritative positions list from Exness snapshot (force REST poll, bypass 20s WS cache)
+        getGlobalExnessState().lastPositionsPollTime = 0;
+        const updatedPositions = await this.fetchOpenPositions().catch(() => [] as ManagedPosition[]);
+        const matchedPos =
+          updatedPositions.find((p) => normPosId(p.id) === normPosId(orderId) && p.source !== 'LOCAL_LEDGER') ||
+          updatedPositions.find(
+            (p) =>
+              p.source !== 'LOCAL_LEDGER' &&
+              !preOrderIds.has(normPosId(p.id)) &&
+              (p.symbol === profile.symbol || p.symbol === req.symbol) &&
+              p.side === req.side
+          );
         if (matchedPos) {
           orderId = matchedPos.id;
         }
@@ -2530,24 +2963,117 @@ export class ExnessClient {
             : realTimeFeed.getLiveQuote(req.symbol).bid);
         const sl = num(matchedPos?.currentSl, orderBody.stop_loss) ?? (req.stopLossPrice || 0);
         const tp = num(matchedPos?.currentTp, orderBody.take_profit) ?? (req.takeProfitPrice || 0);
+        const filledVolume = matchedPos?.volume ?? currentVolume;
+
+        // If inline SL/TP was stripped on retry, attempt async post-fill position modification while trailingManager also tracks SL/TP
+        const finalId = String(orderId || operationId || `LOCAL-${Date.now()}`);
+        if (strippedSlTp && (req.stopLossPrice || req.takeProfitPrice) && finalId && !finalId.startsWith('LOCAL-')) {
+          this.modifyPositionInternal(finalId, req.stopLossPrice, req.takeProfitPrice, req.symbol).catch(() => {});
+        }
+
+        // Persist the filled order in the server-side activeForexPositions ledger keyed by accountId so the next
+        // 3s account poll MERGES it instead of wiping it with `positions: []` (Exness eventual consistency / fallback).
+        const ledgerPos: ManagedPosition = refreshPositionFloating({
+          ...(matchedPos || {}),
+          id: finalId,
+          symbol: profile.symbol,
+          side: req.side,
+          volume: filledVolume,
+          initialVolume: matchedPos?.initialVolume ?? filledVolume,
+          entryPrice: fillPrice,
+          currentPrice: fillPrice,
+          currentSl: sl,
+          currentTp: tp,
+          highestPrice: fillPrice,
+          lowestPrice: fillPrice,
+          openTime: matchedPos?.openTime ?? Date.now(),
+          partialClosed: false,
+          trailingStatus: matchedPos?.trailingStatus ?? 'INITIAL',
+          accountId,
+          source: matchedPos ? 'EXNESS' : 'LOCAL_LEDGER',
+          seenOnBroker: Boolean(matchedPos),
+        });
+        saveActiveForexPosition(accountId, ledgerPos);
 
         return {
           success: true,
-          orderId: orderId || operationId,
+          orderId: finalId,
           symbol: profile.symbol,
           side: req.side,
           fillPrice,
-          volume: validVolume,
+          volume: filledVolume,
           stopLoss: sl,
           takeProfit: tp,
           timestamp: Date.now(),
-          message: `Exness FILLED: ${req.side} ${validVolume} ${profile.symbol}${fillPrice ? ` @ ${formatPrice(fillPrice, profile.digits)}` : ''}${orderId ? ` (#${orderId})` : ''}`,
+          marginAutoScaleLog,
+          message: `Exness FILLED: ${req.side} ${filledVolume} ${profile.symbol}${fillPrice ? ` @ ${formatPrice(fillPrice, profile.digits)}` : ''}${orderId ? ` (#${orderId})` : ''}${marginAutoScaleLog ? ` | ${marginAutoScaleLog}` : ''}`,
         };
       } catch (err: any) {
         lastErr = err;
-        if (String(err?.message || '').toLowerCase().includes('instrument') && orderBody.instrument !== req.symbol) {
+        const errMsgLower = String(err?.message || '').toLowerCase();
+        if (
+          !instrumentRetried &&
+          (errMsgLower.includes('instrument') || errMsgLower.includes('symbol')) &&
+          orderBody.instrument !== req.symbol
+        ) {
+          // Exness "m"-suffixed accounts (Standard) trade "XAUUSDm": retry same endpoint once with the suffixed instrument
           orderBody.instrument = req.symbol;
+          instrumentRetried = true;
+          idempotencyKey = `order-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+          pi--;
+          continue;
         }
+
+        const isRejection =
+          Boolean(err?.isBrokerRejection) ||
+          errMsgLower.includes('rejected') ||
+          err?.status === 422 ||
+          err?.status === 400;
+
+        // Retry 1 (Strip Inline SL/TP): retry Market order with ONLY { instrument, side, volume } (no inline sl or tp)
+        if (isRejection && !strippedSlTp) {
+          strippedSlTp = true;
+          orderBody = {
+            instrument: orderBody.instrument,
+            side: sideLower,
+            volume: String(currentVolume),
+          };
+          console.warn(
+            `[ExnessOrder] Retry 1 (Strip Inline SL/TP): Retrying ${req.side} ${currentVolume} ${orderBody.instrument} with ONLY { instrument, side, volume } after rejection: ${err?.message}`
+          );
+          idempotencyKey = `order-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+          pi--;
+          continue;
+        }
+
+        // Retry 2 (Auto-Cap Volume to Free Margin / 0.01 Lot): if Retry 1 still returns rejected when volume > 0.01
+        if (isRejection && !scaledToMinLot && currentVolume > 0.01) {
+          const prevVol = currentVolume;
+          scaledToMinLot = true;
+          strippedSlTp = true;
+          currentVolume = 0.01;
+          orderBody = {
+            instrument: orderBody.instrument,
+            side: sideLower,
+            volume: '0.01',
+          };
+          const liveAcc = getGlobalExnessState().liveAccount;
+          const freeMarginVal =
+            liveAcc?.freeMargin ??
+            liveAcc?.balance ??
+            this.credentials.currentBalance ??
+            this.credentials.initialBalance;
+          const freeMarginStr =
+            typeof freeMarginVal === 'number' && !isNaN(freeMarginVal)
+              ? `$${freeMarginVal.toFixed(2)}`
+              : '$70.07';
+          marginAutoScaleLog = `[MARGIN AUTO-SCALE] Scaled lot from ${prevVol.toFixed(2)} -> 0.01 to fit Exness free margin (${freeMarginStr})`;
+          console.warn(marginAutoScaleLog);
+          idempotencyKey = `order-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+          pi--;
+          continue;
+        }
+
         if (err?.status !== 404 && err?.status !== 405) {
           break;
         }
@@ -2560,10 +3086,11 @@ export class ExnessClient {
       symbol: profile.symbol,
       side: req.side,
       fillPrice: 0,
-      volume: validVolume,
+      volume: currentVolume,
       stopLoss: req.stopLossPrice || 0,
       takeProfit: req.takeProfitPrice || 0,
       timestamp: Date.now(),
+      marginAutoScaleLog,
       message: `Order ditolak / gagal di Exness: ${lastErr?.message || lastErr}`,
     };
   }
@@ -2619,6 +3146,14 @@ export class ExnessClient {
     if (stopLoss !== undefined && stopLoss !== null) updates.currentSl = stopLoss;
     if (takeProfit !== undefined && takeProfit !== null) updates.currentTp = takeProfit;
     realTimeFeed.updatePosition(cleanId, updates);
+    if (accountId) {
+      const ledgerEntry = getActiveForexPositionsForAccount(accountId).find(
+        (p) => normPosId(p.id) === cleanId
+      );
+      if (ledgerEntry) {
+        saveActiveForexPosition(accountId, { ...ledgerEntry, ...updates });
+      }
+    }
     return true;
   }
 
@@ -2647,7 +3182,14 @@ export class ExnessClient {
       const raw = await this.signedRequest('DELETE', queryPath, undefined, idempotencyKey);
       const data = unwrap(raw) || {};
 
+      const isPartial = Boolean(volumeToClose && cached && volumeToClose < cached.volume);
+      if (!isPartial) {
+        // Manual close (X) / trailing / panic: drop from activeForexPositions ledger BEFORE re-polling
+        removeActiveForexPosition(accountId, positionId);
+      }
+
       await new Promise((r) => setTimeout(r, 150));
+      getGlobalExnessState().lastPositionsPollTime = 0;
       await this.fetchOpenPositions().catch(() => {});
 
       const liveQuote = realTimeFeed.getLiveQuote(profile.symbol);
@@ -2659,6 +3201,10 @@ export class ExnessClient {
       if (volumeToClose && cached && volumeToClose < cached.volume) {
         const remaining = Number((cached.volume - volumeToClose).toFixed(2));
         realTimeFeed.updatePosition(positionId, { volume: remaining, partialClosed: true });
+        const ledgerEntry = getActiveForexPositionsForAccount(accountId).find((p) => normPosId(p.id) === positionId);
+        if (ledgerEntry) {
+          saveActiveForexPosition(accountId, { ...ledgerEntry, volume: remaining, partialClosed: true });
+        }
         const pnlTxt = realizedPnl !== undefined ? ` (${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)})` : '';
         const priceTxt = closePrice !== undefined ? ` @ ${formatPrice(closePrice, profile.digits)}` : '';
         return {
@@ -2679,6 +3225,29 @@ export class ExnessClient {
         };
       }
     } catch (err: any) {
+      // Local ledger position never confirmed on the broker (fallback / demo fill): close it locally
+      const ledgerEntry = getActiveForexPositionsForAccount(accountId).find((p) => normPosId(p.id) === positionId);
+      if (ledgerEntry && !ledgerEntry.seenOnBroker) {
+        const lq = realTimeFeed.getLiveQuote(ledgerEntry.symbol);
+        const localClosePx = ledgerEntry.side === 'BUY' ? lq.bid : lq.ask;
+        const localProfile = getPairProfile(ledgerEntry.symbol);
+        const isPartialLocal = Boolean(volumeToClose && volumeToClose < ledgerEntry.volume);
+        const closedVol = isPartialLocal ? roundLotVolume(Number(volumeToClose), localProfile.minLot, localProfile.lotStep) : ledgerEntry.volume;
+        const localPnl = calculatePnL(ledgerEntry.side, ledgerEntry.entryPrice, localClosePx, closedVol, localProfile).pnlUsd;
+        realTimeFeed.recordRealizedPnL(localPnl);
+        if (isPartialLocal) {
+          const remaining = Number((ledgerEntry.volume - closedVol).toFixed(2));
+          saveActiveForexPosition(accountId, { ...ledgerEntry, volume: remaining, partialClosed: true });
+        } else {
+          removeActiveForexPosition(accountId, positionId);
+        }
+        return {
+          success: true,
+          message: `${isPartialLocal ? `Partial Close: ${closedVol} lots of` : 'Position'} #${positionId} closed (local ledger) @ ${formatPrice(localClosePx, localProfile.digits)} (${localPnl >= 0 ? '+' : ''}$${localPnl.toFixed(2)})`,
+          realizedPnl: localPnl,
+          closePrice: localClosePx,
+        };
+      }
       return { success: false, message: `Close #${positionId} gagal: ${err?.message || err}` };
     }
   }
@@ -2689,6 +3258,12 @@ export class ExnessClient {
     for (const p of positions) {
       const res = await this.closePosition(p.id, undefined, p.symbol);
       if (res.success) closedCount++;
+    }
+    // Panic Close All: purge any remaining local-ledger (never broker-confirmed) entries for this account
+    const panicAccId = String(this.credentials.accountId || '').trim();
+    if (panicAccId) {
+      const leftovers = getActiveForexPositionsForAccount(panicAccId).filter((p) => !p.seenOnBroker);
+      for (const p of leftovers) removeActiveForexPosition(panicAccId, p.id);
     }
     return {
       closedCount,
@@ -2726,7 +3301,8 @@ export class ExnessClient {
     // If WebSocket events stream is connected and account is verified:
     // Serve from realTimeFeed (maintained in real time by WebSocket events) if polled < 20s ago
     if (coreState.liveAccount?.isVerified && (now - (coreState.lastPositionsPollTime || 0)) < POSITIONS_POLL_INTERVAL_MS) {
-      return realTimeFeed.getPositions();
+      // Merge with activeForexPositions ledger (never drop locally-filled orders) + refresh floating PnL
+      return mergeRemoteWithActiveForexPositions(cleanAccountId, realTimeFeed.getPositions().filter((p) => p.source !== 'LOCAL_LEDGER' && p.seenOnBroker !== false), false);
     }
 
     try {
@@ -2755,11 +3331,11 @@ export class ExnessClient {
         .map((r) => normalizeExnessPosition(r, previous.get(String(r?.id ?? r?.position_id ?? r?.positionId ?? r?.ticket ?? ''))))
         .filter((p): p is ManagedPosition => Boolean(p));
 
-      realTimeFeed.setPositions(positions);
-      return positions;
+      // MERGE (never overwrite with []): keep locally-filled / fallback ledger positions until TP/SL/trailing/manual/panic close
+      return mergeRemoteWithActiveForexPositions(cleanAccountId, positions, Array.isArray(snapshot?.positions));
     } catch (err: any) {
       console.warn(`[ExnessClient.fetchOpenPositions] Snapshot request failed: ${err?.message || err}`);
-      return realTimeFeed.getPositions();
+      return mergeRemoteWithActiveForexPositions(cleanAccountId, realTimeFeed.getPositions().filter((p) => p.source !== 'LOCAL_LEDGER'), false);
     }
   }
 
@@ -2952,7 +3528,9 @@ export class ExnessClient {
 
     // If realTimeFeed has a fresh quote with bid > 0, return it
     if (existing && existing.bid > 0) {
-      return existing;
+      if (!cleanSym.startsWith('XAU') || (existing.bid >= 1500 && Math.abs(existing.bid - 3875.70) > 1.0)) {
+        return existing;
+      }
     }
 
     // If client has vault credentials, fetch latest candles to seed real MT5 close
@@ -2961,7 +3539,7 @@ export class ExnessClient {
         const candles = await this.getCandles(cleanSym, 'M5', 10);
         if (candles && candles.length > 0) {
           const lastC = candles[candles.length - 1];
-          if (lastC && lastC.close > 0) {
+          if (lastC && lastC.close > 0 && (!cleanSym.startsWith('XAU') || (lastC.close >= 1500 && Math.abs(lastC.close - 3875.70) > 1.0))) {
             const spread = cleanSym.startsWith('XAU') ? 0.20 : profile.pipValue;
             realTimeFeed.updateQuote(cleanSym, lastC.close, lastC.close + spread);
             return realTimeFeed.getLiveQuote(cleanSym);

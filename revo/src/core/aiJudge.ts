@@ -40,6 +40,7 @@ export interface AiProviderInput {
 }
 
 export interface AiConfig {
+  id?: string; // optional provider identifier (e.g. 'openai', 'gemini', '9router')
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -80,13 +81,24 @@ export function normalizeAiEndpoint(rawBaseUrl: string): {
     trimmed = 'http://localhost:20128/v1';
   }
 
-  const isLocal = trimmed.includes('localhost') || trimmed.includes('127.0.0.1') || trimmed.includes('0.0.0.0');
+  // Sanitize duplicate /v1 paths e.g. /v1/v1 or /v1/v1/ -> /v1
+  trimmed = trimmed.replace(/\/+$/, '').replace(/\/v1\/+v1(\/|$)/g, '/v1$1');
+
+  const isLocal =
+    trimmed.includes('localhost') ||
+    trimmed.includes('127.0.0.1') ||
+    trimmed.includes('0.0.0.0') ||
+    trimmed.includes('11434') ||
+    trimmed.includes('ollama');
   const isAnthropic = trimmed.includes('api.anthropic.com');
 
   if (isAnthropic) {
     let base = trimmed;
     if (base.endsWith('/messages')) {
       base = base.replace(/\/messages$/, '');
+    }
+    if (!base.endsWith('/v1')) {
+      base = `${base}/v1`;
     }
     return {
       baseUrl: base,
@@ -98,14 +110,35 @@ export function normalizeAiEndpoint(rawBaseUrl: string): {
   }
 
   let base = trimmed;
-  if (base.endsWith('/chat/completions')) {
-    base = base.replace(/\/chat\/completions$/, '');
+  // Strip any endpoint suffix the admin may have pasted (chat/completions, /models, Ollama native /api/chat)
+  base = base
+    .replace(/\/chat\/completions\/?$/i, '')
+    .replace(/\/models\/?$/i, '')
+    .replace(/\/api\/(chat|generate)\/?$/i, '')
+    .replace(/\/+$/, '');
+
+  // Sanitize trailing /v1 or ensure standardized /v1 for OpenAI-compatible gateways.
+  // Canonical form: baseUrl.replace(/\/v1\/?$/, '') + '/v1' -> never produces /v1/v1/chat/completions
+  const isGoogle = base.includes('generativelanguage.googleapis.com');
+  if (!isGoogle) {
+    // Collapse any number of trailing /v1 segments (e.g. /v1/v1) and Ollama native /api root
+    while (/\/v1$/i.test(base)) {
+      base = base.replace(/\/v1$/i, '');
+    }
+    if (isLocal) {
+      base = base.replace(/\/api$/i, '');
+    }
+    base = `${base}/v1`;
   }
+
+  // Ensure chatEndpoint is strictly base + /chat/completions without duplicate /v1
+  const cleanChat = `${base.replace(/\/+$/, '')}/chat/completions`;
+  const cleanModels = `${base.replace(/\/+$/, '')}/models`;
 
   return {
     baseUrl: base,
-    chatEndpoint: `${base}/chat/completions`,
-    modelsEndpoint: `${base}/models`,
+    chatEndpoint: cleanChat,
+    modelsEndpoint: cleanModels,
     isAnthropic: false,
     isLocal,
   };
@@ -328,11 +361,12 @@ export async function testAiPing(config: {
   const model = (config.model || '').trim() || 'gpt-4o-mini';
 
   const { chatEndpoint, isAnthropic, isLocal, baseUrl } = normalizeAiEndpoint(rawBaseUrl);
+  const isCloud = isCloudProvider('', rawBaseUrl);
 
-  // Allow empty or placeholder API key for local instances (9Router or Ollama)
-  const effectiveApiKey = apiKey || (isLocal ? 'sk-local-9router' : '');
+  // Allow empty or placeholder API key for local/custom/VPS instances (9Router or Ollama)
+  const effectiveApiKey = apiKey || (!isCloud || isLocal ? 'sk-local-9router' : '');
 
-  if (!effectiveApiKey && !isLocal) {
+  if (!effectiveApiKey && isCloud) {
     return {
       success: false,
       statusText: 'FAILED (Missing API Key)',
@@ -348,7 +382,7 @@ export async function testAiPing(config: {
     try {
       controller.abort();
     } catch {}
-  }, 10000);
+  }, 15000);
 
   try {
     let response: Response;
@@ -525,14 +559,8 @@ Evaluate the qualified setup across our 3-Pillar Quantitative Confluence Framewo
 
 Scale recommended SL/TP pips and tick distances appropriately for the asset's volatility and ATR.
 
-You must respond with ONLY a strict JSON object matching this schema without markdown fences or other text:
-{
-  "decision": "EXECUTE" | "REJECT",
-  "confidence_score": <number 0-100>,
-  "recommended_sl_pips": <number>,
-  "recommended_tp_pips": <number>,
-  "reasoning": "<concise 1-sentence analytical rationale addressing the 3 pillars>"
-}`;
+You must respond with ONLY a strict compact single-line JSON object matching this schema without markdown fences or other text:
+{"decision":"EXECUTE"|"REJECT","confidence_score":<number 0-100>,"recommended_sl_pips":<number>,"recommended_tp_pips":<number>,"reasoning":"<concise <=12 words analytical rationale>"}`;
 }
 
 /**
@@ -602,7 +630,7 @@ export interface QuantFallbackBreakdown {
  * wick conviction, and multi-timeframe volatility harmony.
  */
 export function computeAdaptiveQuantFallback(snapshot: TechnicalSnapshotPayload): QuantFallbackBreakdown {
-  const baseScore = Math.max(65, Math.min(74, Math.round((snapshot.confluence_score || 65) * 0.98)));
+  const baseScore = Math.max(55, Math.min(85, Math.round((snapshot.confluence_score || 65) * 0.98)));
   let trendWeight = 0;
   let setupWeight = 0;
   let divergenceWeight = 0;
@@ -700,7 +728,8 @@ export function computeAdaptiveQuantFallback(snapshot: TechnicalSnapshotPayload)
     erWeight +
     pocWeight +
     btcWeight;
-  const finalScore = Math.min(100, Math.max(0, rawSum));
+  // Bound fallback score to realistic quantitative confluence range (50% - 95%)
+  const finalScore = Math.max(50, Math.min(95, Math.round(rawSum)));
 
   const parts: string[] = [`Base ${baseScore}`];
   if (trendWeight > 0) parts.push(`Trend +${trendWeight}`);
@@ -749,11 +778,12 @@ export function computeQuantHeuristicVerdict(
   // Blend Kronos VPS Directional Confluence if aligned
   if (kronosContext && typeof kronosContext.bullishPct === 'number') {
     if (snapshot.side === 'BUY' && kronosContext.bullishPct >= 58) {
-      score = Math.min(100, score + 3);
+      score = Math.min(95, score + 2);
     } else if (snapshot.side === 'SELL' && kronosContext.bullishPct <= 42) {
-      score = Math.min(100, score + 3);
+      score = Math.min(95, score + 2);
     }
   }
+  score = Math.max(50, Math.min(95, score));
 
   const decision: 'EXECUTE' | 'REJECT' = score >= confidenceThreshold ? 'EXECUTE' : 'REJECT';
   const kronosTag = kronosContext?.pocPrice
@@ -792,9 +822,29 @@ export function parseAiJsonResponse(
     if (jsonMatch) {
       cleaned = jsonMatch[0];
     }
-    const parsed = JSON.parse(cleaned);
+    let parsed: any;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      const decMatch = cleaned.match(/"decision"\s*:\s*"(EXECUTE|REJECT)"/i);
+      const confMatch = cleaned.match(/"confidence_score"\s*:\s*(\d+(?:\.\d+)?)/i);
+      const slMatch = cleaned.match(/"recommended_sl_pips"\s*:\s*(\d+(?:\.\d+)?)/i);
+      const tpMatch = cleaned.match(/"recommended_tp_pips"\s*:\s*(\d+(?:\.\d+)?)/i);
+      const reasonMatch = cleaned.match(/"reasoning"\s*:\s*"([^"]*)/i);
+      if (decMatch || confMatch) {
+        parsed = {
+          decision: decMatch ? decMatch[1].toUpperCase() : 'EXECUTE',
+          confidence_score: confMatch ? Number(confMatch[1]) : 75,
+          recommended_sl_pips: slMatch ? Number(slMatch[1]) : snapshot.proposedSlPips,
+          recommended_tp_pips: tpMatch ? Number(tpMatch[1]) : snapshot.proposedTpPips,
+          reasoning: reasonMatch?.[1]?.trim() || 'AI confluence validation complete.',
+        };
+      } else {
+        throw new Error('Invalid JSON');
+      }
+    }
 
-    const decision: 'EXECUTE' | 'REJECT' = parsed.decision === 'EXECUTE' ? 'EXECUTE' : 'REJECT';
+    const parsedDecision: 'EXECUTE' | 'REJECT' = parsed.decision === 'EXECUTE' ? 'EXECUTE' : 'REJECT';
     const confidence_score = typeof parsed.confidence_score === 'number'
       ? Math.max(0, Math.min(100, parsed.confidence_score))
       : 50;
@@ -807,8 +857,11 @@ export function parseAiJsonResponse(
       ? parsed.recommended_tp_pips
       : snapshot.proposedTpPips;
 
-    const reasoning = parsed.reasoning || 'AI confluence validation complete.';
-    const executionAllowed = decision === 'EXECUTE' && confidence_score >= confidenceThreshold;
+    const reasoning = typeof parsed.reasoning === 'string' && parsed.reasoning.trim().length > 0
+      ? parsed.reasoning.trim()
+      : 'AI confluence validation complete.';
+    const executionAllowed = confidence_score >= confidenceThreshold;
+    const decision: 'EXECUTE' | 'REJECT' = executionAllowed ? 'EXECUTE' : parsedDecision;
 
     return {
       decision,
@@ -850,9 +903,10 @@ function getFailureTtlForStatus(status: number): number {
 export function isAiEndpointInFallback(config: AiConfig): boolean {
   const cleanKey = (config.apiKey || '').trim();
   const { isLocal } = normalizeAiEndpoint(config.baseUrl || '');
+  const isCloud = isCloudProvider(config.id || '', config.baseUrl || '');
 
-  // For local gateways (9Router, Ollama), an empty API key is allowed only if baseUrl is explicitly set
-  if (!isLocal && (!cleanKey || cleanKey.length < 5 || cleanKey.includes('••••••••'))) {
+  // For local/custom gateways (9Router, Ollama, VPS), an empty API key is allowed
+  if (isCloud && (!cleanKey || cleanKey.length < 5 || cleanKey.includes('••••••••'))) {
     return true;
   }
   if (!config.baseUrl || !config.baseUrl.trim()) {
@@ -885,15 +939,23 @@ async function evaluateSingleProviderStrict(
   }
 
   const { chatEndpoint, isAnthropic, isLocal } = normalizeAiEndpoint(rawBaseUrl);
-  if (!isLocal && (!cleanKey || cleanKey.length < 5 || cleanKey.includes('••••••••'))) {
+  const isCloud = isCloudProvider(provider.id || '', rawBaseUrl);
+  if (isCloud && (!cleanKey || cleanKey.length < 5 || cleanKey.includes('••••••••'))) {
     throw new Error('Missing API key');
   }
 
-  const effectiveKey = cleanKey || (isLocal ? 'sk-local-9router' : '');
+  const effectiveKey = cleanKey || (!isCloud || isLocal ? 'sk-local-9router' : '');
   const cacheKey = `${rawBaseUrl}_${effectiveKey}_${model}`;
+  const isSelfHosted = !isCloud || isLocal;
   const failureEntry = aiEndpointFailureCache.get(cacheKey);
-  if (failureEntry && Date.now() - failureEntry.timestamp < failureEntry.ttlMs) {
-    throw new Error(`Provider in failover cooldown (HTTP ${failureEntry.status})`);
+  // Self-hosted VPS / Ollama nodes are never short-circuited by the cooldown cache (except real 429 throttling),
+  // otherwise one slow cold-start would cause an instant 0ms failover to HEURISTIC_QUANT_FALLBACK on every tick.
+  const cooldownApplies = failureEntry && (!isSelfHosted || failureEntry.status === 429);
+  if (cooldownApplies && Date.now() - failureEntry!.timestamp < failureEntry!.ttlMs) {
+    throw new Error(`Provider in failover cooldown (HTTP ${failureEntry!.status}) @ ${chatEndpoint}`);
+  }
+  if (failureEntry && isSelfHosted && failureEntry.status !== 429) {
+    aiEndpointFailureCache.delete(cacheKey);
   }
 
   const marketType = snapshot.marketType || (snapshot.symbol.endsWith('USDT') ? 'CRYPTO' : 'FOREX');
@@ -901,12 +963,21 @@ async function evaluateSingleProviderStrict(
   const userPrompt = buildAiUserPrompt(snapshot, kronosContext);
   const reasoning = isReasoningModel(model);
 
+  const isVpsOrOllama =
+    isLocal ||
+    model.toLowerCase().includes('qwen') ||
+    rawBaseUrl.includes('11434') ||
+    rawBaseUrl.includes(':8000') ||
+    rawBaseUrl.includes(':8080');
+  const timeoutMs = isVpsOrOllama ? 15000 : 15000;
+  const startedAt = Date.now();
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
     try {
       controller.abort();
     } catch {}
-  }, 6500);
+  }, timeoutMs);
 
   try {
     let rawContent = '';
@@ -921,7 +992,8 @@ async function evaluateSingleProviderStrict(
         },
         body: JSON.stringify({
           model,
-          max_tokens: 512,
+          max_tokens: 80,
+          temperature: 0.1,
           system: systemPrompt,
           messages: [{ role: 'user', content: userPrompt }],
         }),
@@ -955,13 +1027,15 @@ async function evaluateSingleProviderStrict(
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
+        max_tokens: 80,
+        temperature: 0.1,
       };
 
       if (reasoning) {
-        basePayload.max_completion_tokens = 1024;
+        basePayload.max_completion_tokens = 80;
       } else {
         basePayload.temperature = 0.1;
-        basePayload.max_tokens = 512;
+        basePayload.max_tokens = 80;
       }
 
       let response = await fetch(chatEndpoint, {
@@ -1004,7 +1078,11 @@ async function evaluateSingleProviderStrict(
           ttlMs: getFailureTtlForStatus(response.status),
           warned: true,
         });
-        throw new Error(`HTTP ${response.status}`);
+        let errBody = '';
+        try {
+          errBody = (await response.text()).slice(0, 160);
+        } catch {}
+        throw new Error(`HTTP ${response.status} @ POST ${chatEndpoint}${errBody ? ` -> ${errBody}` : ''}`);
       }
 
       const json = await response.json();
@@ -1024,6 +1102,9 @@ async function evaluateSingleProviderStrict(
     };
   } catch (err: any) {
     clearTimeout(timeoutId);
+    console.warn(
+      `[AI-JUDGE] Provider ${providerLabel} failed after ${Date.now() - startedAt}ms @ ${chatEndpoint}: ${err?.name === 'AbortError' ? `timeout ${timeoutMs}ms` : err?.message || err}`
+    );
     if (!aiEndpointFailureCache.has(cacheKey)) {
       const status = err.name === 'AbortError' ? 408 : 500;
       aiEndpointFailureCache.set(cacheKey, {
@@ -1087,9 +1168,13 @@ export async function evaluateMultiAiConsensus(
   if (succeeded.length === 0) {
     // Every connected key timed out or hit rate-limit/quota -> Zero-downtime failover to Kronos Quant Engine
     const fallback = computeQuantHeuristicVerdict(snapshot, effectiveThreshold, kronosContext);
+    const failReasons = settled
+      .map((r, i) => (r.status === 'rejected' ? `${active[i]?.model || active[i]?.id || 'provider'}: ${String((r.reason as any)?.message || r.reason).slice(0, 140)}` : ''))
+      .filter(Boolean)
+      .join(' | ');
     return {
       ...fallback,
-      reasoning: `[AUTO-FAILOVER -> KRONOS QUANT] ${fallback.reasoning}`,
+      reasoning: `[AUTO-FAILOVER -> KRONOS QUANT]${failReasons ? ` (${failReasons})` : ''} ${fallback.reasoning}`,
     };
   }
 
@@ -1099,12 +1184,14 @@ export async function evaluateMultiAiConsensus(
       ? ` [Kronos POC=${kronosContext.pocPrice}, RSI=${kronosContext.rsi ?? snapshot.rsi}, Z=${kronosContext.zScore ?? 0}, ${kronosContext.regime || snapshot.regime}]`
       : '';
     const singleExecutionAllowed = Boolean(
+      single.confidence_score >= effectiveThreshold ||
       (single.decision === 'EXECUTE' && single.confidence_score >= effectiveThreshold) ||
       (isCrypto && single.confidence_score >= effectiveThreshold)
     );
 
     return {
       ...single,
+      decision: singleExecutionAllowed ? 'EXECUTE' : single.decision,
       executionAllowed: singleExecutionAllowed,
       reasoning: `[${single.providerLabel}] ${single.reasoning}${kronosNote}`,
       modelsUsed: [single.providerLabel],
@@ -1125,11 +1212,13 @@ export async function evaluateMultiAiConsensus(
   );
 
   let consensusDecision: 'EXECUTE' | 'REJECT';
-  if (executeVotes > rejectVotes) {
+  if (avgConfidence >= effectiveThreshold) {
+    // When AI score meets dynamic threshold (>= effectiveThreshold), allow execution across Forex & Crypto
+    consensusDecision = 'EXECUTE';
+  } else if (executeVotes > rejectVotes) {
     consensusDecision = 'EXECUTE';
   } else if (rejectVotes > executeVotes) {
-    // For Crypto setups where qwen2.5:3b outputs 56-62%, allow execution if score meets dynamic threshold (>= 56)
-    consensusDecision = isCrypto && avgConfidence >= effectiveThreshold ? 'EXECUTE' : 'REJECT';
+    consensusDecision = 'REJECT';
   } else {
     // Tie-breaker via Kronos VPS + Quant Fallback score
     const quantTieBreaker = computeAdaptiveQuantFallback(snapshot).finalScore;
@@ -1137,6 +1226,7 @@ export async function evaluateMultiAiConsensus(
   }
 
   const executionAllowed = Boolean(
+    avgConfidence >= effectiveThreshold ||
     (consensusDecision === 'EXECUTE' && avgConfidence >= effectiveThreshold) ||
     (isCrypto && avgConfidence >= effectiveThreshold && (snapshot.confluence_score ?? 0) >= effectiveThreshold)
   );

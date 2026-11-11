@@ -24,16 +24,21 @@ export async function POST(req: NextRequest) {
     } catch {}
 
     const savedCentral = await readCentralAiConfig();
+    const providerId = body.providerId || body.id ? String(body.providerId || body.id).trim() : '';
+    const rawBaseUrl = (body.baseUrl || body.aiBaseUrl || '').trim();
+    const matchedSlot = savedCentral.providers?.find(
+      (p) => (providerId && p.id === providerId) || (rawBaseUrl && p.baseUrl === rawBaseUrl)
+    );
     const rawApiKey = (body.apiKey ?? body.aiApiKey ?? '').trim();
     const effectiveApiKey =
       rawApiKey && !rawApiKey.includes('••••••••')
         ? rawApiKey
-        : (savedCentral.apiKey || '');
+        : (matchedSlot?.apiKey || savedCentral.apiKey || '');
 
     const result = await testAiPing({
-      baseUrl: (body.baseUrl || body.aiBaseUrl || savedCentral.baseUrl || 'http://localhost:20128/v1').trim(),
+      baseUrl: (rawBaseUrl || matchedSlot?.baseUrl || savedCentral.baseUrl || 'http://localhost:20128/v1').trim(),
       apiKey: effectiveApiKey,
-      model: (body.model || body.aiModel || savedCentral.model || 'gpt-4o-mini').trim(),
+      model: (body.model || body.aiModel || matchedSlot?.model || savedCentral.model || 'gpt-4o-mini').trim(),
     });
 
     return NextResponse.json(

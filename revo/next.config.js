@@ -7,8 +7,14 @@ const nextConfig = {
   },
   experimental: {
     lockDistDir: false,
+    cpus: 1,
+    workerThreads: false,
   },
+  productionBrowserSourceMaps: false,
   webpack: (config, { dev }) => {
+    if (!dev) {
+      config.devtool = false;
+    }
     if (dev) {
       config.watchOptions = {
         ...(config.watchOptions || {}),

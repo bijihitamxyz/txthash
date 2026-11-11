@@ -37,6 +37,13 @@ export interface ManagedPosition {
   trailingStatus: PositionTrailingStatus;
   lastSlUpdateTime?: number;
   unrealizedPnl?: number;
+  // Floating metrics refreshed every tick (UI: ACTIVE OPEN POSITIONS)
+  pnl?: number;
+  pips?: number;
+  // Persistence metadata for activeForexPositions ledger (merge remote Exness + local filled orders)
+  accountId?: string;
+  source?: 'EXNESS' | 'LOCAL_LEDGER';
+  seenOnBroker?: boolean;
 }
 
 export interface TrailingAction {
@@ -61,6 +68,7 @@ export interface TrailingEvaluationInput {
   currentRsi?: number;
   pairProfile: PairProfile;
   enablePartialClose?: boolean;
+  stopLossPips?: number;
 }
 
 /**
@@ -78,11 +86,22 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
     currentRsi = 50,
     pairProfile,
     enablePartialClose = true,
+    stopLossPips = 25,
   } = input;
 
   const profile = pairProfile;
   const isBuy = position.side === 'BUY';
   const currentPrice = isBuy ? currentBid : currentAsk;
+
+  if (!currentPrice || currentPrice <= 0 || isNaN(currentPrice)) {
+    return {
+      type: 'NONE',
+      positionId: position.id,
+      symbol: position.symbol,
+      reason: `[QUOTE GUARD] Invalid live quote for ${position.symbol} (bid=${currentBid}, ask=${currentAsk}). Skipping trailing evaluation.`,
+      statusUpdate: position.trailingStatus,
+    };
+  }
 
   // 2% Price Deviation Guard: Never evaluate SL, TP, Partial Close, or Trailing Stop if quote differs by > 2% from previous valid price
   const prevPrice = position.currentPrice || position.entryPrice;
@@ -128,16 +147,32 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
   position.unrealizedPnl = unrealizedPnl;
 
   // =========================================================================
-  // HARD SL CIRCUIT BREAKER: Auto-close if position unrealizedPnl <= -(lots * 100)
-  // (-$1.00 risk threshold for 0.01 lot)
+  // HARD SL CIRCUIT BREAKER:
+  // - Minimum 15-second grace period after order entry (protects initial spread/noise)
+  // - Calculated strictly from user's configured stopLossPips (safety floor of 25 pips on XAUUSDm)
+  //   e.g. 25 pips on 0.01 lot -> -$2.50 limit; 25 pips on 0.10 lot -> -$25.00 limit.
   // =========================================================================
-  const hardSlLimitUsd = -(position.volume * 100);
-  if (unrealizedPnl <= hardSlLimitUsd) {
+  const tradeAgeMs = Date.now() - (position.openTime || Date.now());
+  const isInGracePeriod = position.openTime > 0 && tradeAgeMs < 15000;
+
+  const effectiveSlPips = Math.max(25, stopLossPips || 25);
+  let pipValueUsdPerLot = 10;
+  if (profile.category === 'METAL' || profile.symbol === 'XAUUSDm') {
+    pipValueUsdPerLot = 100 * profile.pipValue;
+  } else if (profile.symbol.startsWith('USDJPY')) {
+    pipValueUsdPerLot = (100000 * profile.pipValue) / (currentPrice > 0 ? currentPrice : 157.0);
+  } else {
+    pipValueUsdPerLot = (profile.contractSize || 100000) * profile.pipValue;
+  }
+
+  const hardSlLimitUsd = -Number((position.volume * pipValueUsdPerLot * effectiveSlPips).toFixed(2));
+
+  if (!isInGracePeriod && unrealizedPnl <= hardSlLimitUsd) {
     return {
       type: 'HARD_SL_CLOSE',
       positionId: position.id,
       symbol: position.symbol,
-      reason: `[HARD SL CIRCUIT BREAKER] Position PnL ($${unrealizedPnl.toFixed(2)}) breached -$${Math.abs(hardSlLimitUsd).toFixed(2)} limit for ${position.volume} lot. Auto-closing position immediately.`,
+      reason: `[HARD SL CIRCUIT BREAKER] Position PnL ($${unrealizedPnl.toFixed(2)}) breached -$${Math.abs(hardSlLimitUsd).toFixed(2)} limit (${effectiveSlPips} pips) for ${position.volume} lot. Auto-closing position immediately.`,
       statusUpdate: position.trailingStatus,
     };
   }
@@ -249,7 +284,6 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
   // and unrealized PnL is slightly positive (above BE + fee/spread buffer),
   // automatically move Stop Loss to Breakeven+ or execute a protective close.
   // =========================================================================
-  const tradeAgeMs = Date.now() - (position.openTime || Date.now());
   const isStagnant = tradeAgeMs >= 45 * 60 * 1000; // > 45 mins (9 M5 candles)
   const isSlightlyPositive =
     unrealizedPnl > 0.10 ||

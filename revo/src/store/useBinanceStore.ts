@@ -42,7 +42,7 @@ export type BinanceCategory = 'ALL' | 'TOP_MOVERS' | 'L2' | 'L1_DEFI' | 'AI_MEME
 // Categorized symbol lists
 export const L2_MODULAR_SYMBOLS = [
   'ARBUSDT', 'OPUSDT', 'STRKUSDT', 'ZKUSDT', 'POLUSDT',
-  'TIAUSDT', 'MANTAUSDT', 'METISUSDT', 'ZROUSDT', 'MANTAUSDT'
+  'TIAUSDT', 'MANTAUSDT', 'METISUSDT', 'ZROUSDT', 'IMXUSDT'
 ];
 
 export const L1_DEFI_SYMBOLS = [
@@ -64,13 +64,14 @@ const VAULT_STORAGE_KEY = 'binance_vault_enc_v2';
 function getActiveCredentialsPayload(state: BinanceStoreState) {
   const isBitget = state.activeExchange === 'BITGET';
   const c = isBitget ? state.bitgetConfig : state.binanceConfig;
-  const isTest = (c?.accountType || (state.isTestnet ? 'DEMO' : 'REAL')) === 'DEMO';
+  const accountType: CryptoAccountType = c?.accountType || (state.isTestnet ? 'DEMO' : 'REAL');
+  const isTest = accountType === 'DEMO';
   return {
     apiKey: c?.apiKey || state.apiKey,
     secretKey: c?.secretKey || state.apiSecret,
     apiSecret: c?.secretKey || state.apiSecret,
     passphrase: (c as any)?.passphrase || '',
-    accountType: c?.accountType || (state.isTestnet ? 'DEMO' : 'REAL'),
+    accountType,
     isTestnet: isTest,
     exchange: state.activeExchange,
   };
@@ -242,7 +243,6 @@ export const useBinanceStore = create<BinanceStoreState>()(
           get().executeScannerTick();
         }
       },
-      isScanning: false,
       lastScanTime: 0,
       lastScanStatus: 'Engine Idle',
 
@@ -296,14 +296,18 @@ export const useBinanceStore = create<BinanceStoreState>()(
           apiSecret: creds.secretKey || '',
           isTestnet: creds.accountType === 'DEMO',
           isVaultConfigured: configured,
+          positions: [],
         });
-        get().fetchSymbolsAndTickers();
+        get().fetchSymbolsAndTickers(true);
+        if (configured) {
+          get().fetchAccountInfo();
+        }
       },
       binanceConfig: { apiKey: '', secretKey: '', accountType: 'DEMO' },
-      bitgetConfig: { apiKey: '', secretKey: '', passphrase: '', accountType: 'DEMO' },
+      bitgetConfig: { apiKey: '', secretKey: '', passphrase: '', accountType: 'REAL' },
       apiKey: '',
       apiSecret: '',
-      isTestnet: true,
+      isTestnet: false,
       isVaultConfigured: false,
       isVaultModalOpen: false,
       openVaultModal: () => set({ isVaultModalOpen: true }),
@@ -370,7 +374,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
             ? { apiKey: '', secretKey: '', accountType: 'DEMO' }
             : currentVault.binance,
           bitget: targetExchange === 'BITGET'
-            ? { apiKey: '', secretKey: '', passphrase: '', accountType: 'DEMO' }
+            ? { apiKey: '', secretKey: '', passphrase: '', accountType: 'REAL' }
             : currentVault.bitget,
           updatedAt: Date.now(),
         };
@@ -394,6 +398,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
           apiSecret: activeCreds.secretKey || '',
           isTestnet: activeCreds.accountType === 'DEMO',
           isVaultConfigured: configured,
+          ...(configured ? {} : { positions: [], walletBalance: 0, unrealizedProfit: 0, marginBalance: 0, availableBalance: 0 }),
         });
 
         get().addTelemetryLog('VAULT', 'INFO', `[SECURITY] ${targetExchange} credentials cleared from vault.`);
@@ -402,7 +407,30 @@ export const useBinanceStore = create<BinanceStoreState>()(
       loadSavedCredentials: async () => {
         if (typeof window === 'undefined') return;
         try {
-          const vault = await loadCryptoVaultFromLocalStorage();
+          let vault = await loadCryptoVaultFromLocalStorage();
+          if (!vault || (!isCryptoVaultConfigured(vault, 'BINANCE') && !isCryptoVaultConfigured(vault, 'BITGET'))) {
+            try {
+              const srvRes = await fetch('/api/binance', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'LOAD_SERVER_VAULT' }),
+              });
+              if (srvRes.ok) {
+                const srvData = await srvRes.json();
+                if (srvData.success && srvData.vault) {
+                  vault = srvData.vault as CryptoVaultData;
+                  await saveCryptoVaultToLocalStorage(vault);
+                }
+              }
+            } catch {}
+          } else {
+            fetch('/api/binance', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ action: 'SAVE_SERVER_VAULT', vault }),
+            }).catch(() => {});
+          }
+
           if (vault) {
             const activeEx = vault.activeCryptoExchange || 'BINANCE';
             const activeCreds = activeEx === 'BITGET' ? vault.bitget : vault.binance;
@@ -411,7 +439,9 @@ export const useBinanceStore = create<BinanceStoreState>()(
             set({
               activeExchange: activeEx,
               binanceConfig: vault.binance || { apiKey: '', secretKey: '', accountType: 'DEMO' },
-              bitgetConfig: vault.bitget || { apiKey: '', secretKey: '', passphrase: '', accountType: 'DEMO' },
+              bitgetConfig: vault.bitget
+                ? { ...vault.bitget, accountType: vault.bitget.accountType === 'DEMO' ? 'DEMO' : 'REAL' }
+                : { apiKey: '', secretKey: '', passphrase: '', accountType: 'REAL' },
               apiKey: activeCreds?.apiKey || '',
               apiSecret: activeCreds?.secretKey || '',
               isTestnet: activeCreds?.accountType === 'DEMO',
@@ -444,11 +474,11 @@ export const useBinanceStore = create<BinanceStoreState>()(
         }
       },
 
-      // Account & PnL
-      walletBalance: 100.00,
+      // Account & PnL (synced strictly from live exchange API — no dummy balance)
+      walletBalance: 0,
       unrealizedProfit: 0,
-      marginBalance: 100.00,
-      availableBalance: 100.00,
+      marginBalance: 0,
+      availableBalance: 0,
       dailyPnl: 0,
       dailyPnlPercent: 0,
       dailyPnlHistory: {},
@@ -466,11 +496,10 @@ export const useBinanceStore = create<BinanceStoreState>()(
         else record.losses += 1;
 
         history[today] = record;
-        const currentBal = Math.max(10, get().walletBalance + realizedPnl);
-        const pnlPct = Number(((record.pnl / 100.0) * 100).toFixed(2));
+        const baseBal = get().walletBalance > 0 ? get().walletBalance : 100.0;
+        const pnlPct = Number(((record.pnl / baseBal) * 100).toFixed(2));
 
         set({
-          walletBalance: Number(currentBal.toFixed(2)),
           dailyPnl: record.pnl,
           dailyPnlPercent: pnlPct,
           dailyPnlHistory: history,
@@ -606,23 +635,14 @@ export const useBinanceStore = create<BinanceStoreState>()(
           const json = await res.json();
           if (json.success && json.data) {
             const data = json.data;
-            const newBal = data.totalWalletBalance > 0 ? data.totalWalletBalance : get().walletBalance;
-
             const currentPositions = get().positions;
             const remotePositions: BinancePosition[] = Array.isArray(data.positions) ? data.positions : [];
             const mergedMap = new Map<string, BinancePosition>();
 
-            // 1. Anchor all active local / simulated positions so newly executed trades NEVER vanish!
-            for (const cp of currentPositions) {
-              if (cp && cp.symbol) {
-                mergedMap.set(cp.symbol, { ...cp });
-              }
-            }
-
-            // 2. Overlay / merge incoming remote positions from exchange
+            // Use strictly remote positions from exchange as source of truth
             for (const rp of remotePositions) {
               if (!rp || !rp.symbol) continue;
-              const existing = mergedMap.get(rp.symbol);
+              const existing = currentPositions.find((p) => p.symbol === rp.symbol);
               if (existing) {
                 mergedMap.set(rp.symbol, {
                   ...existing,
@@ -650,7 +670,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
               }
             }
 
-            // 3. Continuously compute mark price and unrealized PnL from latest live tickers
+            // Continuously compute mark price and unrealized PnL from latest live tickers
             const tickers = get().tickers;
             const updatedPositions = Array.from(mergedMap.values()).map((pos) => {
               const ticker = tickers[pos.symbol];
@@ -669,13 +689,14 @@ export const useBinanceStore = create<BinanceStoreState>()(
             });
 
             const totalUnrealized = updatedPositions.reduce((sum, p) => sum + (p.unRealizedProfit || 0), 0);
-            const calcWalletBal = newBal > 0 ? newBal : (get().walletBalance > 0 ? get().walletBalance : 1000.00);
+            const calcWalletBal = typeof data.totalWalletBalance === 'number' ? data.totalWalletBalance : get().walletBalance;
+            const calcAvailBal = typeof data.availableBalance === 'number' ? data.availableBalance : calcWalletBal;
 
             set({
               walletBalance: Number(calcWalletBal.toFixed(2)),
               unrealizedProfit: Number(totalUnrealized.toFixed(2)),
               marginBalance: Number((calcWalletBal + totalUnrealized).toFixed(2)),
-              availableBalance: Number((data.availableBalance > 0 ? data.availableBalance : calcWalletBal).toFixed(2)),
+              availableBalance: Number(calcAvailBal.toFixed(2)),
               positions: updatedPositions,
             });
           }
@@ -749,6 +770,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
 
             // Stage 1: 50% Partial Close & Breakeven Stop
             if (trailingAction.action === 'PARTIAL_CLOSE' && !pos.partialClosed) {
+              const originalPosAmt = pos.positionAmt;
               const closeQty = trailingAction.closeQuantity || (absAmt * 0.5);
               const realizedPnl = isLong
                 ? (curPrice - pos.entryPrice) * closeQty
@@ -756,6 +778,8 @@ export const useBinanceStore = create<BinanceStoreState>()(
 
               state.recordTradePnL(realizedPnl);
               dualRoomProtections.recordProfitHit(pos.symbol, 'crypto');
+              const remainingAbs = Math.max(0, absAmt - closeQty);
+              pos.positionAmt = isLong ? remainingAbs : -remainingAbs;
               pos.partialClosed = true;
               pos.isBreakevenLocked = true;
               pos.stopLossPrice = trailingAction.newSlPrice || (isLong ? pos.entryPrice * 1.0008 : pos.entryPrice * 0.9992);
@@ -777,7 +801,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
                     exchange: state.activeExchange,
                     isTestnet: state.isTestnet,
                     credentials: getActiveCredentialsPayload(state),
-                    payload: { symbol: pos.symbol, positionAmt: pos.positionAmt, quantityToClose: closeQty },
+                    payload: { symbol: pos.symbol, positionAmt: originalPosAmt, quantityToClose: closeQty },
                   }),
                 }).catch(() => {});
 
@@ -963,6 +987,15 @@ export const useBinanceStore = create<BinanceStoreState>()(
                 `🔥 CRYPTO ${verdict.setupName || 'CONFLUENCE'} [Score ${verdict.score}/100 | AI ${effectiveScore}% >= ${cryptoDynamicThreshold}%]: ${verdict.side} qualified. SL: $${verdict.stopLossPrice} | TP1: $${verdict.takeProfit1Price}`
               );
 
+              if (!state.isVaultConfigured) {
+                state.addTelemetryLog(
+                  sym,
+                  'GUARD',
+                  `⚠️ [${state.activeExchange}] Signal ${verdict.side} #${sym} dilewati: API Key belum dikonfigurasi di Vault.`
+                );
+                continue;
+              }
+
               // Calculate Notional & Coin Quantity using stepSize
               const margin = state.marginUsdt;
               const lev = state.leverage;
@@ -976,38 +1009,8 @@ export const useBinanceStore = create<BinanceStoreState>()(
 
               if (qtyNum <= 0) continue;
 
-              const newPos: BinancePosition = {
-                symbol: sym,
-                positionAmt: verdict.side === 'LONG' ? qtyNum : -qtyNum,
-                entryPrice: verdict.entryPrice,
-                markPrice: verdict.entryPrice,
-                unRealizedProfit: 0,
-                liquidationPrice: verdict.side === 'LONG' ? verdict.entryPrice * (1 - 0.9 / lev) : verdict.entryPrice * (1 + 0.9 / lev),
-                leverage: lev,
-                marginType: state.marginMode === 'ISOLATED' ? 'isolated' : 'cross',
-                isolatedMargin: margin,
-                initialQuantity: qtyNum,
-                partialClosed: false,
-                isBreakevenLocked: false,
-                takeProfit1Price: verdict.takeProfit1Price,
-                stopLossPrice: verdict.stopLossPrice,
-                highestPriceSinceEntry: verdict.entryPrice,
-                lowestPriceSinceEntry: verdict.entryPrice,
-                openTime: Date.now(),
-              };
-
-              // Add position
-              set((s) => ({ positions: [...s.positions, newPos] }));
-
-              state.addTelemetryLog(
-                sym,
-                'ORDER',
-                `⚡ EXECUTED ${verdict.side} #${sym}: ${formattedQty} coins (Margin: $${margin.toFixed(2)} at ${lev}x ${state.marginMode})`
-              );
-
-              // Send live order to active crypto exchange if vault configured
-              if (state.isVaultConfigured) {
-                fetch('/api/binance', {
+              try {
+                const orderRes = await fetch('/api/binance', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
@@ -1025,13 +1028,33 @@ export const useBinanceStore = create<BinanceStoreState>()(
                       leverage: lev,
                       marginMode: state.marginMode,
                       stopPrice: verdict.stopLossPrice ? String(verdict.stopLossPrice) : undefined,
+                      takeProfitPrice: verdict.takeProfit1Price ? String(verdict.takeProfit1Price) : undefined,
                     },
                   }),
-                })
-                  .then(() => {
-                    setTimeout(() => get().fetchAccountInfo(), 1000);
-                  })
-                  .catch(() => {});
+                });
+                const orderJson = await orderRes.json();
+                if (!orderRes.ok || !orderJson.success) {
+                  state.addTelemetryLog(
+                    sym,
+                    'GUARD',
+                    `❌ [${state.activeExchange}] Order ${verdict.side} #${sym} gagal: ${orderJson.error || orderJson.message || 'Exchange rejected order'}`
+                  );
+                  continue;
+                }
+
+                state.addTelemetryLog(
+                  sym,
+                  'ORDER',
+                  `⚡ EXECUTED ${verdict.side} #${sym} on ${state.activeExchange}: ${formattedQty} coins (Margin: $${margin.toFixed(2)} at ${lev}x ${state.marginMode})`
+                );
+
+                await get().fetchAccountInfo();
+              } catch (orderErr: any) {
+                state.addTelemetryLog(
+                  sym,
+                  'GUARD',
+                  `❌ [${state.activeExchange}] Order ${verdict.side} #${sym} network error: ${orderErr?.message || 'Failed'}`
+                );
               }
 
               // Check if concurrent limit reached
@@ -1049,8 +1072,21 @@ export const useBinanceStore = create<BinanceStoreState>()(
 
       executeManualTrade: async (symbol, side) => {
         const state = get();
+        if (!state.isVaultConfigured) {
+          state.addTelemetryLog(
+            symbol,
+            'GUARD',
+            `❌ [${state.activeExchange}] Tidak dapat membuka order manual: API Key belum dikonfigurasi di Vault.`
+          );
+          return;
+        }
+
         const ticker = state.tickers[symbol];
-        const price = ticker?.lastPrice || 1.0;
+        const price = ticker?.lastPrice || 0;
+        if (price <= 0) {
+          state.addTelemetryLog(symbol, 'GUARD', `❌ [${state.activeExchange}] Harga live ${symbol} belum tersedia.`);
+          return;
+        }
         const margin = state.marginUsdt;
         const lev = state.leverage;
         const notional = margin * lev;
@@ -1067,36 +1103,8 @@ export const useBinanceStore = create<BinanceStoreState>()(
         const stopLossPrice = isLong ? price - 1.5 * atrApprox : price + 1.5 * atrApprox;
         const takeProfit1Price = isLong ? price + 0.7 * (1.5 * atrApprox) : price - 0.7 * (1.5 * atrApprox);
 
-        const newPos: BinancePosition = {
-          symbol,
-          positionAmt: isLong ? qtyNum : -qtyNum,
-          entryPrice: price,
-          markPrice: price,
-          unRealizedProfit: 0,
-          liquidationPrice: isLong ? price * (1 - 0.9 / lev) : price * (1 + 0.9 / lev),
-          leverage: lev,
-          marginType: state.marginMode === 'ISOLATED' ? 'isolated' : 'cross',
-          isolatedMargin: margin,
-          initialQuantity: qtyNum,
-          partialClosed: false,
-          isBreakevenLocked: false,
-          takeProfit1Price,
-          stopLossPrice,
-          highestPriceSinceEntry: price,
-          lowestPriceSinceEntry: price,
-          openTime: Date.now(),
-        };
-
-        set((s) => ({ positions: [...s.positions, newPos] }));
-
-        state.addTelemetryLog(
-          symbol,
-          'ORDER',
-          `MANUAL ${side} ${symbol}: ${formattedQty} coins at $${price} (Margin $${margin.toFixed(2)}, ${lev}x ${state.marginMode})`
-        );
-
-        if (state.isVaultConfigured) {
-          fetch('/api/binance', {
+        try {
+          const res = await fetch('/api/binance', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1114,13 +1122,32 @@ export const useBinanceStore = create<BinanceStoreState>()(
                 leverage: lev,
                 marginMode: state.marginMode,
                 stopPrice: stopLossPrice ? String(stopLossPrice) : undefined,
+                takeProfitPrice: takeProfit1Price ? String(takeProfit1Price) : undefined,
               },
             }),
-          })
-            .then(() => {
-              setTimeout(() => get().fetchAccountInfo(), 1000);
-            })
-            .catch(() => {});
+          });
+          const json = await res.json();
+          if (!res.ok || !json.success) {
+            state.addTelemetryLog(
+              symbol,
+              'GUARD',
+              `❌ [${state.activeExchange}] Manual ${side} ${symbol} ditolak: ${json.error || json.message || 'Order failed'}`
+            );
+            return;
+          }
+
+          state.addTelemetryLog(
+            symbol,
+            'ORDER',
+            `✅ MANUAL ${side} ${symbol} (${state.activeExchange}): ${formattedQty} coins at $${price} (Margin $${margin.toFixed(2)}, ${lev}x ${state.marginMode})`
+          );
+          await get().fetchAccountInfo();
+        } catch (err: any) {
+          state.addTelemetryLog(
+            symbol,
+            'GUARD',
+            `❌ [${state.activeExchange}] Manual ${side} ${symbol} error: ${err?.message || 'Network error'}`
+          );
         }
       },
 
@@ -1182,6 +1209,18 @@ export const useBinanceStore = create<BinanceStoreState>()(
         const currentPositions = [...state.positions];
         state.addTelemetryLog('PANIC', 'ORDER', `🚨 PANIC CLOSE ALL: Liquidating ${currentPositions.length} positions across ${state.activeExchange}! Execution lock active (5s).`);
 
+        if (currentPositions.length > 0) {
+          const tickers = state.tickers;
+          let totalPanicPnl = 0;
+          for (const pos of currentPositions) {
+            const curPrice = tickers[pos.symbol]?.lastPrice || pos.markPrice || pos.entryPrice;
+            const isLong = pos.positionAmt > 0;
+            const qty = Math.abs(pos.positionAmt);
+            totalPanicPnl += isLong ? (curPrice - pos.entryPrice) * qty : (pos.entryPrice - curPrice) * qty;
+          }
+          state.recordTradePnL(totalPanicPnl);
+        }
+
         // 1. Immediately set execution lock for 5s, turn off auto-trading & scanning, and clear positions array
         set({
           isPanicClosing: true,
@@ -1214,12 +1253,6 @@ export const useBinanceStore = create<BinanceStoreState>()(
             }, 2500);
           })
           .catch(() => {});
-
-        for (const pos of currentPositions) {
-          try {
-            await state.closePosition(pos.symbol);
-          } catch {}
-        }
       },
     }),
     {
@@ -1237,9 +1270,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
         timeframe: state.timeframe,
         isTestnet: state.isTestnet,
         dailyPnlHistory: state.dailyPnlHistory,
-        walletBalance: state.walletBalance,
         isAutoTrading: state.isAutoTrading,
-        positions: state.positions,
       }),
       onRehydrateStorage: () => (rehydratedState) => {
         if (rehydratedState) {

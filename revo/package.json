@@ -5,9 +5,10 @@
   "scripts": {
     "dev": "next dev --webpack",
     "start": "next dev --webpack -p 3000",
-    "prod:build": "next build",
-    "build": "next build",
-    "lint": "next lint"
+    "prod:build": "next build --webpack",
+    "build": "next build --webpack",
+    "lint": "node --max-old-space-size=400 ./node_modules/typescript/bin/tsc --noEmit",
+    "worker": "node --experimental-strip-types src/scripts/daemonRunner.ts"
   },
   "dependencies": {
     "@types/ws": "^8.18.2",

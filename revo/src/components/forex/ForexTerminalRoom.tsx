@@ -2,7 +2,8 @@
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import dynamic from 'next/dynamic';
-import { useTradingStore } from '@/store/useTradingStore';
+import { useTradingStore, getValidLivePrice, isValidPriceUpdate, getPersistedVerifiedAccount } from '@/store/useTradingStore';
+import { getActiveExnessCredentials } from '@/lib/cryptoVault';
 import { useRoomStore } from '@/store/useRoomStore';
 import { PnlCalendarModal } from '@/components/PnlCalendarModal';
 import { getPairProfile, formatPrice, evaluatePositionPnL } from '@/core/pairConfig';
@@ -18,7 +19,6 @@ import {
   ArrowDownRight,
   Layers,
   RefreshCw,
-  AlertOctagon,
   Sliders,
   Trash2,
   CalendarDays,
@@ -44,13 +44,17 @@ let isDashboardLoopRunning = false;
 const SYMBOLS = ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'] as const;
 const TIMEFRAMES: Timeframe[] = ['M1', 'M5', 'M15', 'H1'];
 
-export const ForexTerminalRoom: React.FC = () => {
+export interface ForexTerminalRoomProps {
+  isActiveRoom?: boolean;
+}
+
+export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRoom = true }) => {
   const [isMounted, setIsMounted] = useState(false);
   const [isForexPnlOpen, setIsForexPnlOpen] = useState(false);
 
   const setActiveRoom = useRoomStore((s) => s.setActiveRoom);
   const activeRoom = useRoomStore((s) => s.activeRoom);
-  const isForexActive = activeRoom !== 'CRYPTO' && activeRoom !== 'ROOM_2_BINANCE';
+  const isForexActive = isActiveRoom && activeRoom !== 'CRYPTO' && activeRoom !== 'ROOM_2_BINANCE';
 
   // Exness Forex Store state
   const balance = useTradingStore((s) => s.balance);
@@ -83,9 +87,35 @@ export const ForexTerminalRoom: React.FC = () => {
   const kronosHealth = useTradingStore((s) => s.kronosHealth);
   const checkKronosHealth = useTradingStore((s) => s.checkKronosHealth);
 
-  // Local execution parameter states
-  const [slPips, setSlPips] = useState<number>(25);
-  const [tpPips, setTpPips] = useState<number>(50);
+  // Synchronized SL/TP execution parameter states with useTradingStore
+  const storeSlPips = useTradingStore((s) => s.stopLossPips ?? 25);
+  const storeTpPips = useTradingStore((s) => s.takeProfitPips ?? 50);
+  const setStoreSlPips = useTradingStore((s) => s.setStopLossPips);
+  const setStoreTpPips = useTradingStore((s) => s.setTakeProfitPips);
+
+  const [slPips, setLocalSlPips] = useState<number>(storeSlPips);
+  const [tpPips, setLocalTpPips] = useState<number>(storeTpPips);
+
+  useEffect(() => {
+    setLocalSlPips(storeSlPips);
+  }, [storeSlPips]);
+
+  useEffect(() => {
+    setLocalTpPips(storeTpPips);
+  }, [storeTpPips]);
+
+  const handleSlChange = (val: number) => {
+    const valid = Math.max(5, Math.min(500, val));
+    setLocalSlPips(valid);
+    setStoreSlPips(valid).catch(() => {});
+  };
+
+  const handleTpChange = (val: number) => {
+    const valid = Math.max(5, Math.min(1000, val));
+    setLocalTpPips(valid);
+    setStoreTpPips(valid).catch(() => {});
+  };
+
   const [isPlacingOrder, setIsPlacingOrder] = useState<'BUY' | 'SELL' | 'PANIC' | null>(null);
   const [closingIds, setClosingIds] = useState<Record<string, boolean>>({});
   const [modifyingIds, setModifyingIds] = useState<Record<string, boolean>>({});
@@ -103,10 +133,15 @@ export const ForexTerminalRoom: React.FC = () => {
   // Initial load on mount - load real Exness vault, account, and real-time GET /api/kronos health & prediction
   useEffect(() => {
     const initTerminal = async () => {
-      await useTradingStore.getState().checkKronosHealth();
-      await useTradingStore.getState().loadVaultOnStartup();
-      await useTradingStore.getState().fetchAccountInfo();
-      await useTradingStore.getState().fetchKronosPrediction();
+      if (!isActiveRoom && !useTradingStore.getState().isAutoTrading && (!useTradingStore.getState().openPositions || useTradingStore.getState().openPositions.length === 0)) {
+        return;
+      }
+      await Promise.allSettled([
+        useTradingStore.getState().checkKronosHealth(),
+        useTradingStore.getState().loadVaultOnStartup(),
+        useTradingStore.getState().fetchAccountInfo(),
+        useTradingStore.getState().fetchKronosPrediction(),
+      ]);
       const st = useTradingStore.getState();
       const cleanPositions = (st.openPositions || []).filter(
         (p) => p && p.id !== 'F-637' && p.id !== '#F-637'
@@ -122,12 +157,21 @@ export const ForexTerminalRoom: React.FC = () => {
       }
     };
     initTerminal();
-  }, []);
+  }, [isActiveRoom]);
+
+  // When room becomes active from background, fetch fresh forex data immediately
+  useEffect(() => {
+    if (isActiveRoom) {
+      useTradingStore.getState().executeLiveTickStream().catch(() => {});
+      useTradingStore.getState().fetchAccountInfo().catch(() => {});
+      useTradingStore.getState().fetchKronosPrediction().catch(() => {});
+    }
+  }, [isActiveRoom]);
 
   // Real-time Kronos + Multi-AI forecast sync via POST /api/kronos
   const lastCandleClose = candles && candles.length > 0 ? candles[candles.length - 1]?.close : 0;
   useEffect(() => {
-    if (!isForexActive) return;
+    if (!isForexActive && !isAutoTrading && (!openPositions || openPositions.length === 0)) return;
     let isCancelled = false;
     const syncKronosVps = async () => {
       const state = useTradingStore.getState();
@@ -182,36 +226,40 @@ export const ForexTerminalRoom: React.FC = () => {
         if (typeof document !== 'undefined' && document.hidden) return;
         tickCounter++;
         const currentRoom = useRoomStore.getState().activeRoom;
-        const currentIsForexActive = currentRoom !== 'CRYPTO' && currentRoom !== 'ROOM_2_BINANCE';
+        const currentIsForexActive = isActiveRoom && currentRoom !== 'CRYPTO' && currentRoom !== 'ROOM_2_BINANCE';
+        const isAuto = useTradingStore.getState().isAutoTrading;
+        const hasPositions = Boolean(useTradingStore.getState().openPositions && useTradingStore.getState().openPositions.length > 0);
 
-        // 1. Real-time GET /api/kronos health polling every ~4.5s
+        if (!currentIsForexActive && !isAuto && !hasPositions) {
+          return;
+        }
+
+        // 1. Real-time GET /api/kronos health polling every ~9s
         if (tickCounter % 3 === 0) {
           await useTradingStore.getState().checkKronosHealth();
         }
 
         // 2. Forex tick stream & autonomous strategy execution
-        if (currentIsForexActive || useTradingStore.getState().isAutoTrading) {
-          await useTradingStore.getState().executeLiveTickStream();
+        await useTradingStore.getState().executeLiveTickStream();
 
-          if (useTradingStore.getState().isAutoTrading && tickCounter % 2 === 0) {
-            await useTradingStore.getState().executeEngineTick();
-          }
+        if (isAuto) {
+          await useTradingStore.getState().executeEngineTick();
+        }
 
-          if (tickCounter % 4 === 0) {
-            await useTradingStore.getState().fetchAccountInfo();
-            await useTradingStore.getState().fetchKronosPrediction();
-          }
+        if (tickCounter % 4 === 0) {
+          await useTradingStore.getState().fetchAccountInfo();
+          await useTradingStore.getState().fetchKronosPrediction();
+        }
 
-          if (tickCounter % 8 === 0) {
-            await useTradingStore.getState().syncWithServerState();
-          }
+        if (tickCounter % 8 === 0) {
+          await useTradingStore.getState().syncWithServerState();
         }
       } catch (err) {
         console.error('[NMSSx Execution Loop] Error:', err);
       } finally {
         isExecuting = false;
       }
-    }, 1500);
+    }, 3000);
 
     return () => {
       clearInterval(intervalId);
@@ -231,15 +279,23 @@ export const ForexTerminalRoom: React.FC = () => {
     return raw.filter((p) => p && p.id !== 'F-637' && p.id !== '#F-637');
   }, [openPositions, positions]);
 
-  // Live Floating PnL calculation across all active Forex positions
+  // Live Floating PnL calculation across all active Forex positions strictly using filtered live prices
   const totalFloatingPnl = useMemo(() => {
     return activePositions.reduce((sum, pos) => {
       const q = quotes[pos.symbol];
-      if (q && q.bid > 0) {
-        const pnl = evaluatePositionPnL(pos, q);
-        return sum + pnl.pnlUsd;
-      }
-      return sum + (pos.unrealizedPnl || 0);
+      const validPrice = getValidLivePrice(pos.symbol);
+      const prof = getPairProfile(pos.symbol);
+      const safeQ = (q && isValidPriceUpdate(pos.symbol, q.bid))
+        ? q
+        : {
+            symbol: pos.symbol,
+            bid: validPrice,
+            ask: Number((validPrice + (pos.symbol.startsWith('XAU') ? 0.20 : prof.pipValue)).toFixed(prof.digits)),
+            spreadPips: pos.symbol.startsWith('XAU') ? 2.0 : 0.8,
+            timestamp: Date.now(),
+          };
+      const pnl = evaluatePositionPnL(pos, safeQ);
+      return sum + pnl.pnlUsd;
     }, 0);
   }, [activePositions, quotes]);
 
@@ -370,7 +426,11 @@ export const ForexTerminalRoom: React.FC = () => {
     setIsPlacingOrder(side);
     try {
       const q = quotes[activeSymbol];
-      const refPrice = side === 'BUY' ? q?.ask || q?.bid || 0 : q?.bid || q?.ask || 0;
+      const validPrice = getValidLivePrice(activeSymbol);
+      const isQuoteValid = q && isValidPriceUpdate(activeSymbol, q.bid);
+      const safeBid = isQuoteValid ? q.bid : validPrice;
+      const safeAsk = isQuoteValid ? q.ask : Number((validPrice + (activeSymbol.startsWith('XAU') ? 0.20 : activeProfile.pipValue)).toFixed(activeProfile.digits));
+      const refPrice = side === 'BUY' ? safeAsk : safeBid;
       const pipVal = activeProfile.pipValue;
       const stopLoss =
         refPrice > 0 && slPips > 0
@@ -395,6 +455,7 @@ export const ForexTerminalRoom: React.FC = () => {
         `[EA] Dispatching ${side} Market Order (${lotSize.toFixed(2)} Lots) | SL: ${stopLoss ?? 'None'} | TP: ${takeProfit ?? 'None'}`
       );
 
+      const activeCreds = getActiveExnessCredentials(useTradingStore.getState().credentials);
       const res = await fetch('/api/exness', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -406,6 +467,15 @@ export const ForexTerminalRoom: React.FC = () => {
           stopLoss,
           takeProfit,
           comment: `NMSSx_EA_${side}`,
+          credentials: {
+            accountId: activeCreds.accountId,
+            server: activeCreds.server,
+            apiKey: activeCreds.apiKey,
+            token: activeCreds.apiKey,
+            secret: activeCreds.secret,
+            privateKey: activeCreds.secret,
+            mode: activeCreds.mode,
+          },
         }),
       });
       const data = await res.json();
@@ -417,7 +487,7 @@ export const ForexTerminalRoom: React.FC = () => {
           'ORDER',
           `[EA] Order FILLED #${orderId}: ${side} ${lotSize.toFixed(2)} ${activeSymbol} @ ${fillPrice}`
         );
-        if (Array.isArray(data.positions)) {
+        if (Array.isArray(data.positions) && (data.positions.length > 0 || data.positionsSuccess !== false)) {
           useTradingStore.setState({
             positions: data.positions,
             openPositions: data.positions,
@@ -523,16 +593,35 @@ export const ForexTerminalRoom: React.FC = () => {
     });
   }, [telemetryLogs]);
 
-  const isConnected = Boolean(accountInfo?.connected);
-  const liveAccountNumber = accountInfo?.accountNumber || '30000143146';
-  const liveMode = accountInfo?.mode || accountMode || 'DEMO';
-  const liveBalance = balance ?? accountInfo?.balance;
-  const liveEquity =
-    equity !== null && equity !== undefined
-      ? equity
-      : liveBalance !== null && liveBalance !== undefined
-      ? Number((liveBalance + totalFloatingPnl).toFixed(2))
-      : null;
+  const credentials = useTradingStore((s) => s.credentials);
+  const verifiedAcc = getPersistedVerifiedAccount();
+  const activeCreds = getActiveExnessCredentials(credentials);
+  const hasVaultCreds = Boolean(
+    (credentials.demoAccountId && credentials.demoApiKey) ||
+    (credentials.realAccountId && credentials.realApiKey) ||
+    (credentials.exnessAccountId && credentials.exnessToken) ||
+    (activeCreds.accountId && activeCreds.apiKey)
+  );
+  const isBound = Boolean(accountInfo?.connected || hasVaultCreds || verifiedAcc);
+
+  // Strictly bind liveBalance to actual broker account balance ($85.37), never overwrite with balance + floatingPnl
+  const liveBalance = (balance !== null && balance !== undefined && balance > 0)
+    ? balance
+    : (accountInfo?.balance !== null && accountInfo?.balance !== undefined && accountInfo.balance > 0)
+    ? accountInfo.balance
+    : (verifiedAcc?.balance ?? null);
+
+  const liveEquity = (equity !== null && equity !== undefined && equity > 0)
+    ? equity
+    : (accountInfo?.equity !== null && accountInfo?.equity !== undefined && accountInfo.equity > 0)
+    ? accountInfo.equity
+    : (liveBalance !== null && liveBalance !== undefined)
+    ? Number((liveBalance + totalFloatingPnl).toFixed(2))
+    : (verifiedAcc?.equity ?? null);
+
+  const liveAccountNumber = accountInfo?.accountNumber || verifiedAcc?.accountId || activeCreds.accountId || '30000143146';
+  const liveMode = accountInfo?.mode || verifiedAcc?.mode || accountMode || 'DEMO';
+  const isConnected = Boolean(accountInfo?.connected || (isBound && liveBalance !== null));
   const liveLatency = accountInfo?.latencyMs && accountInfo.latencyMs > 0 ? accountInfo.latencyMs : 14;
 
   return (
@@ -631,17 +720,45 @@ export const ForexTerminalRoom: React.FC = () => {
       {/* Main Forex Terminal Content */}
       <main className="flex-1 p-3 sm:p-5 space-y-4 min-w-0">
         {/* TOP STATUS & KPI STRIP */}
-        <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          {/* 1. REAL BALANCE */}
+        <section className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {/* 1. CONSOLIDATED EXNESS BALANCE, ACCOUNT ID, EQUITY & FLOATING PNL */}
           <div className="bg-white dark:bg-zinc-900/90 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] p-4 flex flex-col justify-between">
-            <div className="flex items-center justify-between gap-1">
-              <span className="font-mono text-xs uppercase tracking-wider text-slate-500 dark:text-zinc-400 font-semibold">
-                EXNESS BALANCE
-              </span>
-              <span className="bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-200/80 dark:border-emerald-500/30 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold">
-                {liveMode}
-              </span>
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-xs uppercase tracking-wider text-slate-500 dark:text-zinc-400 font-semibold">
+                  EXNESS BALANCE
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setIsForexPnlOpen(true)}
+                  className="inline-flex items-center gap-1.5 text-[11px] font-mono text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-200 cursor-pointer"
+                  title="Open PnL Calendar"
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      isConnected
+                        ? 'bg-emerald-400 animate-pulse shadow-[0_0_8px_#34d399]'
+                        : 'bg-slate-500'
+                    }`}
+                  />
+                  <span>#{liveAccountNumber}</span>
+                </button>
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-200/80 dark:border-emerald-500/30 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold">
+                  {liveMode}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => fetchAccountInfo()}
+                  className="text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-200 cursor-pointer p-0.5"
+                  title="Sync Exness Balance"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                </button>
+              </div>
             </div>
+
             <div className="my-2">
               <div className="font-bold text-[#0F172A] dark:text-slate-100 tracking-tight text-xl sm:text-2xl font-mono">
                 {liveBalance !== null && liveBalance !== undefined
@@ -649,102 +766,43 @@ export const ForexTerminalRoom: React.FC = () => {
                   : 'Vault Unbound'}
               </div>
             </div>
-            <div className="flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-zinc-400">
+
+            <div className="flex items-center justify-between text-[11px] font-mono text-slate-400 dark:text-zinc-400 pt-1 border-t border-slate-100 dark:border-zinc-800/80">
+              <div className="flex items-center gap-1.5 truncate">
+                <span>
+                  Equity:{' '}
+                  <strong className="text-slate-700 dark:text-slate-200 font-semibold">
+                    {liveEquity !== null && liveEquity !== undefined
+                      ? `$${Number(liveEquity).toFixed(2)}`
+                      : '---'}
+                  </strong>
+                </span>
+                <span className="text-slate-300 dark:text-zinc-600">•</span>
+                <span>
+                  PnL:{' '}
+                  <strong
+                    className={`font-semibold ${
+                      totalFloatingPnl >= 0
+                        ? 'text-emerald-600 dark:text-emerald-400'
+                        : 'text-rose-600 dark:text-rose-400'
+                    }`}
+                  >
+                    {totalFloatingPnl >= 0 ? '+' : ''}${totalFloatingPnl.toFixed(2)}
+                  </strong>
+                </span>
+              </div>
               <button
                 type="button"
                 onClick={() => setIsForexPnlOpen(true)}
-                className="inline-flex items-center gap-1 text-slate-500 dark:text-zinc-400 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer"
+                className="text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-200 cursor-pointer shrink-0"
+                title="PnL Calendar"
               >
-                <CalendarDays className="w-3 h-3" />
-                <span>#{liveAccountNumber}</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => fetchAccountInfo()}
-                className="text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-200 cursor-pointer"
-                title="Sync Exness Balance"
-              >
-                <RefreshCw className="w-3 h-3" />
+                <CalendarDays className="w-3.5 h-3.5" />
               </button>
             </div>
           </div>
 
-          {/* 2. EQUITY & FLOATING PNL */}
-          <div className="bg-white dark:bg-zinc-900/90 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] p-4 flex flex-col justify-between">
-            <div className="flex items-center justify-between gap-1">
-              <span className="font-mono text-xs uppercase tracking-wider text-slate-500 dark:text-zinc-400 font-semibold">
-                EQUITY &amp; FLOATING PNL
-              </span>
-              <span
-                className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border ${
-                  totalFloatingPnl >= 0
-                    ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200/80 dark:border-emerald-500/30'
-                    : 'bg-rose-50 dark:bg-rose-500/15 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-500/30'
-                }`}
-              >
-                {totalFloatingPnl >= 0 ? '+' : ''}${totalFloatingPnl.toFixed(2)}
-              </span>
-            </div>
-            <div className="my-2">
-              <div className="font-bold text-[#0F172A] dark:text-slate-100 tracking-tight text-xl sm:text-2xl font-mono">
-                {liveEquity !== null && liveEquity !== undefined
-                  ? `$${Number(liveEquity).toFixed(2)}`
-                  : '---'}
-              </div>
-            </div>
-            <div className="flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-zinc-400">
-              <span>Open Positions: {activePositions.length}</span>
-              <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
-                Live Tick Sync
-              </span>
-            </div>
-          </div>
-
-          {/* 3. EXNESS GATEWAY */}
-          <div className="bg-white dark:bg-zinc-900/90 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] p-4 flex flex-col justify-between">
-            <div className="flex items-center justify-between gap-1">
-              <span className="font-mono text-xs uppercase tracking-wider text-slate-500 dark:text-zinc-400 font-semibold">
-                EXNESS GATEWAY
-              </span>
-              <span
-                className={`px-2.5 py-0.5 rounded-full text-[10px] font-mono font-semibold flex items-center gap-1 border ${
-                  isConnected
-                    ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200/80 dark:border-emerald-500/30'
-                    : 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
-                }`}
-              >
-                <span
-                  className={`w-1.5 h-1.5 rounded-full ${
-                    isConnected ? 'bg-[#10B981] animate-pulse' : 'bg-slate-400'
-                  }`}
-                />
-                {isConnected ? 'CONNECTED' : 'STANDBY'}
-              </span>
-            </div>
-            <div className="my-1.5">
-              <div className="font-mono text-xs font-bold text-[#0F172A] dark:text-slate-100 truncate">
-                ap-6756732d.exness-api.com
-              </div>
-              <div className="font-mono text-[11px] text-slate-500 dark:text-zinc-400">
-                Latency:{' '}
-                <strong className="text-emerald-700 dark:text-emerald-400">{liveLatency}ms</strong> · Ed25519
-              </div>
-            </div>
-            <div className="flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-zinc-400">
-              <span>Vault: AES-256-GCM</span>
-              <span
-                className={`font-semibold ${
-                  kronosHealth?.vpsReady
-                    ? 'text-emerald-700 dark:text-emerald-400'
-                    : 'text-slate-600 dark:text-zinc-400'
-                }`}
-              >
-                {kronosHealth?.vpsReady ? 'VPS ONLINE' : 'LOCAL QUANT'}
-              </span>
-            </div>
-          </div>
-
-          {/* 4. MULTI-AI CONSENSUS / RISK GOVERNANCE */}
+          {/* 2. MULTI-AI CONSENSUS / RISK GOVERNANCE */}
           <div className="bg-white dark:bg-zinc-900/90 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] p-4 flex flex-col justify-between">
             <div className="flex items-center justify-between gap-1">
               <span className="font-mono text-xs uppercase tracking-wider text-slate-500 dark:text-zinc-400 font-semibold truncate">
@@ -884,13 +942,13 @@ export const ForexTerminalRoom: React.FC = () => {
 
             {/* ACTIVE OPEN POSITIONS TABLE */}
             <div className="bg-white dark:bg-zinc-900/90 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] overflow-hidden">
-              <div className="px-4 py-3.5 border-b border-slate-200/80 dark:border-zinc-800 flex items-center justify-between">
+              <div className="px-4 py-3 border-b border-slate-200/80 dark:border-zinc-800 flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2">
                   <Layers className="w-4 h-4 text-[#0F172A] dark:text-emerald-400" />
-                  <h2 className="font-sans font-bold text-[#0F172A] dark:text-slate-100 tracking-tight text-sm uppercase">
-                    Active Open Positions (Account #{liveAccountNumber})
+                  <h2 className="font-sans font-bold text-[#0F172A] dark:text-slate-100 tracking-tight text-sm">
+                    Active Posisi
                   </h2>
-                  <span className="bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-200/80 dark:border-emerald-500/30 px-2.5 py-0.5 rounded-full text-xs font-mono font-semibold">
+                  <span className="bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-200/80 dark:border-emerald-500/30 px-2 py-0.5 rounded-full text-[11px] font-mono font-semibold">
                     {activePositions.length} Open
                   </span>
                 </div>
@@ -899,7 +957,7 @@ export const ForexTerminalRoom: React.FC = () => {
                     type="button"
                     onClick={handlePanicCloseAll}
                     disabled={isPlacingOrder === 'PANIC'}
-                    className="bg-rose-50 dark:bg-rose-500/15 border border-rose-200 dark:border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-100 rounded-xl px-3 py-1.5 text-xs font-semibold transition-all cursor-pointer disabled:opacity-50"
+                    className="bg-rose-50 dark:bg-rose-500/15 border border-rose-200 dark:border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-100 rounded-xl px-2.5 py-1 text-[11px] font-semibold transition-all cursor-pointer disabled:opacity-50"
                   >
                     {isPlacingOrder === 'PANIC' ? 'Closing All...' : 'Panic Close All'}
                   </button>
@@ -909,7 +967,7 @@ export const ForexTerminalRoom: React.FC = () => {
               {activePositions.length === 0 ? (
                 <div className="p-8 text-center space-y-1">
                   <div className="font-mono text-xs text-slate-500 dark:text-slate-400">
-                    No open positions on Account #{liveAccountNumber}.
+                    No active positions open.
                   </div>
                   <p className="text-slate-400 dark:text-zinc-500 text-xs">
                     Use Manual EA Quick Execution or toggle START AUTO-TRADING to execute live Exness orders.
@@ -918,28 +976,29 @@ export const ForexTerminalRoom: React.FC = () => {
               ) : (
                 <div className="overflow-x-auto">
                   <table className="w-full text-left font-mono text-xs">
-                    <thead className="bg-slate-50/90 dark:bg-slate-950/90 text-[11px] uppercase tracking-wider text-slate-500 dark:text-zinc-400 border-b border-slate-200/80 dark:border-zinc-800">
+                    <thead className="bg-slate-50/90 dark:bg-slate-950/90 text-[10px] sm:text-[11px] uppercase tracking-wider text-slate-500 dark:text-zinc-400 border-b border-slate-200/80 dark:border-zinc-800">
                       <tr>
-                        <th className="px-4 py-2.5">TICKET / ID</th>
-                        <th className="px-4 py-2.5">SYMBOL &amp; SIDE</th>
-                        <th className="px-4 py-2.5">VOLUME</th>
-                        <th className="px-4 py-2.5">OPEN -&gt; CURRENT</th>
-                        <th className="px-4 py-2.5">SL / TP</th>
-                        <th className="px-4 py-2.5">PROFIT</th>
-                        <th className="px-4 py-2.5 text-right">ACTIONS</th>
+                        <th className="px-3 sm:px-4 py-2.5">TICKET / SYMBOL &amp; SIDE</th>
+                        <th className="px-3 sm:px-4 py-2.5">ENTRY -&gt; CURRENT</th>
+                        <th className="px-3 sm:px-4 py-2.5">PNL (USD / PIPS)</th>
+                        <th className="px-3 sm:px-4 py-2.5 text-right">ACTION</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-zinc-800">
                       {activePositions.map((pos) => {
                         const prof = getPairProfile(pos.symbol);
                         const q = quotes[pos.symbol];
-                        const pnlData = q
-                          ? evaluatePositionPnL(pos, q)
+                        const validLivePrice = getValidLivePrice(pos.symbol);
+                        const safeQuote = (q && isValidPriceUpdate(pos.symbol, q.bid))
+                          ? q
                           : {
-                              curPrice: pos.currentPrice || pos.entryPrice,
-                              pnlPips: 0,
-                              pnlUsd: pos.unrealizedPnl || 0,
+                              symbol: pos.symbol,
+                              bid: validLivePrice,
+                              ask: Number((validLivePrice + (pos.symbol.startsWith('XAU') ? 0.20 : prof.pipValue)).toFixed(prof.digits)),
+                              spreadPips: pos.symbol.startsWith('XAU') ? 2.0 : 0.8,
+                              timestamp: Date.now(),
                             };
+                        const pnlData = evaluatePositionPnL(pos, safeQuote);
                         const isProfit = pnlData.pnlUsd >= 0;
 
                         return (
@@ -947,16 +1006,13 @@ export const ForexTerminalRoom: React.FC = () => {
                             key={pos.id}
                             className="hover:bg-slate-50/80 dark:hover:bg-zinc-800/50 transition-colors"
                           >
-                            <td className="px-4 py-3 font-semibold text-slate-600 dark:text-slate-300">
-                              #{pos.id.slice(-7)}
-                            </td>
-                            <td className="px-4 py-3">
-                              <div className="flex items-center gap-1.5">
+                            <td className="px-3 sm:px-4 py-2.5">
+                              <div className="flex flex-wrap items-center gap-1.5">
                                 <span className="font-bold text-[#0F172A] dark:text-slate-100">
                                   {pos.symbol}
                                 </span>
                                 <span
-                                  className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                                  className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${
                                     pos.side === 'BUY'
                                       ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/30'
                                       : 'bg-rose-50 dark:bg-rose-500/15 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-500/30'
@@ -964,34 +1020,36 @@ export const ForexTerminalRoom: React.FC = () => {
                                 >
                                   {pos.side}
                                 </span>
+                                <span className="text-[11px] font-semibold text-slate-600 dark:text-slate-300">
+                                  {pos.volume.toFixed(2)} Lot
+                                </span>
+                              </div>
+                              <div className="text-[10px] text-slate-400 dark:text-zinc-500 mt-0.5">
+                                #{pos.id.slice(-7)}
                               </div>
                             </td>
-                            <td className="px-4 py-3 font-semibold text-[#0F172A] dark:text-slate-200">
-                              {pos.volume.toFixed(2)} Lots
-                            </td>
-                            <td className="px-4 py-3 text-slate-700 dark:text-slate-300">
-                              {formatPrice(pos.entryPrice, prof.digits)} -&gt;{' '}
-                              <strong className="text-[#0F172A] dark:text-white">
-                                {formatPrice(pnlData.curPrice, prof.digits)}
-                              </strong>
-                            </td>
-                            <td className="px-4 py-3 text-[11px]">
-                              <div className="text-rose-600 dark:text-rose-400">
-                                SL:{' '}
-                                {pos.currentSl > 0
-                                  ? formatPrice(pos.currentSl, prof.digits)
-                                  : 'None'}
+                            <td className="px-3 sm:px-4 py-2.5 text-slate-700 dark:text-slate-300">
+                              <div className="whitespace-nowrap">
+                                {formatPrice(pos.entryPrice, prof.digits)} -&gt;{' '}
+                                <strong className="text-[#0F172A] dark:text-white">
+                                  {formatPrice(pnlData.curPrice, prof.digits)}
+                                </strong>
                               </div>
-                              <div className="text-emerald-700 dark:text-emerald-400">
-                                TP:{' '}
-                                {pos.currentTp > 0
-                                  ? formatPrice(pos.currentTp, prof.digits)
-                                  : 'None'}
-                              </div>
+                              {(pos.currentSl > 0 || pos.currentTp > 0) && (
+                                <div className="text-[10px] text-slate-400 dark:text-zinc-500 mt-0.5 whitespace-nowrap">
+                                  <span className="text-rose-500/90 dark:text-rose-400/90">
+                                    SL: {pos.currentSl > 0 ? formatPrice(pos.currentSl, prof.digits) : '—'}
+                                  </span>
+                                  {' • '}
+                                  <span className="text-emerald-600/90 dark:text-emerald-400/90">
+                                    TP: {pos.currentTp > 0 ? formatPrice(pos.currentTp, prof.digits) : '—'}
+                                  </span>
+                                </div>
+                              )}
                             </td>
-                            <td className="px-4 py-3">
+                            <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap">
                               <div
-                                className={`font-bold text-sm ${
+                                className={`font-bold text-xs sm:text-sm ${
                                   isProfit
                                     ? 'text-emerald-700 dark:text-emerald-400'
                                     : 'text-rose-600 dark:text-rose-400'
@@ -1004,25 +1062,15 @@ export const ForexTerminalRoom: React.FC = () => {
                                 {pnlData.pnlPips} pips
                               </div>
                             </td>
-                            <td className="px-4 py-3 text-right">
-                              <div className="inline-flex items-center gap-1.5">
-                                <button
-                                  type="button"
-                                  onClick={() => handleModifyPosition(pos)}
-                                  disabled={modifyingIds[pos.id]}
-                                  className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-zinc-800 rounded-lg px-2.5 py-1 text-[11px] font-medium transition-all cursor-pointer disabled:opacity-50"
-                                >
-                                  {modifyingIds[pos.id] ? 'Syncing...' : 'Modify SL/TP'}
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleClosePosition(pos.id)}
-                                  disabled={closingIds[pos.id]}
-                                  className="bg-rose-50 dark:bg-rose-500/15 border border-rose-200 dark:border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-100 rounded-lg px-2.5 py-1 text-[11px] font-semibold transition-all cursor-pointer disabled:opacity-50"
-                                >
-                                  {closingIds[pos.id] ? 'Closing...' : 'Close'}
-                                </button>
-                              </div>
+                            <td className="px-3 sm:px-4 py-2.5 text-right whitespace-nowrap">
+                              <button
+                                type="button"
+                                onClick={() => handleClosePosition(pos.id)}
+                                disabled={closingIds[pos.id]}
+                                className="bg-rose-50 dark:bg-rose-500/15 border border-rose-200 dark:border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-100 rounded-lg px-2.5 py-1 text-[11px] font-semibold transition-all cursor-pointer disabled:opacity-50"
+                              >
+                                {closingIds[pos.id] ? 'Closing...' : 'Close'}
+                              </button>
                             </td>
                           </tr>
                         );
@@ -1154,7 +1202,7 @@ export const ForexTerminalRoom: React.FC = () => {
                       max="500"
                       value={slPips}
                       onChange={(e) =>
-                        setSlPips(Math.max(0, parseInt(e.target.value, 10) || 0))
+                        handleSlChange(parseInt(e.target.value, 10) || 25)
                       }
                       className="w-full rounded-xl bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 px-3 py-1.5 font-mono text-xs font-bold text-[#0F172A] dark:text-slate-100"
                     />
@@ -1169,7 +1217,7 @@ export const ForexTerminalRoom: React.FC = () => {
                       max="1000"
                       value={tpPips}
                       onChange={(e) =>
-                        setTpPips(Math.max(0, parseInt(e.target.value, 10) || 0))
+                        handleTpChange(parseInt(e.target.value, 10) || 50)
                       }
                       className="w-full rounded-xl bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 px-3 py-1.5 font-mono text-xs font-bold text-[#0F172A] dark:text-slate-100"
                     />
@@ -1199,7 +1247,7 @@ export const ForexTerminalRoom: React.FC = () => {
                   </button>
                 </div>
 
-                {/* BUY MARKET, SELL MARKET, and PANIC CLOSE ALL Buttons */}
+                {/* BUY MARKET and SELL MARKET Buttons */}
                 <div className="grid grid-cols-2 gap-2.5 pt-1">
                   <button
                     type="button"
@@ -1221,16 +1269,6 @@ export const ForexTerminalRoom: React.FC = () => {
                     <span>{isPlacingOrder === 'SELL' ? 'EXECUTING...' : 'SELL MARKET'}</span>
                   </button>
                 </div>
-
-                <button
-                  type="button"
-                  onClick={handlePanicCloseAll}
-                  disabled={isPlacingOrder !== null}
-                  className="w-full bg-rose-50 dark:bg-rose-500/15 border border-rose-200 dark:border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-100 rounded-xl px-4 py-2 text-xs font-semibold transition-all flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
-                >
-                  <AlertOctagon className="w-3.5 h-3.5" />
-                  <span>PANIC CLOSE ALL POSITIONS</span>
-                </button>
               </div>
 
               {/* Multi-AI Consensus / Risk Governance + Kronos Quant Metrics Widget */}

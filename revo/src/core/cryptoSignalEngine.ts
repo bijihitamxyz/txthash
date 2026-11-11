@@ -639,7 +639,7 @@ export async function evaluateCryptoSignal(params: {
   let aiVerdict: CryptoSignalVerdict['aiVerdict'] | undefined;
 
   // Call Multi-AI Consensus / Risk Governance Judge when setup is qualified or scoring >= dynamic threshold
-  if (isApproved && enableAiJudge && typeof window !== 'undefined') {
+  if (isApproved && enableAiJudge) {
     try {
       const regime =
         Math.abs(zScore) >= 2.0
@@ -650,46 +650,149 @@ export async function evaluateCryptoSignal(params: {
           ? 'TRENDING_BEAR'
           : 'MEAN_REVERTING';
 
-      const res = await fetch('/api/ai/judge', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          symbol,
-          side: candidateSide === 'LONG' ? 'BUY' : 'SELL',
-          timeframe: 'M5',
-          price,
-          confluenceScore: candidateScore,
-          bbWickSweepPct: candidateSide === 'LONG' ? lowerWickRatio : upperWickRatio,
-          volumeRatio,
-          rsi: curRsi,
-          pocPrice,
-          vahPrice,
-          valPrice,
-          zScore,
-          regime,
-          vwapDistancePct: Math.abs(price - curVwap) / price,
-          fundingRate,
-          emaTrend: curEma50 >= curEma200 ? 'BULLISH' : 'BEARISH',
-          divergence,
-          room: 'BINANCE',
-          marketType: 'CRYPTO',
-          efficiencyRatio: er10,
-          pocMagnetAligned,
-          btcGuardStatus: (btcGuard as any)?.statusText || (btcBlocked ? 'VETO_DUMP_BLOCKED' : 'NORMAL'),
-        }),
-      });
+      const judgePayload = {
+        symbol,
+        side: candidateSide === 'LONG' ? 'BUY' : 'SELL',
+        timeframe: 'M5',
+        price,
+        confluenceScore: candidateScore,
+        bbWickSweepPct: candidateSide === 'LONG' ? lowerWickRatio : upperWickRatio,
+        volumeRatio,
+        rsi: curRsi,
+        pocPrice,
+        vahPrice,
+        valPrice,
+        zScore,
+        regime,
+        vwapDistancePct: Math.abs(price - curVwap) / price,
+        fundingRate,
+        emaTrend: curEma50 >= curEma200 ? 'BULLISH' : 'BEARISH',
+        divergence,
+        room: 'BINANCE',
+        marketType: 'CRYPTO',
+        efficiencyRatio: er10,
+        pocMagnetAligned,
+        btcGuardStatus: (btcGuard as any)?.statusText || (btcBlocked ? 'VETO_DUMP_BLOCKED' : 'NORMAL'),
+      };
 
-      const aiData = await res.json();
-      if (aiData.success && aiData.verdict) {
-        aiVerdict = {
-          decision: aiData.verdict.decision,
-          confidence: aiData.verdict.confidence_score,
-          reasoning: aiData.verdict.reasoning,
-          source: aiData.verdict.source,
-          modelUsed: aiData.verdict.modelUsed,
-        };
+      if (typeof window !== 'undefined') {
+        const res = await fetch('/api/ai/judge', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(judgePayload),
+        });
 
-        // When qwen2.5:3b outputs confidence >= cryptoDynamicThreshold (56%), it MUST execute!
+        const aiData = await res.json();
+        if (aiData.success && aiData.verdict) {
+          aiVerdict = {
+            decision: aiData.verdict.decision,
+            confidence: aiData.verdict.confidence_score,
+            reasoning: aiData.verdict.reasoning,
+            source: aiData.verdict.source,
+            modelUsed: aiData.verdict.modelUsed,
+          };
+        }
+      } else {
+        // Server-side direct Multi-AI Consensus evaluation (for 24/7 EngineScheduler)
+        const { readCentralAiConfig, getActiveAiProviders } = await import('@/core/centralAiConfig');
+        const { evaluateMultiAiConsensus } = await import('@/core/aiJudge');
+        const centralCfg = await readCentralAiConfig();
+        if (centralCfg.engineSwitches?.emergencyKillSwitch) {
+          isApproved = false;
+          aiVerdict = {
+            decision: 'REJECT',
+            confidence: 0,
+            reasoning: 'Blocked by Admin Emergency Kill Switch.',
+            source: 'HEURISTIC_QUANT_FALLBACK',
+            modelUsed: 'Admin-Kill-Switch',
+          };
+        } else if (centralCfg.engineSwitches?.multiAiRiskJudge !== false) {
+          const activeProviders = getActiveAiProviders(centralCfg);
+          const prevCandle = klines[Math.max(0, len - 2)] || currentCandle;
+          const serverSnap: any = {
+            symbol,
+            timestamp: Date.now(),
+            timeframe: 'M5',
+            side: candidateSide === 'LONG' ? 'BUY' : 'SELL',
+            signalType: candidateSide === 'LONG' ? 'COUNTER_TREND_BUY' : 'COUNTER_TREND_SELL',
+            setupName: qualifiedSetup,
+            confluence_score: candidateScore,
+            regime: curEma50 >= curEma200 ? 'WITH_TREND' : 'COUNTER_TREND',
+            triggerPrice: price,
+            rsi: curRsi,
+            wick_ratio: candidateSide === 'LONG' ? lowerWickRatio : upperWickRatio,
+            bbw_expansion_pct: 0,
+            bb_position_pct: 50,
+            divergence_detected: divergence !== 'NONE',
+            divergence_type: divergence,
+            ema200Distance: Math.abs(price - curEma200),
+            atr_pips: curAtr,
+            atr_ratio: 1,
+            volatility_regime: 'OPTIMAL',
+            support_price: valPrice,
+            resistance_price: vahPrice,
+            distance_to_support_pips: Math.abs(price - valPrice),
+            distance_to_resistance_pips: Math.abs(vahPrice - price),
+            wick_rejection_strength: 'MODERATE',
+            rsi_slope: 0,
+            c0: {
+              open: currentCandle.open,
+              high: currentCandle.high,
+              low: currentCandle.low,
+              close: currentCandle.close,
+              rsi: curRsi,
+              upperBB: curUpperBB,
+              middleBB: curMiddleBB,
+              lowerBB: curLowerBB,
+              ema200: curEma200,
+              lowerWickRatio,
+              upperWickRatio,
+            },
+            c1: {
+              open: prevCandle.open,
+              high: prevCandle.high,
+              low: prevCandle.low,
+              close: prevCandle.close,
+              rsi: curRsi,
+              upperBB: curUpperBB,
+              lowerBB: curLowerBB,
+            },
+            proposedSlPrice: stopLossPrice,
+            proposedTpPrice: takeProfit1Price,
+            proposedSlPips: rDistance,
+            proposedTpPips: Math.abs(takeProfit1Price - price),
+            riskRewardRatio: 1.5,
+            marketType: 'CRYPTO',
+            efficiencyRatio: er10,
+            pocMagnetAligned,
+            zScore,
+            btcGuardStatus: judgePayload.btcGuardStatus,
+          };
+          const srvVerdict = await evaluateMultiAiConsensus(
+            serverSnap,
+            activeProviders,
+            centralCfg.autoAdaptiveThreshold !== false ? cryptoDynamicThreshold : centralCfg.confidenceThreshold,
+            {
+              bullishPct: candidateSide === 'LONG' ? 62 : 38,
+              pocPrice,
+              vahPrice,
+              valPrice,
+              rsi: curRsi,
+              zScore,
+              regime,
+            }
+          );
+          aiVerdict = {
+            decision: srvVerdict.decision,
+            confidence: srvVerdict.confidence_score,
+            reasoning: srvVerdict.reasoning,
+            source: srvVerdict.source,
+            modelUsed: srvVerdict.modelsUsed?.[0] || 'Multi-AI Consensus',
+          };
+        }
+      }
+
+      if (aiVerdict) {
         if (aiVerdict.confidence >= cryptoDynamicThreshold) {
           isApproved = !btcBlocked;
         } else if (aiVerdict.decision === 'REJECT' && aiVerdict.confidence < 50) {

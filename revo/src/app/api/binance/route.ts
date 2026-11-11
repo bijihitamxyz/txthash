@@ -97,6 +97,15 @@ export async function POST(req: NextRequest) {
 
     const action = body.action;
 
+    if (action === 'SYNC_ACTIVE_ROOM') {
+      const activeRoom = body.activeRoom === 'CRYPTO' || body.activeRoom === 'ROOM_2_BINANCE' ? 'CRYPTO' : 'FOREX';
+      const { engineScheduler } = await import('@/lib/engineScheduler');
+      engineScheduler.setActiveRoom(activeRoom);
+      const { stateSync } = await import('@/lib/stateSync');
+      await stateSync.updateRuntimeState({ activeRoom });
+      return NextResponse.json({ success: true, activeRoom });
+    }
+
     if (action === 'SYNC_STATE' || action === 'TOGGLE_AUTO_TRADING') {
       const isAuto = typeof body.isAutoTrading === 'boolean' ? body.isAutoTrading : false;
       const { engineScheduler } = await import('@/lib/engineScheduler');
@@ -180,6 +189,14 @@ export async function POST(req: NextRequest) {
     const effectiveSecret = secretKey || apiSecret;
     const accountType: 'REAL' | 'DEMO' = rawAccountType || (isTestnet ? 'DEMO' : 'REAL');
 
+    const BITGET_PRIVATE_ACTIONS = ['ACCOUNT', 'ORDER', 'PLACE_ORDER', 'CLOSE_POSITION', 'PANIC_CLOSE', 'UPDATE_TRAILING_STOP', 'SET_LEVERAGE', 'SET_MARGIN_TYPE'];
+    if (exchange === 'BITGET' && BITGET_PRIVATE_ACTIONS.includes(action) && (!apiKey.trim() || !effectiveSecret.trim() || !passphrase.trim())) {
+      return NextResponse.json(
+        { success: false, exchange: 'BITGET', error: 'Bitget API Key, Secret Key, dan Passphrase wajib diisi di Vault.' },
+        { status: 400 }
+      );
+    }
+
     // 1. TEST CONNECTION (Binance or Bitget)
     if (action === 'TEST_CONNECTION') {
       if (exchange === 'BITGET') {
@@ -199,7 +216,7 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({
             success: true,
             exchange: 'BITGET',
-            message: `Connected successfully to Bitget Futures (${accountType === 'REAL' ? 'Live Real' : 'Demo Paper Trading'}).`,
+            message: `Connected successfully to Bitget Futures (${accountType === 'REAL' ? 'Live Real' : 'Bitget Demo Trading'}).`,
             balance: account.totalWalletBalance,
             availableBalance: account.availableBalance,
             openPositionsCount: account.positions.length,
@@ -259,17 +276,28 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: true, exchange: 'BINANCE', data: account });
     }
 
-    // 3. SET LEVERAGE (Binance)
+    // 3. SET LEVERAGE (Binance or Bitget)
     if (action === 'SET_LEVERAGE') {
       const { symbol, leverage } = body.payload || {};
+      if (exchange === 'BITGET') {
+        const bitget = new BitgetFuturesService(apiKey, effectiveSecret, passphrase, accountType);
+        const res = await bitget.setLeverage(symbol, Number(leverage));
+        return NextResponse.json({ success: true, exchange: 'BITGET', data: res });
+      }
       const client = new BinanceFuturesClient(apiKey, effectiveSecret, accountType === 'DEMO');
       const res = await client.setLeverage(symbol, leverage);
       return NextResponse.json({ success: true, data: res });
     }
 
-    // 4. SET MARGIN TYPE (Binance)
+    // 4. SET MARGIN TYPE (Binance or Bitget)
     if (action === 'SET_MARGIN_TYPE') {
       const { symbol, marginType } = body.payload || {};
+      if (exchange === 'BITGET') {
+        const bitget = new BitgetFuturesService(apiKey, effectiveSecret, passphrase, accountType);
+        const mode = String(marginType || '').toLowerCase().startsWith('cross') ? 'crossed' : 'isolated';
+        const res = await bitget.setMarginMode(symbol, mode);
+        return NextResponse.json({ success: true, exchange: 'BITGET', data: res });
+      }
       const client = new BinanceFuturesClient(apiKey, effectiveSecret, accountType === 'DEMO');
       const res = await client.setMarginType(symbol, marginType);
       return NextResponse.json({ success: true, data: res });
@@ -277,7 +305,7 @@ export async function POST(req: NextRequest) {
 
     // 5. PLACE ORDER (Binance or Bitget)
     if (action === 'ORDER' || action === 'PLACE_ORDER') {
-      const { symbol, side, type, quantity, price, stopPrice, reduceOnly, margin, leverage, marginMode } = body.payload || {};
+      const { symbol, side, type, quantity, price, stopPrice, takeProfitPrice, reduceOnly, margin, leverage, marginMode } = body.payload || {};
 
       if (exchange === 'BITGET') {
         const bitget = new BitgetFuturesService(apiKey, effectiveSecret, passphrase, accountType);
@@ -288,9 +316,10 @@ export async function POST(req: NextRequest) {
           price: price ? parseFloat(price) : undefined,
           margin: typeof margin === 'number' ? margin : (margin ? parseFloat(margin) : undefined),
           leverage: typeof leverage === 'number' ? leverage : (leverage ? parseInt(leverage, 10) : undefined),
-          marginMode: marginMode?.toLowerCase() === 'cross' ? 'crossed' : 'isolated',
+          marginMode: String(marginMode || '').toLowerCase().startsWith('cross') ? 'crossed' : 'isolated',
           reduceOnly: Boolean(reduceOnly),
           stopLossPrice: stopPrice ? parseFloat(stopPrice) : undefined,
+          takeProfitPrice: takeProfitPrice ? parseFloat(takeProfitPrice) : undefined,
         });
         return NextResponse.json({ success: true, exchange: 'BITGET', data: order });
       }
@@ -332,13 +361,10 @@ export async function POST(req: NextRequest) {
       const { stateSync } = await import('@/lib/stateSync');
       await stateSync.updateRuntimeState({ cryptoIsAutoTrading: false });
 
-      const { clearAllSimulatedPositions } = await import('@/services/bitgetService');
-      clearAllSimulatedPositions();
-
       if (exchange === 'BITGET') {
         const bitget = new BitgetFuturesService(apiKey, effectiveSecret, passphrase, accountType);
-        const res = await bitget.panicCloseAll(body.payload?.positions);
-        return NextResponse.json({ success: true, exchange: 'BITGET', data: res });
+        const res = await bitget.panicCloseAll();
+        return NextResponse.json({ success: res.errors.length === 0, exchange: 'BITGET', data: res, error: res.errors.join('; ') || undefined });
       }
 
       const client = new BinanceFuturesClient(apiKey, effectiveSecret, accountType === 'DEMO');

@@ -19,18 +19,27 @@ function ClientTerminalWorkspace() {
   const activeMarket: 'FOREX' | 'CRYPTO' =
     activeRoom === 'CRYPTO' || activeRoom === 'ROOM_2_BINANCE' ? 'CRYPTO' : 'FOREX';
 
+  // Synchronize active room with server engine scheduler
+  React.useEffect(() => {
+    fetch('/api/binance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'SYNC_ACTIVE_ROOM', activeRoom: activeMarket }),
+    }).catch(() => {});
+  }, [activeMarket]);
+
   return (
     <div className="min-h-screen flex flex-col bg-[#F8FAFC] dark:bg-slate-950 text-[#0F172A] dark:text-slate-100 transition-colors">
       <TerminalHeader />
 
       {/* Room 1: Forex · Exness (persisted across tab switches) */}
       <div className={activeMarket === 'FOREX' ? 'flex flex-1 w-full min-h-0' : 'hidden'}>
-        <ForexTerminalRoom />
+        <ForexTerminalRoom isActiveRoom={activeMarket === 'FOREX'} />
       </div>
 
       {/* Room 2: Crypto · Binance / Bitget (persisted across tab switches) */}
       <div className={activeMarket === 'CRYPTO' ? 'flex flex-1 w-full min-h-0' : 'hidden'}>
-        <CryptoTerminalRoom />
+        <CryptoTerminalRoom isActiveRoom={activeMarket === 'CRYPTO'} />
       </div>
 
       {/* Isolated Exness Vault Modal */}

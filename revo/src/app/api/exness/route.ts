@@ -6,6 +6,7 @@ import {
   LiveQuote,
   validateExnessCredentials,
   normalizeGatewayHost,
+  getGlobalExnessState,
 } from '@/core/exnessClient';
 import {
   loadVaultCredentials,
@@ -47,11 +48,44 @@ function sanitizeRuntimeState(state: any) {
 }
 
 /**
- * Creates an ExnessClient from the server-side AES vault.
+ * Auto-rehydrates vault credentials on cold Vercel serverless containers
+ */
+async function resolveEffectiveVaultCreds(incomingCreds?: any): Promise<ExnessVaultCredentials | null> {
+  let vaultCreds = await loadVaultCredentials();
+  if (incomingCreds && incomingCreds.accountId) {
+    const apiKey = incomingCreds.apiKey || incomingCreds.token;
+    const privateKey = incomingCreds.privateKey || incomingCreds.secret;
+    if (apiKey && privateKey && String(privateKey).length >= 32 && !String(apiKey).includes('••') && !String(apiKey).startsWith('CONFIGURED_')) {
+      const rehydrated: ExnessVaultCredentials = {
+        accountId: String(incomingCreds.accountId).trim(),
+        mode: incomingCreds.mode === 'REAL' ? 'REAL' : 'DEMO',
+        server: String(incomingCreds.server || 'https://api.exness-api.com').trim(),
+        apiKey: String(apiKey).trim(),
+        privateKey: String(privateKey).trim(),
+        updatedAt: Date.now(),
+      };
+      const needsSave =
+        !vaultCreds ||
+        vaultCreds.accountId !== rehydrated.accountId ||
+        vaultCreds.apiKey !== rehydrated.apiKey ||
+        vaultCreds.privateKey !== rehydrated.privateKey ||
+        vaultCreds.mode !== rehydrated.mode ||
+        vaultCreds.server !== rehydrated.server;
+      if (needsSave) {
+        await saveVaultCredentials(rehydrated).catch(() => {});
+      }
+      return rehydrated;
+    }
+  }
+  return vaultCreds;
+}
+
+/**
+ * Creates an ExnessClient from the server-side AES vault or rehydrated credentials.
  * Throws if no Exness credentials are configured.
  */
-async function getVaultClient(): Promise<ExnessClient> {
-  const vaultCreds = await loadVaultCredentials();
+async function getVaultClient(incomingCreds?: any): Promise<ExnessClient> {
+  const vaultCreds = await resolveEffectiveVaultCreds(incomingCreds);
   if (!vaultCreds) {
     throw new Error('Akun Exness belum terhubung. Masukkan Account ID, API Key (exnsk-) dan Ed25519 Private Key di Vault.');
   }
@@ -60,9 +94,15 @@ async function getVaultClient(): Promise<ExnessClient> {
 
 async function safeFetchPositions(client: ExnessClient) {
   try {
-    return { positions: await client.fetchOpenPositions(), error: undefined as string | undefined };
+    const list = await client.fetchOpenPositions();
+    if (Array.isArray(list)) {
+      return { positions: list, error: undefined as string | undefined, success: true };
+    }
+    return { positions: [] as any[], error: undefined, success: false };
   } catch (err: any) {
-    return { positions: [] as any[], error: String(err?.message || err) };
+    // Preserve cached positions from memory on transient error
+    const cached = getGlobalExnessState().activePositions || [];
+    return { positions: cached, error: String(err?.message || err), success: false };
   }
 }
 
@@ -70,14 +110,16 @@ async function safeFetchPositions(client: ExnessClient) {
  * Builds unified snapshot containing REAL Exness account info + positions, live quotes, candles, and telemetry.
  * Strict zero dummy balance: balance, equity, dailyPnl are null when disconnected.
  */
-async function buildUnifiedSnapshot(targetSymbol: string = 'XAUUSDm') {
+async function buildUnifiedSnapshot(targetSymbol: string = 'XAUUSDm', incomingCreds?: any) {
   return coalesceSnapshotRequest(async () => {
-    const vaultCreds = await loadVaultCredentials();
+    const vaultCreds = await resolveEffectiveVaultCreds(incomingCreds);
     const client = new ExnessClient(vaultCreds || undefined);
 
     let acc;
     let positions: any[] = [];
     let positionsError: string | undefined;
+    let positionsSuccess = false;
+
     if (vaultCreds) {
       acc = await client.getAccountInfo();
       if (acc.connected) {
@@ -85,6 +127,7 @@ async function buildUnifiedSnapshot(targetSymbol: string = 'XAUUSDm') {
         const posRes = await safeFetchPositions(client);
         positions = posRes.positions;
         positionsError = posRes.error;
+        positionsSuccess = posRes.success !== false && !positionsError;
       }
     } else {
       acc = {
@@ -128,6 +171,9 @@ async function buildUnifiedSnapshot(targetSymbol: string = 'XAUUSDm') {
       ok: isConn,
       success: isConn,
       connected: isConn,
+      authenticated: isConn,
+      positionsSuccess,
+      positionsError,
       error: acc.error || positionsError,
       isLiveExness: Boolean(acc.isLiveExness && isConn),
       mode: acc.mode,
@@ -170,7 +216,16 @@ export async function GET(req: NextRequest) {
     ensureSchedulerStarted();
     const { searchParams } = new URL(req.url);
     const symbol = searchParams.get('symbol') || 'XAUUSDm';
-    const snapshot = await buildUnifiedSnapshot(symbol);
+    const authHeader = req.headers.get('authorization') || req.headers.get('x-api-key');
+    const accId = searchParams.get('accountId');
+    const incomingCreds = accId ? {
+      accountId: accId,
+      apiKey: searchParams.get('apiKey') || authHeader?.replace(/^Bearer\s+/i, ''),
+      privateKey: searchParams.get('privateKey') || searchParams.get('secret'),
+      server: searchParams.get('server'),
+      mode: searchParams.get('mode'),
+    } : undefined;
+    const snapshot = await buildUnifiedSnapshot(symbol, incomingCreds);
 
     return NextResponse.json(
       {
@@ -199,6 +254,7 @@ export async function POST(req: NextRequest) {
     const { action, credentials, symbol, payload } = body;
     const rawAction = String(action || body.type || '').trim();
     const cleanAction = rawAction.toLowerCase().replace(/[-_\s]/g, '');
+    const effectiveCreds = credentials || payload?.credentials || body?.credentials || (body?.accountId ? body : undefined);
 
     // 1. CONNECT ACTION
     if (cleanAction === 'connect') {
@@ -311,7 +367,7 @@ export async function POST(req: NextRequest) {
       const takeProfit = body.takeProfit ?? body.tp ?? body.takeProfitPrice ?? payload?.takeProfit ?? payload?.tp ?? payload?.takeProfitPrice;
       const comment = body.comment || payload?.comment || orderData.comment || 'Quant AI Execution';
 
-      const client = await getVaultClient();
+      const client = await getVaultClient(effectiveCreds);
       const result = await client.openMarketOrder({
         symbol: orderSymbol,
         side,
@@ -356,7 +412,7 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const client = await getVaultClient();
+      const client = await getVaultClient(effectiveCreds);
       const norm = (id: string) => String(id || '').replace(/^#+/, '').trim().toLowerCase();
       const targetNorm = norm(positionId);
 
@@ -408,7 +464,7 @@ export async function POST(req: NextRequest) {
         );
       }
 
-      const client = await getVaultClient();
+      const client = await getVaultClient(effectiveCreds);
       const modified = await client.modifyPosition({ positionId, stopLoss, takeProfit }, stopLoss, takeProfit, sym);
       const { positions: currentPositions, error: posError } = await safeFetchPositions(client);
       if (!posError) {
@@ -430,7 +486,7 @@ export async function POST(req: NextRequest) {
 
     // 5. CLOSE ALL / PANIC CLOSE (closeAll | panicClose | panic) -> REAL Exness close all
     if (['closeall', 'panicclose', 'panic'].includes(cleanAction)) {
-      const client = await getVaultClient();
+      const client = await getVaultClient(effectiveCreds);
       const panicRes = await client.closeAllPositions();
       const { positions: currentPositions } = await safeFetchPositions(client);
       await stateSync.updateRuntimeState({
@@ -456,7 +512,7 @@ export async function POST(req: NextRequest) {
       const targetSym = symbol || payload?.symbol || body?.symbol || 'XAUUSDm';
       const timeframe = payload?.timeframe || body?.timeframe || 'M5';
       const limit = payload?.limit || body?.limit || 80;
-      const vaultCreds = await loadVaultCredentials();
+      const vaultCreds = await resolveEffectiveVaultCreds(effectiveCreds);
       const client = new ExnessClient(vaultCreds || undefined);
       client.ensureWebSocketConnected().catch(() => {});
       const candles = await client.getCandles(targetSym, timeframe, limit);
@@ -467,7 +523,7 @@ export async function POST(req: NextRequest) {
     // 7. QUOTE
     if (cleanAction === 'quote') {
       const targetSym = symbol || payload?.symbol || body?.symbol || 'XAUUSDm';
-      const vaultCreds = await loadVaultCredentials();
+      const vaultCreds = await resolveEffectiveVaultCreds(effectiveCreds);
       const client = new ExnessClient(vaultCreds || undefined);
       client.ensureWebSocketConnected().catch(() => {});
       const quote = await client.getQuote(targetSym);
@@ -491,6 +547,9 @@ export async function POST(req: NextRequest) {
 
     // 9. SYNC-STATE
     if (cleanAction === 'syncstate') {
+      if (effectiveCreds) {
+        await resolveEffectiveVaultCreds(effectiveCreds);
+      }
       const updated = await stateSync.updateRuntimeState(payload || {});
       return NextResponse.json({ ok: true, success: true, data: sanitizeRuntimeState(updated) }, { status: 200 });
     }
@@ -503,7 +562,7 @@ export async function POST(req: NextRequest) {
 
     // 11. UNIFIED SNAPSHOT FALLBACK
     const targetSym = symbol || payload?.symbol || body?.symbol || 'XAUUSDm';
-    const snapshot = await buildUnifiedSnapshot(targetSym);
+    const snapshot = await buildUnifiedSnapshot(targetSym, effectiveCreds);
 
     return NextResponse.json(
       {

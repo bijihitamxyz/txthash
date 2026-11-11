@@ -40,11 +40,11 @@ export const BinanceVaultModal: React.FC = () => {
   const [binanceSecret, setBinanceSecret] = useState(binanceConfig?.secretKey || '');
   const [binanceAccountType, setBinanceAccountType] = useState<CryptoAccountType>(binanceConfig?.accountType || 'DEMO');
 
-  // Form states for Bitget
+  // Form states for Bitget (Real Bitget V2 REST API — Live or Official Demo Trading via API Key)
   const [bitgetKey, setBitgetKey] = useState(bitgetConfig?.apiKey || '');
   const [bitgetSecret, setBitgetSecret] = useState(bitgetConfig?.secretKey || '');
   const [bitgetPassphrase, setBitgetPassphrase] = useState(bitgetConfig?.passphrase || '');
-  const [bitgetAccountType, setBitgetAccountType] = useState<CryptoAccountType>(bitgetConfig?.accountType || 'DEMO');
+  const [bitgetAccountType, setBitgetAccountType] = useState<CryptoAccountType>(bitgetConfig?.accountType || 'REAL');
 
   // Visibility toggles
   const [showBinanceSecret, setShowBinanceSecret] = useState(false);
@@ -74,7 +74,7 @@ export const BinanceVaultModal: React.FC = () => {
     setBitgetKey(bitgetConfig?.apiKey || '');
     setBitgetSecret(bitgetConfig?.secretKey || '');
     setBitgetPassphrase(bitgetConfig?.passphrase || '');
-    setBitgetAccountType(bitgetConfig?.accountType || 'DEMO');
+    setBitgetAccountType(bitgetConfig?.accountType || 'REAL');
 
     setValidationError(null);
     setTestStatus(null);
@@ -85,13 +85,14 @@ export const BinanceVaultModal: React.FC = () => {
   const isBinanceConfigured = Boolean(binanceConfig?.apiKey && binanceConfig?.secretKey);
   const isBitgetConfigured = Boolean(bitgetConfig?.apiKey && bitgetConfig?.secretKey && bitgetConfig?.passphrase);
 
-  const currentAccountType = selectedExchange === 'BINANCE' ? binanceAccountType : bitgetAccountType;
+  const currentAccountType: CryptoAccountType = selectedExchange === 'BINANCE' ? binanceAccountType : bitgetAccountType;
   const setAccountType = (type: CryptoAccountType) => {
     if (selectedExchange === 'BINANCE') {
       setBinanceAccountType(type);
     } else {
       setBitgetAccountType(type);
     }
+    setTestStatus(null);
   };
 
   const handleTest = async () => {
@@ -403,14 +404,21 @@ export const BinanceVaultModal: React.FC = () => {
             </div>
           </div>
 
-          {/* 2. ACCOUNT TYPE SELECTOR (REAL vs DEMO Segmented Toggle) */}
+          {/* 2. ACCOUNT TYPE SELECTOR */}
           <div className="pt-1">
             <div className="flex items-center justify-between mb-2">
               <label className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
                 2. ACCOUNT MODE ({selectedExchange})
               </label>
               <span className="text-[10px] text-slate-400 dark:text-zinc-500">
-                Target: {currentAccountType === 'REAL' ? 'Live Production' : 'Simulated Paper'}
+                Target:{' '}
+                {selectedExchange === 'BITGET'
+                  ? currentAccountType === 'REAL'
+                    ? 'Bitget Live V2'
+                    : 'Bitget Demo V2 (API Key · paptrading: 1)'
+                  : currentAccountType === 'REAL'
+                  ? 'Live Production'
+                  : 'Binance Testnet'}
               </span>
             </div>
 
@@ -426,8 +434,14 @@ export const BinanceVaultModal: React.FC = () => {
               >
                 <Cpu className="w-4 h-4 text-amber-500" />
                 <div className="text-left">
-                  <div className="text-xs">DEMO / SIMULATED</div>
-                  <div className="text-[9px] opacity-75 font-normal">Paper Trading</div>
+                  <div className="text-xs">
+                    {selectedExchange === 'BITGET' ? 'DEMO V2 (API KEY)' : 'TESTNET'}
+                  </div>
+                  <div className="text-[9px] opacity-75 font-normal">
+                    {selectedExchange === 'BITGET'
+                      ? 'Bitget Demo API (paptrading: 1)'
+                      : 'Binance Future Testnet'}
+                  </div>
                 </div>
               </button>
 
@@ -443,7 +457,9 @@ export const BinanceVaultModal: React.FC = () => {
                 <ShieldCheck className="w-4 h-4 text-emerald-500" />
                 <div className="text-left">
                   <div className="text-xs">REAL ACCOUNT</div>
-                  <div className="text-[9px] opacity-75 font-normal">Live USDT-M</div>
+                  <div className="text-[9px] opacity-75 font-normal">
+                    {selectedExchange === 'BITGET' ? 'Bitget Live USDT-M V2' : 'Live USDT-M'}
+                  </div>
                 </div>
               </button>
             </div>
@@ -456,9 +472,9 @@ export const BinanceVaultModal: React.FC = () => {
                   ? currentAccountType === 'REAL'
                     ? 'https://fapi.binance.com'
                     : 'https://testnet.binancefuture.com'
-                  : currentAccountType === 'REAL'
-                  ? 'https://api.bitget.com (USDT-FUTURES)'
-                  : "https://api.bitget.com (Bitget V2 Demo: USDT-FUTURES + paptrading: 1)"}
+                  : currentAccountType === 'DEMO'
+                  ? 'https://api.bitget.com (Bitget Demo V2 · paptrading: 1)'
+                  : 'https://api.bitget.com (Bitget Live V2 · USDT-FUTURES)'}
               </span>
             </div>
           </div>
