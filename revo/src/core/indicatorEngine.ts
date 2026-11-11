@@ -44,6 +44,30 @@ export interface DivergenceResult {
   rsiDiff: number;
 }
 
+export interface ExpectedMoveProjection {
+  expectedTargetPrice: number;
+  expectedMoveUsd: number;
+  expectedMovePct: number;
+  magnetType: 'POC_PULLBACK' | 'VAL_DEEP_DIP' | 'VAH_DEEP_RISE' | 'DRASTIC_DROP' | 'DRASTIC_RISE' | 'EQUILIBRIUM';
+  pocPrice: number;
+  vahPrice: number;
+  valPrice: number;
+}
+
+export interface ExpectedMoveInput {
+  currentPrice: number;
+  pocPrice: number;
+  vahPrice: number;
+  valPrice: number;
+  atr14: number;
+  zScore: number;
+  rsi?: number;
+  momentum5?: number;
+  bbwExpansionPct?: number;
+  bullishPct?: number;
+  digits?: number;
+}
+
 export interface IndicatorSnapshot {
   rsi: number[];
   bb: BollingerBandsResult;
@@ -61,6 +85,13 @@ export interface IndicatorSnapshot {
   efficiencyRatio: number;
   supportPrice: number;
   resistancePrice: number;
+  pocPrice: number;
+  vahPrice: number;
+  valPrice: number;
+  expectedTargetPrice: number;
+  expectedMoveUsd: number;
+  expectedMovePct: number;
+  expectedMove: ExpectedMoveProjection;
   divergence: DivergenceResult;
   // Last three closed candles reference (C0 trigger, C1 setup, C2 prior context)
   c0: {
@@ -521,6 +552,21 @@ export function computeIndicatorSnapshot(
   const c2Std = (bb.upper[c2Index] - bb.middle[c2Index]) / (bbStdDev || 2);
   const c2ZScore = c2Std > 0 ? Number(((candles[c2Index].close - bb.middle[c2Index]) / c2Std).toFixed(2)) : 0;
 
+  const inferredDigits = candles[c0Index].close > 500 ? 2 : candles[c0Index].close > 50 ? 3 : 5;
+  const vpLevels = computeVolumeProfileLevels(candles, bb.middle[c0Index], inferredDigits);
+  const expectedMove = computeExpectedMarketMove({
+    currentPrice: candles[c0Index].close,
+    pocPrice: vpLevels.poc,
+    vahPrice: vpLevels.vah,
+    valPrice: vpLevels.val,
+    atr14: atr14[c0Index],
+    zScore: c0ZScore,
+    rsi: rsi[c0Index],
+    momentum5,
+    bbwExpansionPct,
+    digits: inferredDigits,
+  });
+
   return {
     rsi,
     bb,
@@ -538,6 +584,13 @@ export function computeIndicatorSnapshot(
     efficiencyRatio,
     supportPrice: Number(supportPrice.toFixed(5)),
     resistancePrice: Number(resistancePrice.toFixed(5)),
+    pocPrice: vpLevels.poc,
+    vahPrice: vpLevels.vah,
+    valPrice: vpLevels.val,
+    expectedTargetPrice: expectedMove.expectedTargetPrice,
+    expectedMoveUsd: expectedMove.expectedMoveUsd,
+    expectedMovePct: expectedMove.expectedMovePct,
+    expectedMove,
     divergence,
     c0: {
       candle: candles[c0Index],
@@ -581,6 +634,197 @@ export function computeIndicatorSnapshot(
       lowerWickRatio: c2Wicks.lowerWickRatio,
       upperWickRatio: c2Wicks.upperWickRatio,
     },
+  };
+}
+
+/**
+ * Computes Volume-Weighted Point of Control (POC), Value Area High (VAH), and Value Area Low (VAL)
+ * across recent candles for Expected Market Move projection.
+ */
+export function computeVolumeProfileLevels(
+  candles: Candle[],
+  middleBB: number,
+  digits: number = 2
+): { poc: number; vah: number; val: number } {
+  if (!candles || candles.length === 0) {
+    const base = Number((middleBB || 0).toFixed(digits));
+    return { poc: base, vah: base, val: base };
+  }
+  const recent = candles.slice(-50);
+  let minP = Infinity;
+  let maxP = -Infinity;
+  for (const c of recent) {
+    if (c.low < minP) minP = c.low;
+    if (c.high > maxP) maxP = c.high;
+  }
+  if (!isFinite(minP) || !isFinite(maxP) || maxP <= minP) {
+    const fallback = Number((middleBB || recent[recent.length - 1].close).toFixed(digits));
+    return { poc: fallback, vah: fallback, val: fallback };
+  }
+
+  const buckets = 16;
+  const step = (maxP - minP) / buckets;
+  const volBins = new Array<number>(buckets).fill(0);
+  let totalVol = 0;
+
+  for (const c of recent) {
+    const typicalPrice = (c.high + c.low + c.close * 2) / 4;
+    const vol = Math.max(1, c.volume || 1);
+    const idx = Math.min(buckets - 1, Math.max(0, Math.floor((typicalPrice - minP) / step)));
+    volBins[idx] += vol;
+    totalVol += vol;
+  }
+
+  let bestBin = 0;
+  let maxVol = -1;
+  for (let i = 0; i < buckets; i++) {
+    if (volBins[i] > maxVol) {
+      maxVol = volBins[i];
+      bestBin = i;
+    }
+  }
+
+  const targetVol = totalVol * 0.7;
+  let capturedVol = volBins[bestBin];
+  let lowBin = bestBin;
+  let highBin = bestBin;
+
+  while (capturedVol < targetVol && (lowBin > 0 || highBin < buckets - 1)) {
+    const nextLowVol = lowBin > 0 ? volBins[lowBin - 1] : -1;
+    const nextHighVol = highBin < buckets - 1 ? volBins[highBin + 1] : -1;
+    if (nextHighVol >= nextLowVol && highBin < buckets - 1) {
+      highBin++;
+      capturedVol += volBins[highBin];
+    } else if (lowBin > 0) {
+      lowBin--;
+      capturedVol += volBins[lowBin];
+    } else {
+      break;
+    }
+  }
+
+  const rawPoc = minP + (bestBin + 0.5) * step;
+  const blendedPoc = middleBB > 0 ? rawPoc * 0.65 + middleBB * 0.35 : rawPoc;
+  const rawVal = minP + lowBin * step;
+  const rawVah = minP + (highBin + 1) * step;
+
+  return {
+    poc: Number(blendedPoc.toFixed(digits)),
+    vah: Number(Math.max(blendedPoc, rawVah).toFixed(digits)),
+    val: Number(Math.min(blendedPoc, rawVal).toFixed(digits)),
+  };
+}
+
+/**
+ * Calculates real-time Quantitative Expected Market Move (% and target price)
+ * from Kronos POC/VAH/VAL + ATR(14) + Z-Score:
+ * - If price is extended above POC (Z > 1.0 or bearish momentum), primary downside magnet is POC (moderate dip)
+ *   and VAL (deep dip); if VAL breaks with high volume/momentum, project currentPrice - (2.0 * atr) (drastic drop).
+ * - Symmetric logic for upside magnet (POC -> VAH -> currentPrice + 2.0 * atr).
+ * - expectedMoveUsd = expectedTargetPrice - currentPrice
+ * - expectedMovePct = (expectedMoveUsd / currentPrice) * 100
+ */
+export function computeExpectedMarketMove(input: ExpectedMoveInput): ExpectedMoveProjection {
+  const {
+    currentPrice,
+    pocPrice,
+    vahPrice,
+    valPrice,
+    atr14,
+    zScore,
+    rsi = 50,
+    momentum5 = 0,
+    bbwExpansionPct = 10,
+    bullishPct = 50,
+  } = input;
+
+  const digits = input.digits ?? (currentPrice > 500 ? 2 : currentPrice > 50 ? 3 : 5);
+  if (!currentPrice || currentPrice <= 0 || isNaN(currentPrice)) {
+    return {
+      expectedTargetPrice: 0,
+      expectedMoveUsd: 0,
+      expectedMovePct: 0,
+      magnetType: 'EQUILIBRIUM',
+      pocPrice: pocPrice || 0,
+      vahPrice: vahPrice || 0,
+      valPrice: valPrice || 0,
+    };
+  }
+
+  const safeAtr = atr14 > 0 ? atr14 : currentPrice * 0.0015;
+  const poc = pocPrice > 0 ? pocPrice : currentPrice;
+  const vah = vahPrice > 0 ? Math.max(poc, vahPrice) : poc + safeAtr;
+  const val = valPrice > 0 ? Math.min(poc, valPrice) : poc - safeAtr;
+  const bearishPct = 100 - bullishPct;
+  const hasBearishMomentum = momentum5 < 0 || bearishPct > 52 || rsi >= 62;
+  const hasBullishMomentum = momentum5 > 0 || bullishPct > 52 || rsi <= 38;
+
+  let expectedTargetPrice = poc;
+  let magnetType: ExpectedMoveProjection['magnetType'] = 'POC_PULLBACK';
+
+  // 1. VAL break with high volume/momentum -> Drastic Drop: currentPrice - (2.0 * atr)
+  if (
+    currentPrice < val &&
+    (momentum5 < -0.35 * safeAtr || bbwExpansionPct >= 20 || zScore <= -1.35 || bearishPct >= 65)
+  ) {
+    expectedTargetPrice = currentPrice - 2.0 * safeAtr;
+    magnetType = 'DRASTIC_DROP';
+  }
+  // 2. VAH break with high volume/momentum -> Drastic Rise: currentPrice + (2.0 * atr)
+  else if (
+    currentPrice > vah &&
+    (momentum5 > 0.35 * safeAtr || bbwExpansionPct >= 20 || zScore >= 1.35 || bullishPct >= 65) &&
+    zScore <= 2.2
+  ) {
+    expectedTargetPrice = currentPrice + 2.0 * safeAtr;
+    magnetType = 'DRASTIC_RISE';
+  }
+  // 3. Extended above POC (Z > 1.0 or bearish momentum) -> Downside magnet: POC (moderate dip) or VAL (deep dip)
+  else if (currentPrice > poc && (zScore > 1.0 || hasBearishMomentum)) {
+    const distToPoc = currentPrice - poc;
+    if (zScore > 1.75 || (momentum5 < -0.6 * safeAtr && bearishPct >= 58) || distToPoc < 0.2 * safeAtr) {
+      expectedTargetPrice = val < currentPrice ? val : currentPrice - 1.2 * safeAtr;
+      magnetType = 'VAL_DEEP_DIP';
+    } else {
+      expectedTargetPrice = poc;
+      magnetType = 'POC_PULLBACK';
+    }
+  }
+  // 4. Extended below POC (Z < -1.0 or bullish momentum) -> Upside magnet: POC (moderate rise) or VAH (deep rise)
+  else if (currentPrice < poc && (zScore < -1.0 || hasBullishMomentum)) {
+    const distToPoc = poc - currentPrice;
+    if (zScore < -1.75 || (momentum5 > 0.6 * safeAtr && bullishPct >= 58) || distToPoc < 0.2 * safeAtr) {
+      expectedTargetPrice = vah > currentPrice ? vah : currentPrice + 1.2 * safeAtr;
+      magnetType = 'VAH_DEEP_RISE';
+    } else {
+      expectedTargetPrice = poc;
+      magnetType = 'POC_PULLBACK';
+    }
+  }
+  // 5. Inside Value Area near POC -> gravitate toward VAH (bullish) or VAL (bearish) or POC
+  else if (Math.abs(currentPrice - poc) >= 0.25 * safeAtr) {
+    expectedTargetPrice = poc;
+    magnetType = 'POC_PULLBACK';
+  } else if (bullishPct >= 50) {
+    expectedTargetPrice = vah > currentPrice + 0.1 * safeAtr ? vah : currentPrice + 0.8 * safeAtr;
+    magnetType = 'VAH_DEEP_RISE';
+  } else {
+    expectedTargetPrice = val < currentPrice - 0.1 * safeAtr ? val : currentPrice - 0.8 * safeAtr;
+    magnetType = 'VAL_DEEP_DIP';
+  }
+
+  const roundedTarget = Number(expectedTargetPrice.toFixed(digits));
+  const expectedMoveUsd = Number((roundedTarget - currentPrice).toFixed(digits));
+  const expectedMovePct = Number((((roundedTarget - currentPrice) / currentPrice) * 100).toFixed(2));
+
+  return {
+    expectedTargetPrice: roundedTarget,
+    expectedMoveUsd,
+    expectedMovePct,
+    magnetType,
+    pocPrice: poc,
+    vahPrice: vah,
+    valPrice: val,
   };
 }
 

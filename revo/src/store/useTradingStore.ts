@@ -1938,17 +1938,41 @@ export const useTradingStore = create<TradingState>()(
             }
           }
 
-          // Compute ATR(14) and Middle BB for advancing Tight ATR Trailing Stop
+          // Compute ATR(14), Middle BB, and Expected Market Move for Style 2 Hybrid Trailing Stop
           let middleBB = curPrice;
           let atr14 = profile.pipValue * (pos.symbol === 'XAUUSDm' ? 15 : 10);
+          let expectedMovePct: number | undefined;
+          let expectedTargetPrice: number | undefined;
+          let expectedMoveUsd: number | undefined;
+          let pocPrice: number | undefined;
+          let vahPrice: number | undefined;
+          let valPrice: number | undefined;
+          let zScore: number | undefined;
+          let currentRsi: number | undefined;
+          let bbwExpansionPct: number | undefined;
+
           if (pos.symbol === (freshState.focusSymbol || freshState.selectedSymbol) && freshState.candles.length >= 20) {
             try {
               const { computeIndicatorSnapshot } = await import('@/core/indicatorEngine');
               const ind = computeIndicatorSnapshot(freshState.candles, profile.preset.rsiPeriod, profile.preset.bbPeriod, profile.preset.bbStdDev);
               middleBB = ind.c0.middleBB;
               atr14 = ind.c0.atr14;
+              expectedMovePct = ind.expectedMovePct;
+              expectedTargetPrice = ind.expectedTargetPrice;
+              expectedMoveUsd = ind.expectedMoveUsd;
+              pocPrice = ind.pocPrice;
+              vahPrice = ind.vahPrice;
+              valPrice = ind.valPrice;
+              zScore = ind.c0.zScore;
+              currentRsi = ind.c0.rsi;
+              bbwExpansionPct = ind.bbwExpansionPct;
             } catch {}
           }
+
+          const kp = freshState.kronosPrediction?.symbol === pos.symbol ? freshState.kronosPrediction : undefined;
+          const opposingRegimePct = kp
+            ? (isBuy ? (kp.bearishPct ?? 50) : (kp.bullishPct ?? 50))
+            : undefined;
 
           const trailingAction = evaluatePositionTrailing({
             position: pos,
@@ -1956,9 +1980,19 @@ export const useTradingStore = create<TradingState>()(
             currentAsk: q.ask,
             middleBB,
             atr14,
+            bbwExpansionPct,
+            currentRsi,
             pairProfile: profile,
             enablePartialClose: freshState.enablePartialClose,
             stopLossPips: freshState.stopLossPips ?? 25,
+            expectedMovePct,
+            expectedTargetPrice,
+            expectedMoveUsd,
+            pocPrice: kp?.pocPrice || pocPrice,
+            vahPrice: kp?.vahPrice || vahPrice,
+            valPrice: kp?.valPrice || valPrice,
+            zScore: kp?.zScore ?? zScore,
+            opposingRegimePct,
           });
 
           if (trailingAction.type === 'HARD_SL_CLOSE') {

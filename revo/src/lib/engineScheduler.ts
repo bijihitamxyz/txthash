@@ -18,7 +18,7 @@ import { BinanceFuturesClient, formatQuantityByStepSize, FALLBACK_SYMBOLS } from
 import { BitgetFuturesService } from '@/services/bitgetService';
 import { getPairProfile, SUPPORTED_SYMBOLS, calculatePnL, evaluatePositionPnL } from '@/core/pairConfig';
 import { evaluateSignalGates } from '@/core/signalGate';
-import { evaluateMultiAiConsensus } from '@/core/aiJudge';
+import { evaluateMultiAiConsensus, computeForwardMarketOutlook } from '@/core/aiJudge';
 import {
   readCentralAiConfig,
   getActiveAiProviders,
@@ -72,6 +72,10 @@ class EngineScheduler {
   public cryptoLeverage = 10;
   public cryptoMarginMode: 'ISOLATED' | 'CROSS' = 'ISOLATED';
   public cryptoMaxConcurrentCoins = 5;
+
+  // Forex Entry Scanner & Active Position Guardian State
+  public entryScannerState: string = 'ACTIVE';
+  private hasLoggedFullCapacityGuard = false;
 
   public setActiveRoom(room: 'FOREX' | 'CRYPTO') {
     this.activeRoom = room;
@@ -333,7 +337,36 @@ class EngineScheduler {
             profile.preset.bbStdDev
           );
 
-          const trailingAction = evaluatePositionTrailing({
+          const kronosForPos = computeRealTimeKronosForecast({
+            symbol: pos.symbol,
+            timeframe: 'M5',
+            candles,
+            aiModel: activeAiSummaryLabel,
+          });
+
+          const forwardOutlook = computeForwardMarketOutlook({
+            symbol: pos.symbol,
+            currentPrice: curPrice,
+            pocPrice: kronosForPos.pocPrice || indicators.pocPrice,
+            vahPrice: kronosForPos.vahPrice || indicators.vahPrice,
+            valPrice: kronosForPos.valPrice || indicators.valPrice,
+            zScore: kronosForPos.zScore ?? indicators.c0.zScore,
+            rsi: kronosForPos.rsi || indicators.c0.rsi,
+            momentum5: indicators.momentum5,
+            bbwExpansionPct: indicators.bbwExpansionPct,
+            bullishPct: kronosForPos.bullishPct,
+            expectedMovePct: indicators.expectedMovePct,
+            expectedMoveUsd: indicators.expectedMoveUsd,
+            expectedTargetPrice: indicators.expectedTargetPrice,
+            digits: profile.digits,
+            openPositions: updatedPositions,
+          });
+
+          if (forwardOutlook.shouldTightenOrFreezeSl) {
+            pos.strictRatchetLocked = true;
+          }
+
+          let trailingAction = evaluatePositionTrailing({
             position: pos,
             currentBid: quote.bid,
             currentAsk: quote.ask,
@@ -344,7 +377,44 @@ class EngineScheduler {
             pairProfile: profile,
             enablePartialClose: state.enablePartialClose,
             stopLossPips: state.stopLossPips ?? 25,
+            expectedMovePct: indicators.expectedMovePct,
+            expectedTargetPrice: indicators.expectedTargetPrice,
+            expectedMoveUsd: indicators.expectedMoveUsd,
+            pocPrice: kronosForPos.pocPrice || indicators.pocPrice,
+            vahPrice: kronosForPos.vahPrice || indicators.vahPrice,
+            valPrice: kronosForPos.valPrice || indicators.valPrice,
+            zScore: kronosForPos.zScore ?? indicators.c0.zScore,
+            opposingRegimePct: forwardOutlook.opposingRegimePctForTrailing,
           });
+
+          // If Forward Forecast shifts strongly against open position (e.g. BUY held while SHORT >= 68% and negative Proj. Move),
+          // tighten/freeze the Trailing Stop immediately to protect open profit
+          if (forwardOutlook.shouldTightenOrFreezeSl && trailingAction.type === 'NONE') {
+            const isBuy = pos.side === 'BUY';
+            const profitDist = isBuy ? curPrice - pos.entryPrice : pos.entryPrice - curPrice;
+            const profitPips = profitDist / (profile.pipValue || 0.01);
+            const minStep = pos.symbol === 'XAUUSDm' ? 0.10 : profile.pipValue;
+            if (profitPips >= 5) {
+              const lockSlRaw = isBuy
+                ? Math.max(pos.entryPrice + profile.pipValue, curPrice - 6 * profile.pipValue)
+                : Math.min(pos.entryPrice - profile.pipValue, curPrice + 6 * profile.pipValue);
+              const lockSl = Number(lockSlRaw.toFixed(profile.digits));
+              const canTighten = isBuy
+                ? lockSl < curPrice - 2 * profile.pipValue && (pos.currentSl === 0 || lockSl > pos.currentSl + minStep)
+                : lockSl > curPrice + 2 * profile.pipValue && (pos.currentSl === 0 || lockSl < pos.currentSl - minStep);
+              if (canTighten) {
+                trailingAction = {
+                  type: 'MODIFY_SL',
+                  positionId: pos.id,
+                  symbol: pos.symbol,
+                  newSlPrice: lockSl,
+                  formattedSlPrice: lockSl.toFixed(profile.digits),
+                  reason: `[FORWARD-GUARD] Forward Forecast shifted to ${forwardOutlook.nextBias} (${forwardOutlook.dominantPct}%, Proj. Move ${forwardOutlook.expectedMovePct >= 0 ? '+' : ''}${forwardOutlook.expectedMovePct.toFixed(2)}% -> ${forwardOutlook.expectedTargetPrice.toFixed(profile.digits)}): Tightened & froze Trailing SL at ${lockSl.toFixed(profile.digits)} to protect open profit`,
+                  statusUpdate: 'PHASE_B_RATCHET',
+                };
+              }
+            }
+          }
 
           // Hard SL Circuit Breaker handling
           if (trailingAction.type === 'HARD_SL_CLOSE') {
@@ -400,8 +470,39 @@ class EngineScheduler {
         };
       }
 
+      const maxOpenPositions = riskConfig.maxOpenPositions || 2;
+      const isFullCapacity = updatedPositions.length >= maxOpenPositions;
+      if (isFullCapacity) {
+        this.entryScannerState = 'IDLE (2/2 FULL — GUARDING POSITIONS)';
+        if (!this.hasLoggedFullCapacityGuard) {
+          this.hasLoggedFullCapacityGuard = true;
+          const guardSym = updatedPositions[0]?.symbol || targetSymbols[0] || 'XAUUSDm';
+          log(
+            guardSym,
+            'AI',
+            `[POSITION-GUARD] Slot ${updatedPositions.length}/${maxOpenPositions} terisi penuh — Entry Scanner IDLE. Mengalihkan pemrosesan ke Prediksi Arah & Trailing Stop.`
+          );
+        }
+      } else {
+        this.entryScannerState = 'ACTIVE';
+        this.hasLoggedFullCapacityGuard = false;
+      }
+
       // 2. Scan Target Markets for Unified Hybrid Signals (With-Trend & Counter-Trend)
-      for (const symbol of targetSymbols) {
+      // Strictly skipped when slots are full (2/2) so 100% of processing is dedicated to Forward Prediction & Trailing Stop
+      for (const symbol of isFullCapacity ? [] : targetSymbols) {
+        if (updatedPositions.length >= maxOpenPositions) {
+          this.entryScannerState = 'IDLE (2/2 FULL — GUARDING POSITIONS)';
+          if (!this.hasLoggedFullCapacityGuard) {
+            this.hasLoggedFullCapacityGuard = true;
+            log(
+              symbol,
+              'AI',
+              `[POSITION-GUARD] Slot ${updatedPositions.length}/${maxOpenPositions} terisi penuh — Entry Scanner IDLE. Mengalihkan pemrosesan ke Prediksi Arah & Trailing Stop.`
+            );
+          }
+          break;
+        }
         if (state.targetMarket === 'GOLD' && symbol !== 'XAUUSDm') {
           continue;
         }

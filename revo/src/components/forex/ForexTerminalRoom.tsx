@@ -7,8 +7,9 @@ import { getActiveExnessCredentials } from '@/lib/cryptoVault';
 import { useRoomStore } from '@/store/useRoomStore';
 import { PnlCalendarModal } from '@/components/PnlCalendarModal';
 import { getPairProfile, formatPrice, evaluatePositionPnL } from '@/core/pairConfig';
-import { computeIndicatorSnapshot, Timeframe } from '@/core/indicatorEngine';
+import { computeIndicatorSnapshot, computeExpectedMarketMove, Timeframe } from '@/core/indicatorEngine';
 import { computeVolumeProfileMetrics } from '@/core/kronosService';
+import { computeForwardMarketOutlook } from '@/core/aiJudge';
 import {
   Terminal,
   BrainCircuit,
@@ -40,6 +41,8 @@ const TradingChart = dynamic(
 );
 
 let isDashboardLoopRunning = false;
+let hasLoggedFullCapacityTransition = false;
+const MAX_OPEN_POSITIONS = 2;
 
 const SYMBOLS = ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'] as const;
 const TIMEFRAMES: Timeframe[] = ['M1', 'M5', 'M15', 'H1'];
@@ -225,10 +228,19 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
       try {
         if (typeof document !== 'undefined' && document.hidden) return;
         tickCounter++;
+        const st = useTradingStore.getState();
         const currentRoom = useRoomStore.getState().activeRoom;
         const currentIsForexActive = isActiveRoom && currentRoom !== 'CRYPTO' && currentRoom !== 'ROOM_2_BINANCE';
-        const isAuto = useTradingStore.getState().isAutoTrading;
-        const hasPositions = Boolean(useTradingStore.getState().openPositions && useTradingStore.getState().openPositions.length > 0);
+        const isAuto = st.isAutoTrading;
+        const rawOpen =
+          Array.isArray(st.openPositions) && st.openPositions.length > 0
+            ? st.openPositions
+            : Array.isArray(st.positions)
+            ? st.positions
+            : [];
+        const currentOpenList = rawOpen.filter((p) => p && p.id !== 'F-637' && p.id !== '#F-637');
+        const hasPositions = currentOpenList.length > 0;
+        const isFullCapacity = currentOpenList.length >= MAX_OPEN_POSITIONS;
 
         if (!currentIsForexActive && !isAuto && !hasPositions) {
           return;
@@ -236,19 +248,42 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
 
         // 1. Real-time GET /api/kronos health polling every ~9s
         if (tickCounter % 3 === 0) {
-          await useTradingStore.getState().checkKronosHealth();
+          await st.checkKronosHealth();
         }
 
-        // 2. Forex tick stream & autonomous strategy execution
-        await useTradingStore.getState().executeLiveTickStream();
+        // 2. Forex tick stream & Trailing Stop Guardian execution
+        await st.executeLiveTickStream();
 
-        if (isAuto) {
-          await useTradingStore.getState().executeEngineTick();
+        if (isFullCapacity) {
+          // Slot 2/2 Full: Entry Scanner IDLE — Log ONLY ONCE on transition into full capacity
+          if (!hasLoggedFullCapacityTransition) {
+            hasLoggedFullCapacityTransition = true;
+            const guardMsg =
+              '[POSITION-GUARD] Slot 2/2 terisi penuh — Entry Scanner IDLE. Mengalihkan pemrosesan ke Prediksi Arah & Trailing Stop.';
+            const alreadyLogged = (st.telemetryLogs || [])
+              .slice(0, 8)
+              .some((l) => l.message.includes('[POSITION-GUARD] Slot'));
+            if (!alreadyLogged) {
+              const sym = st.focusSymbol || st.selectedSymbol || currentOpenList[0]?.symbol || 'XAUUSDm';
+              st.addTelemetryLog(sym, 'AI', guardMsg);
+            }
+          }
+          // Reallocate cycle strictly to Forward Market Forecast & Trailing Stop Management (no entry calls)
+          if (tickCounter % 2 === 0) {
+            await st.fetchKronosPrediction();
+          }
+        } else {
+          hasLoggedFullCapacityTransition = false;
+          if (isAuto) {
+            await st.executeEngineTick();
+          }
         }
 
         if (tickCounter % 4 === 0) {
           await useTradingStore.getState().fetchAccountInfo();
-          await useTradingStore.getState().fetchKronosPrediction();
+          if (!isFullCapacity) {
+            await useTradingStore.getState().fetchKronosPrediction();
+          }
         }
 
         if (tickCounter % 8 === 0) {
@@ -279,6 +314,23 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
     return raw.filter((p) => p && p.id !== 'F-637' && p.id !== '#F-637');
   }, [openPositions, positions]);
 
+  const isSlotsFull = activePositions.length >= MAX_OPEN_POSITIONS;
+  const entryScannerState = isSlotsFull
+    ? 'IDLE (2/2 FULL — GUARDING POSITIONS)'
+    : isAutoTrading
+    ? 'ACTIVE'
+    : 'IDLE';
+  const forwardTightenLockRef = useRef<Record<string, number>>({});
+
+  // Purge any legacy "Max concurrency limit:" spam from telemetryLogs store state
+  useEffect(() => {
+    if (telemetryLogs.some((l) => l.message.includes('Max concurrency limit:'))) {
+      useTradingStore.setState({
+        telemetryLogs: telemetryLogs.filter((l) => !l.message.includes('Max concurrency limit:')),
+      });
+    }
+  }, [telemetryLogs]);
+
   // Live Floating PnL calculation across all active Forex positions strictly using filtered live prices
   const totalFloatingPnl = useMemo(() => {
     return activePositions.reduce((sum, pos) => {
@@ -302,11 +354,17 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
   // Compute live Kronos Forecaster & Multi-AI Consensus / Risk Governance metrics
   const aiMetrics = useMemo(() => {
     let bullishPct = 58;
-    let pocPrice = activeQuote?.bid || 0;
+    const liveRefPrice =
+      activeQuote?.bid ||
+      (candles && candles.length > 0 ? candles[candles.length - 1].close : 0);
+    let pocPrice = liveRefPrice;
     let vahPrice = pocPrice;
     let valPrice = pocPrice;
     let rsiVal = 52.4;
     let zScore = 0;
+    let atrVal = activeProfile.pipValue * (activeSymbol === 'XAUUSDm' ? 20 : 12);
+    let momentum5 = 0;
+    let bbwExpansionPct = 10;
     let regime = 'MEAN_REVERTING';
     let signal: 'BUY' | 'SELL' | 'NEUTRAL' = 'NEUTRAL';
 
@@ -319,6 +377,9 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
           activeProfile.preset.bbStdDev
         );
         rsiVal = snap.c0.rsi || 50;
+        atrVal = snap.c0.atr14 || atrVal;
+        momentum5 = snap.momentum5 || 0;
+        bbwExpansionPct = snap.bbwExpansionPct || 10;
         const middleBB = snap.c0.middleBB || candles[candles.length - 1].close;
         const vp = computeVolumeProfileMetrics(candles, middleBB, activeProfile.digits);
         pocPrice = vp.poc;
@@ -377,34 +438,84 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
     }
 
     const bearishPct = 100 - bullishPct;
+
+    // Quantitative Expected Market Move (% and Target Price) from Kronos POC/VAH/VAL + ATR + Z-Score
+    const expectedMove = computeExpectedMarketMove({
+      currentPrice: liveRefPrice || pocPrice,
+      pocPrice,
+      vahPrice,
+      valPrice,
+      atr14: atrVal,
+      zScore,
+      rsi: rsiVal,
+      momentum5,
+      bbwExpansionPct,
+      bullishPct,
+      digits: activeProfile.digits,
+    });
+
+    const pctSign = expectedMove.expectedMovePct >= 0 ? '+' : '';
+    const usdSign = expectedMove.expectedMoveUsd >= 0 ? '+$' : '-$';
+    const projMoveFormatted = `${pctSign}${expectedMove.expectedMovePct.toFixed(2)}% (${usdSign}${Math.abs(
+      expectedMove.expectedMoveUsd
+    ).toFixed(activeProfile.digits)} -> ${formatPrice(
+      expectedMove.expectedTargetPrice,
+      activeProfile.digits
+    )})`;
+
+    // Forward Market Forecast (forwardOutlook) for Active Position Guardian & Style 2 Trailing Stop
+    const forwardOutlook = computeForwardMarketOutlook({
+      symbol: activeSymbol,
+      currentPrice: liveRefPrice || pocPrice,
+      pocPrice,
+      vahPrice,
+      valPrice,
+      zScore,
+      rsi: rsiVal,
+      momentum5,
+      bbwExpansionPct,
+      bullishPct,
+      expectedMovePct: expectedMove.expectedMovePct,
+      expectedMoveUsd: expectedMove.expectedMoveUsd,
+      expectedTargetPrice: expectedMove.expectedTargetPrice,
+      digits: activeProfile.digits,
+      maxOpenPositions: MAX_OPEN_POSITIONS,
+      openPositions: activePositions,
+    });
+
     const latestAiLog = telemetryLogs.find(
       (l) =>
-        l.category === 'AI' ||
-        l.message.toUpperCase().includes('MULTI-AI') ||
-        l.message.toUpperCase().includes('CONSENSUS')
+        !l.message.includes('Max concurrency limit:') &&
+        (l.category === 'AI' ||
+          l.message.toUpperCase().includes('MULTI-AI') ||
+          l.message.toUpperCase().includes('CONSENSUS'))
     );
-    const latestSignalLog = telemetryLogs.find((l) => l.category === 'SIGNAL');
+    const latestSignalLog = telemetryLogs.find(
+      (l) => !l.message.includes('Max concurrency limit:') && l.category === 'SIGNAL'
+    );
 
-    const verdict =
-      kronosPrediction?.symbol === activeSymbol && kronosPrediction?.verdict
-        ? kronosPrediction.verdict
-        : bullishPct >= 58
-        ? 'BULLISH ACCUMULATION'
-        : bullishPct <= 42
-        ? 'BEARISH DISTRIBUTION'
-        : 'NEUTRAL CONSOLIDATION';
+    const verdict = isSlotsFull
+      ? `${forwardOutlook.nextBias} (${forwardOutlook.dominantPct}%) • ${forwardOutlook.reversalRisk}`
+      : kronosPrediction?.symbol === activeSymbol && kronosPrediction?.verdict
+      ? kronosPrediction.verdict
+      : bullishPct >= 58
+      ? 'BULLISH ACCUMULATION'
+      : bullishPct <= 42
+      ? 'BEARISH DISTRIBUTION'
+      : 'NEUTRAL CONSOLIDATION';
 
-    const multiAiSummary =
-      latestAiLog?.message ||
-      (kronosPrediction?.symbol === activeSymbol ? kronosPrediction.multiAiSummary : '') ||
-      latestSignalLog?.message ||
-      `Multi-AI Consensus / Risk Governance active on ${activeSymbol} (${timeframe}). POC=${formatPrice(
-        pocPrice,
-        activeProfile.digits
-      )}, VAH=${formatPrice(vahPrice, activeProfile.digits)}, VAL=${formatPrice(
-        valPrice,
-        activeProfile.digits
-      )}, RSI=${rsiVal.toFixed(1)}, Z=${zScore >= 0 ? '+' : ''}${zScore.toFixed(2)} (${regime}).`;
+    const multiAiSummary = isSlotsFull
+      ? forwardOutlook.advisoryText
+      : latestAiLog?.message ||
+        (kronosPrediction?.symbol === activeSymbol ? kronosPrediction.multiAiSummary : '') ||
+        latestSignalLog?.message ||
+        `Multi-AI Consensus / Risk Governance active on ${activeSymbol} (${timeframe}). POC=${formatPrice(
+          pocPrice,
+          activeProfile.digits
+        )}, VAH=${formatPrice(vahPrice, activeProfile.digits)}, VAL=${formatPrice(
+          valPrice,
+          activeProfile.digits
+        )}, RSI=${rsiVal.toFixed(1)}, Z=${zScore >= 0 ? '+' : ''}${zScore.toFixed(2)} (${regime}).`;
 
     return {
       bullishPct,
@@ -418,8 +529,67 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
       zScore,
       regime,
       signal,
+      expectedTargetPrice: expectedMove.expectedTargetPrice,
+      expectedMoveUsd: expectedMove.expectedMoveUsd,
+      expectedMovePct: expectedMove.expectedMovePct,
+      magnetType: expectedMove.magnetType,
+      projMoveFormatted,
+      forwardOutlook,
+      reversalRisk: forwardOutlook.reversalRisk,
     };
-  }, [candles, activeProfile, activeQuote, activeSymbol, timeframe, telemetryLogs, kronosPrediction]);
+  }, [candles, activeProfile, activeQuote, activeSymbol, timeframe, telemetryLogs, kronosPrediction, activePositions, isSlotsFull]);
+
+  // Feed Forward Forecast directly into Style 2 Trailing Stop for active positions:
+  // If user holds a BUY (LONG) position and Forward Forecast shifts strongly to SHORT (Bearish >= 68% and negative Proj. Move)
+  // (or SELL position when LONG >= 68% and positive Proj. Move), freeze Phase A elastic cushion & tighten SL immediately to protect profit.
+  useEffect(() => {
+    if (activePositions.length === 0) return;
+    const { forwardOutlook } = aiMetrics;
+    if (!forwardOutlook.shouldTightenOrFreezeSl) return;
+
+    const now = Date.now();
+    activePositions.forEach((pos) => {
+      if (pos.symbol !== activeSymbol) return;
+      const isBuy = pos.side === 'BUY';
+      const strongOpposing =
+        (isBuy && forwardOutlook.shortPct >= 68 && forwardOutlook.expectedMovePct < 0) ||
+        (!isBuy && forwardOutlook.longPct >= 68 && forwardOutlook.expectedMovePct > 0);
+      if (!strongOpposing) return;
+
+      // Immediately lock strict one-way ratchet so Style 2 Trailing Stop freezes against pullback
+      pos.strictRatchetLocked = true;
+
+      const prof = getPairProfile(pos.symbol);
+      const q = quotes[pos.symbol];
+      const curPrice = q ? (isBuy ? q.bid : q.ask) : pos.currentPrice || pos.entryPrice;
+      if (!curPrice || curPrice <= 0) return;
+
+      const profitDist = isBuy ? curPrice - pos.entryPrice : pos.entryPrice - curPrice;
+      const profitPips = profitDist / (prof.pipValue || 0.01);
+      const minStep = pos.symbol === 'XAUUSDm' ? 0.10 : prof.pipValue;
+
+      if (profitPips >= 5) {
+        const tightSlRaw = isBuy
+          ? Math.max(pos.entryPrice + prof.pipValue, curPrice - 6 * prof.pipValue)
+          : Math.min(pos.entryPrice - prof.pipValue, curPrice + 6 * prof.pipValue);
+        const tightSl = Number(tightSlRaw.toFixed(prof.digits));
+        const canTighten = isBuy
+          ? tightSl < curPrice - 2 * prof.pipValue && (pos.currentSl === 0 || tightSl > pos.currentSl + minStep)
+          : tightSl > curPrice + 2 * prof.pipValue && (pos.currentSl === 0 || tightSl < pos.currentSl - minStep);
+
+        const lastTightenAt = forwardTightenLockRef.current[pos.id] || 0;
+        if (canTighten && now - lastTightenAt > 12000) {
+          forwardTightenLockRef.current[pos.id] = now;
+          modifyPosition(pos.id, tightSl, pos.currentTp > 0 ? pos.currentTp : undefined).catch(() => {});
+          addTelemetryLog(
+            pos.symbol,
+            'TRAILING',
+            `[FORWARD-GUARD] Forward Forecast shifted to ${forwardOutlook.nextBias} (${forwardOutlook.dominantPct}%, Proj. Move ${forwardOutlook.expectedMovePct >= 0 ? '+' : ''}${forwardOutlook.expectedMovePct.toFixed(2)}% -> ${formatPrice(forwardOutlook.expectedTargetPrice, prof.digits)}): Tightened & froze Trailing SL at ${formatPrice(tightSl, prof.digits)} to protect open profit.`
+          );
+        }
+      }
+    });
+  }, [activePositions, aiMetrics, activeSymbol, quotes, modifyPosition, addTelemetryLog]);
 
   // Direct Manual EA Market Execution wired to /api/exness
   const handleManualMarketOrder = async (side: 'BUY' | 'SELL') => {
@@ -560,9 +730,22 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
     }
   };
 
-  // Unified ALL Telemetry stream
+  // Unified ALL Telemetry stream (suppressing any repeat concurrency spam)
   const formattedTelemetry = useMemo(() => {
-    return telemetryLogs.slice(0, 100).map((item) => {
+    let seenPositionGuard = false;
+    return telemetryLogs
+      .filter((item) => {
+        if (item.message.includes('Max concurrency limit:')) {
+          return false;
+        }
+        if (item.message.includes('[POSITION-GUARD] Slot')) {
+          if (seenPositionGuard) return false;
+          seenPositionGuard = true;
+        }
+        return true;
+      })
+      .slice(0, 100)
+      .map((item) => {
       let tag: 'KRONOS' | 'MULTI-AI' | 'EA-ORDER' | 'ACCOUNT' = 'EA-ORDER';
       const msgUpper = item.message.toUpperCase();
       if (
@@ -810,12 +993,14 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
               </span>
               <span
                 className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border shrink-0 ${
-                  isAutoTrading
+                  isSlotsFull
+                    ? 'bg-amber-50 dark:bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-200/80 dark:border-amber-500/30'
+                    : isAutoTrading
                     ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200/80 dark:border-emerald-500/30'
                     : 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
                 }`}
               >
-                {isAutoTrading ? 'ACTIVE' : 'IDLE'}
+                {entryScannerState}
               </span>
             </div>
             <div className="my-1.5 space-y-1 font-mono text-[11px]">
@@ -823,6 +1008,18 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
                 <span className="text-slate-500 dark:text-zinc-400">Kronos Horizon:</span>
                 <span className="font-bold text-emerald-700 dark:text-emerald-400">
                   {aiMetrics.bullishPct}% Bull / {aiMetrics.bearishPct}% Bear
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-slate-500 dark:text-zinc-400">Proj. Move:</span>
+                <span
+                  className={`font-bold ${
+                    aiMetrics.expectedMovePct >= 0
+                      ? 'text-emerald-700 dark:text-emerald-400'
+                      : 'text-rose-600 dark:text-rose-400'
+                  }`}
+                >
+                  {aiMetrics.projMoveFormatted}
                 </span>
               </div>
               <div className="flex items-center justify-between">
@@ -1124,15 +1321,28 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
                   <span className="flex items-center gap-1.5">
                     <span
                       className={`w-2 h-2 rounded-full ${
-                        isAutoTrading ? 'bg-[#10B981] animate-pulse' : 'bg-slate-300 dark:bg-zinc-600'
+                        isSlotsFull
+                          ? 'bg-amber-500 animate-pulse'
+                          : isAutoTrading
+                          ? 'bg-[#10B981] animate-pulse'
+                          : 'bg-slate-300 dark:bg-zinc-600'
                       }`}
                     />
                     <span>
-                      {isAutoTrading ? 'Autonomous Loop Active' : 'Autonomous Loop Standby'}
+                      {isSlotsFull
+                        ? 'IDLE (2/2 FULL — GUARDING POSITIONS)'
+                        : isAutoTrading
+                        ? 'Autonomous Loop Active'
+                        : 'Autonomous Loop Standby'}
                     </span>
                   </span>
                   <span>Cycle: 3.0s</span>
                 </div>
+                {isSlotsFull && (
+                  <div className="px-2.5 py-1.5 rounded-xl bg-amber-50 dark:bg-amber-500/15 border border-amber-200/90 dark:border-amber-500/30 text-amber-800 dark:text-amber-300 font-mono text-[10px] font-bold tracking-tight text-center shadow-2xs">
+                    STATUS: ENTRY IDLE (2/2 FULL) • MODE: FORWARD FORECAST &amp; TRAILING GUARD
+                  </div>
+                )}
               </div>
 
               {/* Manual EA Quick Execution */}
@@ -1224,14 +1434,14 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
                   </div>
                 </div>
 
-                {/* 3-Stage Trailing Stop Toggle */}
+                {/* Hybrid Style 2 Trailing Stop Toggle */}
                 <div className="flex items-center justify-between pt-1">
                   <div>
                     <div className="text-xs font-semibold text-[#0F172A] dark:text-slate-100">
-                      3-Stage Trailing Stop
+                      Hybrid Trailing Stop (Style 2)
                     </div>
                     <div className="text-[11px] text-slate-500 dark:text-zinc-400">
-                      50% Banked + Breakeven + ATR Lock
+                      Phase A Elastic Cushion + Phase B Ratchet
                     </div>
                   </div>
                   <button
@@ -1318,7 +1528,7 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
                   <div className="p-2 rounded-lg bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800">
                     <div className="text-slate-400 dark:text-zinc-500">VAH / VAL</div>
                     <div className="font-bold text-[#0F172A] dark:text-slate-100 truncate">
-                      {formatPrice(aiMetrics.vahPrice, activeProfile.digits)}
+                      {formatPrice(aiMetrics.vahPrice, activeProfile.digits)} / {formatPrice(aiMetrics.valPrice, activeProfile.digits)}
                     </div>
                   </div>
                   <div className="p-2 rounded-lg bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800">
@@ -1329,11 +1539,47 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
                   </div>
                 </div>
 
+                {/* Quantitative Expected Market Move (% / $) Estimator */}
+                <div className="px-3 py-2 rounded-xl bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 flex items-center justify-between font-mono text-[11px]">
+                  <span className="text-slate-500 dark:text-zinc-400 font-semibold">
+                    Proj. Move:
+                  </span>
+                  <span
+                    className={`font-bold ${
+                      aiMetrics.expectedMovePct >= 0
+                        ? 'text-emerald-700 dark:text-emerald-400'
+                        : 'text-rose-600 dark:text-rose-400'
+                    }`}
+                  >
+                    {aiMetrics.projMoveFormatted}
+                  </span>
+                </div>
+
                 {/* Multi-AI Consensus / Risk Governance Summary */}
-                <div className="p-3 rounded-xl bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 space-y-1">
-                  <div className="font-mono text-[10px] uppercase tracking-wider text-slate-400 dark:text-zinc-500 font-semibold">
-                    Multi-AI Consensus / Risk Governance
+                <div className="p-3 rounded-xl bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 space-y-1.5">
+                  <div className="flex flex-wrap items-center justify-between gap-1">
+                    <div className="font-mono text-[10px] uppercase tracking-wider text-slate-400 dark:text-zinc-500 font-semibold">
+                      Multi-AI Consensus / Risk Governance
+                    </div>
+                    {isSlotsFull && (
+                      <span
+                        className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold border ${
+                          aiMetrics.reversalRisk === 'HIGH REVERSAL RISK'
+                            ? 'bg-rose-50 dark:bg-rose-500/15 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-500/30'
+                            : aiMetrics.reversalRisk === 'MODERATE'
+                            ? 'bg-amber-50 dark:bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/30'
+                            : 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/30'
+                        }`}
+                      >
+                        {aiMetrics.reversalRisk}
+                      </span>
+                    )}
                   </div>
+                  {isSlotsFull && (
+                    <div className="px-2 py-1 rounded-lg bg-amber-50/90 dark:bg-amber-500/15 border border-amber-200/80 dark:border-amber-500/30 text-amber-800 dark:text-amber-300 font-mono text-[10px] font-bold tracking-tight">
+                      STATUS: ENTRY IDLE (2/2 FULL) • MODE: FORWARD FORECAST &amp; TRAILING GUARD
+                    </div>
+                  )}
                   <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed font-mono">
                     {aiMetrics.multiAiSummary}
                   </p>

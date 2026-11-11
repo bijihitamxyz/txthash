@@ -316,6 +316,13 @@ export async function POST(req: NextRequest) {
           pairProfile: profile,
           enablePartialClose,
           stopLossPips,
+          expectedMovePct: indicators.expectedMovePct,
+          expectedTargetPrice: indicators.expectedTargetPrice,
+          expectedMoveUsd: indicators.expectedMoveUsd,
+          pocPrice: indicators.pocPrice,
+          vahPrice: indicators.vahPrice,
+          valPrice: indicators.valPrice,
+          zScore: indicators.c0.zScore,
         });
 
         // Hard SL Circuit Breaker handling

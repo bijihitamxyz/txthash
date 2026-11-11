@@ -1270,3 +1270,138 @@ export async function evaluateWithAi(
     kronosContext
   );
 }
+
+export interface ForwardOutlookInput {
+  symbol: string;
+  currentPrice: number;
+  pocPrice: number;
+  vahPrice: number;
+  valPrice: number;
+  zScore: number;
+  rsi: number;
+  momentum5?: number;
+  bbwExpansionPct?: number;
+  bullishPct?: number;
+  expectedMovePct: number;
+  expectedMoveUsd: number;
+  expectedTargetPrice: number;
+  digits?: number;
+  maxOpenPositions?: number;
+  openPositions?: Array<{
+    id?: string;
+    symbol?: string;
+    side: 'BUY' | 'SELL';
+    entryPrice: number;
+    currentPrice?: number;
+    currentSl?: number;
+  }>;
+}
+
+export interface ForwardOutlookResult {
+  longPct: number;
+  shortPct: number;
+  nextBias: 'LONG' | 'SHORT';
+  opposingBias: 'LONG' | 'SHORT';
+  dominantPct: number;
+  minorPct: number;
+  expectedMovePct: number;
+  expectedMoveUsd: number;
+  expectedTargetPrice: number;
+  reversalRisk: 'LOW' | 'MODERATE' | 'HIGH REVERSAL RISK';
+  shouldTightenOrFreezeSl: boolean;
+  opposingRegimePctForTrailing: number;
+  actionOnOpenTrades: string;
+  advisoryText: string;
+}
+
+/**
+ * Forward Market Forecast (forwardOutlook) for Active Position Guardian Mode:
+ * Continuously computes next-wave directional probability (LONG % vs SHORT %),
+ * expected target price (Proj. Move), reversal risk (LOW / MODERATE / HIGH REVERSAL RISK),
+ * and Style 2 Trailing Stop tightening/freezing signals when slots are full (2/2) or positions are open.
+ */
+export function computeForwardMarketOutlook(input: ForwardOutlookInput): ForwardOutlookResult {
+  const digits = typeof input.digits === 'number' ? input.digits : 2;
+  let baseBullish = typeof input.bullishPct === 'number' ? input.bullishPct : 50;
+
+  if (typeof input.bullishPct !== 'number') {
+    const rsiComponent = (input.rsi - 50) * 0.55;
+    const pocGravity =
+      input.currentPrice > 0 && input.pocPrice > 0
+        ? ((input.pocPrice - input.currentPrice) / input.currentPrice) * 4000
+        : 0;
+    const zReversion = -(input.zScore || 0) * 4.5;
+    const momComponent = (input.momentum5 || 0) * 8;
+    baseBullish = 50 + rsiComponent + Math.max(-18, Math.min(18, pocGravity + zReversion + momComponent));
+  }
+
+  const longPct = Math.max(12, Math.min(88, Math.round(baseBullish)));
+  const shortPct = 100 - longPct;
+
+  const nextBias: 'LONG' | 'SHORT' = shortPct >= longPct ? 'SHORT' : 'LONG';
+  const opposingBias: 'LONG' | 'SHORT' = nextBias === 'SHORT' ? 'LONG' : 'SHORT';
+  const dominantPct = nextBias === 'SHORT' ? shortPct : longPct;
+  const minorPct = 100 - dominantPct;
+
+  const openList = Array.isArray(input.openPositions) ? input.openPositions : [];
+  const symbolPositions = openList.filter((p) => !p.symbol || p.symbol === input.symbol);
+  const trackedPositions = symbolPositions.length > 0 ? symbolPositions : openList;
+
+  const hasLongPosition = trackedPositions.some((p) => p.side === 'BUY');
+  const hasShortPosition = trackedPositions.some((p) => p.side === 'SELL');
+
+  // Strong opposing shift check:
+  // BUY position held while Forward Forecast shifts strongly to SHORT (Bearish >= 68% and negative Proj. Move)
+  // or SELL position held while Forward Forecast shifts strongly to LONG (Bullish >= 68% and positive Proj. Move)
+  const strongShortAgainstBuy = hasLongPosition && shortPct >= 68 && input.expectedMovePct < 0;
+  const strongLongAgainstSell = hasShortPosition && longPct >= 68 && input.expectedMovePct > 0;
+  const shouldTightenOrFreezeSl = strongShortAgainstBuy || strongLongAgainstSell;
+
+  const moderateAgainstBuy = hasLongPosition && (shortPct >= 56 || input.expectedMovePct <= -0.04);
+  const moderateAgainstSell = hasShortPosition && (longPct >= 56 || input.expectedMovePct >= 0.04);
+
+  let reversalRisk: 'LOW' | 'MODERATE' | 'HIGH REVERSAL RISK' = 'LOW';
+  if (shouldTightenOrFreezeSl || (trackedPositions.length > 0 && Math.abs(input.zScore || 0) >= 1.85)) {
+    reversalRisk = 'HIGH REVERSAL RISK';
+  } else if (moderateAgainstBuy || moderateAgainstSell || Math.abs(input.zScore || 0) >= 1.35) {
+    reversalRisk = 'MODERATE';
+  }
+
+  // Feed directly into Style 2 Trailing Stop (evaluatePositionTrailing triggers freeze/tight lock when opposingRegimePct > 75)
+  const opposingRegimePctForTrailing = shouldTightenOrFreezeSl
+    ? Math.max(dominantPct, 82)
+    : hasLongPosition
+    ? shortPct
+    : hasShortPosition
+    ? longPct
+    : dominantPct;
+
+  const targetPriceNum = Number.isFinite(input.expectedTargetPrice) && input.expectedTargetPrice > 0
+    ? input.expectedTargetPrice
+    : input.currentPrice;
+  const targetStr = Number(targetPriceNum || 0).toFixed(digits);
+  const movePctNum = Number.isFinite(input.expectedMovePct) ? input.expectedMovePct : 0;
+  const pctSign = movePctNum >= 0 ? '+' : '';
+  const pctStr = `${pctSign}${movePctNum.toFixed(2)}%`;
+
+  const actionOnOpenTrades = 'HOLD / TRAIL SL ACTIVE';
+  const advisoryText = `[FORWARD FORECAST • 2/2 GUARD MODE] Next Bias: ${nextBias} (${dominantPct}%) vs ${opposingBias} (${minorPct}%) | Target: ${targetStr} (${pctStr}) | Action on Open Trades: ${actionOnOpenTrades}`;
+
+  return {
+    longPct,
+    shortPct,
+    nextBias,
+    opposingBias,
+    dominantPct,
+    minorPct,
+    expectedMovePct: movePctNum,
+    expectedMoveUsd: input.expectedMoveUsd || 0,
+    expectedTargetPrice: targetPriceNum,
+    reversalRisk,
+    shouldTightenOrFreezeSl,
+    opposingRegimePctForTrailing,
+    actionOnOpenTrades,
+    advisoryText,
+  };
+}
+
