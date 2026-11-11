@@ -568,19 +568,28 @@ export const TradingChart: React.FC = () => {
     }
 
     // Include open positions Entry / SL / TP in price range strictly for the active symbol
+    // Chart Y-Axis Guard: Never include an SL or TP line in Y-axis scaling if its distance from currentPrice is > $15.00 (150 pips)
+    const refChartPrice = (currentQuote && currentQuote.symbol === activeSymbol && currentQuote.bid > 0)
+      ? currentQuote.bid
+      : (visibleCandles.length > 0 ? visibleCandles[visibleCandles.length - 1].close : 0);
+    const maxSlTpDist = isGold ? 15.0 : 150 * profile.pipValue;
     const activePositions = (positions || []).filter(
       (p) => p && p.symbol === activeSymbol && p.id !== 'F-637' && p.id !== '#F-637'
     );
     for (const pos of activePositions) {
-      if (pos.entryPrice > maxPrice) maxPrice = pos.entryPrice;
-      if (pos.entryPrice < minPrice) minPrice = pos.entryPrice;
-      if (pos.currentSl > 0) {
-        if (pos.currentSl > maxPrice) maxPrice = pos.currentSl;
-        if (pos.currentSl < minPrice) minPrice = pos.currentSl;
+      if (pos.entryPrice > 0 && (refChartPrice <= 0 || Math.abs(pos.entryPrice - refChartPrice) <= maxSlTpDist)) {
+        if (pos.entryPrice > maxPrice) maxPrice = pos.entryPrice;
+        if (pos.entryPrice < minPrice) minPrice = pos.entryPrice;
       }
-      if (pos.currentTp > 0) {
-        if (pos.currentTp > maxPrice) maxPrice = pos.currentTp;
-        if (pos.currentTp < minPrice) minPrice = pos.currentTp;
+      const effectiveSl = pos.currentSl || pos.virtualSl || 0;
+      if (effectiveSl > 0 && (refChartPrice <= 0 || Math.abs(effectiveSl - refChartPrice) <= maxSlTpDist)) {
+        if (effectiveSl > maxPrice) maxPrice = effectiveSl;
+        if (effectiveSl < minPrice) minPrice = effectiveSl;
+      }
+      const effectiveTp = pos.currentTp || pos.virtualTp || 0;
+      if (effectiveTp > 0 && (refChartPrice <= 0 || Math.abs(effectiveTp - refChartPrice) <= maxSlTpDist)) {
+        if (effectiveTp > maxPrice) maxPrice = effectiveTp;
+        if (effectiveTp < minPrice) minPrice = effectiveTp;
       }
     }
 
@@ -778,45 +787,56 @@ export const TradingChart: React.FC = () => {
       ctx.fillRect(xLeft, bodyTop, candleBodyWidth, bodyHeight);
     }
 
-    // 5. Active Position Lines (Entry, SL, TP)
+    // 5. Active Position Lines (Entry, SL, TP) — Guarded by $15.00 (150 pips) distance from currentPrice
     for (const pos of activePositions) {
+      const posRefPrice = refChartPrice > 0 ? refChartPrice : (pos.currentPrice || pos.entryPrice);
       // Entry Line
-      const yEntry = priceToY(pos.entryPrice);
-      ctx.strokeStyle = isDark ? '#38bdf8' : '#0284c7';
-      ctx.lineWidth = 1;
-      ctx.setLineDash([4, 2]);
-      ctx.beginPath();
-      ctx.moveTo(0, yEntry);
-      ctx.lineTo(mainChartWidth, yEntry);
-      ctx.stroke();
-      ctx.fillStyle = isDark ? '#38bdf8' : '#0284c7';
-      ctx.font = '10px ui-monospace, monospace';
-      ctx.fillText(`Entry #${pos.id.slice(-4)} (${pos.side} @ ${formatPrice(pos.entryPrice, profile.digits)})`, 8, yEntry - 3);
+      if (pos.entryPrice > 0 && (posRefPrice <= 0 || Math.abs(pos.entryPrice - posRefPrice) <= maxSlTpDist)) {
+        const yEntry = priceToY(pos.entryPrice);
+        ctx.strokeStyle = isDark ? '#38bdf8' : '#0284c7';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 2]);
+        ctx.beginPath();
+        ctx.moveTo(0, yEntry);
+        ctx.lineTo(mainChartWidth, yEntry);
+        ctx.stroke();
+        ctx.fillStyle = isDark ? '#38bdf8' : '#0284c7';
+        ctx.font = '10px ui-monospace, monospace';
+        ctx.fillText(`Entry #${pos.id.slice(-4)} (${pos.side} @ ${formatPrice(pos.entryPrice, profile.digits)})`, 8, yEntry - 3);
+      }
 
-      // Stop Loss Line
-      if (pos.currentSl > 0) {
-        const ySl = priceToY(pos.currentSl);
+      // Stop Loss Line (Never plot if distance from currentPrice > $15.00 / 150 pips)
+      const effectiveSl = pos.currentSl || pos.virtualSl || 0;
+      if (effectiveSl > 0 && (posRefPrice <= 0 || Math.abs(effectiveSl - posRefPrice) <= maxSlTpDist)) {
+        const ySl = priceToY(effectiveSl);
         ctx.strokeStyle = '#ef4444';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 2]);
         ctx.beginPath();
         ctx.moveTo(0, ySl);
         ctx.lineTo(mainChartWidth, ySl);
         ctx.stroke();
         ctx.fillStyle = '#ef4444';
-        const slText = `SL: ${formatPrice(pos.currentSl, profile.digits)}`;
+        ctx.font = '10px ui-monospace, monospace';
+        const slText = `SL: ${formatPrice(effectiveSl, profile.digits)}`;
         const slW = ctx.measureText(slText).width;
         ctx.fillText(slText, Math.max(10, mainChartWidth - slW - 8), ySl - 3);
       }
 
-      // Take Profit Line
-      if (pos.currentTp > 0) {
-        const yTp = priceToY(pos.currentTp);
+      // Take Profit Line (Never plot if distance from currentPrice > $15.00 / 150 pips)
+      const effectiveTp = pos.currentTp || pos.virtualTp || 0;
+      if (effectiveTp > 0 && (posRefPrice <= 0 || Math.abs(effectiveTp - posRefPrice) <= maxSlTpDist)) {
+        const yTp = priceToY(effectiveTp);
         ctx.strokeStyle = '#10b981';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 2]);
         ctx.beginPath();
         ctx.moveTo(0, yTp);
         ctx.lineTo(mainChartWidth, yTp);
         ctx.stroke();
         ctx.fillStyle = '#10b981';
-        const tpText = `TP: ${formatPrice(pos.currentTp, profile.digits)}`;
+        ctx.font = '10px ui-monospace, monospace';
+        const tpText = `TP: ${formatPrice(effectiveTp, profile.digits)}`;
         const tpW = ctx.measureText(tpText).width;
         ctx.fillText(tpText, Math.max(10, mainChartWidth - tpW - 8), yTp - 3);
       }

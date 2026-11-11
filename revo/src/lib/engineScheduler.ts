@@ -27,7 +27,13 @@ import {
   formatAutoGovernanceTelemetry,
 } from '@/core/centralAiConfig';
 import { computeRealTimeKronosForecast } from '@/core/kronosService';
-import { evaluatePositionTrailing, evaluateCryptoPositionTrailing, ManagedPosition } from '@/core/trailingManager';
+import {
+  evaluatePositionTrailing,
+  evaluateCryptoPositionTrailing,
+  ManagedPosition,
+  sanitizePositionSlTp,
+  canAttemptPositionClose,
+} from '@/core/trailingManager';
 import {
   evaluatePreTradeRisk,
   idempotencyLocks,
@@ -309,6 +315,8 @@ class EngineScheduler {
         stateSync.addTelemetry(symbol, category, message);
       };
 
+      const initialPositionCount = updatedPositions.length;
+
       // 1. Process Trailing Stops & Partial Closes for all active positions
       for (const pos of updatedPositions) {
         const profile = getPairProfile(pos.symbol);
@@ -326,6 +334,7 @@ class EngineScheduler {
           }
         }
         pos.currentPrice = curPrice;
+        sanitizePositionSlTp(pos, curPrice, state.stopLossPips ?? 25, state.takeProfitPips ?? 50);
 
         const candles = await client.getCandles(pos.symbol, 'M5', 100);
 
@@ -418,16 +427,24 @@ class EngineScheduler {
 
           // Hard SL Circuit Breaker handling
           if (trailingAction.type === 'HARD_SL_CLOSE') {
+            if (!canAttemptPositionClose(pos.id)) {
+              pos.isClosing = true;
+              continue;
+            }
             log(pos.symbol, 'RISK', trailingAction.reason);
             dualRoomProtections.recordStopLossHit(
               pos.symbol,
               'forex',
               trailingAction.reason.includes('TIME_DECAY') ? 'TIME_DECAY' : 'HARD_SL_CLOSE'
             );
-            await client.closePosition(pos.id, undefined, pos.symbol);
-            const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
-            if (posIdx !== -1) {
-              updatedPositions.splice(posIdx, 1);
+            pos.isClosing = true;
+            pos.closingStartedAt = Date.now();
+            const closeRes = await client.closePosition(pos.id, undefined, pos.symbol);
+            if (closeRes.success) {
+              const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
+              if (posIdx !== -1) {
+                updatedPositions.splice(posIdx, 1);
+              }
             }
             continue;
           }
@@ -449,6 +466,7 @@ class EngineScheduler {
               const modRes = await client.modifyPosition(pos.id, trailingAction.newSlPrice, undefined, pos.symbol);
               if (modRes) {
                 pos.currentSl = trailingAction.newSlPrice;
+                pos.virtualSl = trailingAction.newSlPrice;
                 pos.trailingStatus = trailingAction.statusUpdate;
               }
             }
@@ -471,7 +489,8 @@ class EngineScheduler {
       }
 
       const maxOpenPositions = riskConfig.maxOpenPositions || 2;
-      const isFullCapacity = updatedPositions.length >= maxOpenPositions;
+      const effectivePositionCount = Math.max(initialPositionCount, updatedPositions.length);
+      const isFullCapacity = effectivePositionCount >= maxOpenPositions;
       if (isFullCapacity) {
         this.entryScannerState = 'IDLE (2/2 FULL — GUARDING POSITIONS)';
         if (!this.hasLoggedFullCapacityGuard) {

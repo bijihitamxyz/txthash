@@ -1,4 +1,7 @@
-'use client';
+"use client";
+const stopLossPips = 25;
+const takeProfitPips = 50;
+
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import dynamic from 'next/dynamic';
@@ -7,6 +10,7 @@ import { getActiveExnessCredentials } from '@/lib/cryptoVault';
 import { useRoomStore } from '@/store/useRoomStore';
 import { PnlCalendarModal } from '@/components/PnlCalendarModal';
 import { getPairProfile, formatPrice, evaluatePositionPnL } from '@/core/pairConfig';
+import { sanitizePositionSlTp } from '@/core/trailingManager';
 import { computeIndicatorSnapshot, computeExpectedMarketMove, Timeframe } from '@/core/indicatorEngine';
 import { computeVolumeProfileMetrics } from '@/core/kronosService';
 import { computeForwardMarketOutlook } from '@/core/aiJudge';
@@ -303,7 +307,7 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
     };
   }, []);
 
-  // Live Active Forex Positions
+  // Live Active Forex Positions — sanitized & enriched with virtualSl/virtualTp
   const activePositions = useMemo(() => {
     const raw =
       Array.isArray(openPositions) && openPositions.length > 0
@@ -311,8 +315,22 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
         : Array.isArray(positions)
         ? positions
         : [];
-    return raw.filter((p) => p && p.id !== 'F-637' && p.id !== '#F-637');
-  }, [openPositions, positions]);
+    return raw
+      .filter((p) => p && p.id !== 'F-637' && p.id !== '#F-637')
+      .map((p) => {
+        const cloned = { ...p };
+        const q = quotes[cloned.symbol];
+        const liveRef =
+          q && isValidPriceUpdate(cloned.symbol, q.bid)
+            ? cloned.side === 'BUY'
+              ? q.bid
+              : q.ask
+            : cloned.currentPrice && isValidPriceUpdate(cloned.symbol, cloned.currentPrice)
+            ? cloned.currentPrice
+            : cloned.entryPrice;
+        return sanitizePositionSlTp(cloned, liveRef, stopLossPips || 25, takeProfitPips || 50);
+      });
+  }, [openPositions, positions, quotes, stopLossPips, takeProfitPips]);
 
   const isSlotsFull = activePositions.length >= MAX_OPEN_POSITIONS;
   const entryScannerState = isSlotsFull
@@ -561,8 +579,16 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
 
       const prof = getPairProfile(pos.symbol);
       const q = quotes[pos.symbol];
-      const curPrice = q ? (isBuy ? q.bid : q.ask) : pos.currentPrice || pos.entryPrice;
-      if (!curPrice || curPrice <= 0) return;
+      const curPrice =
+        q && isValidPriceUpdate(pos.symbol, q.bid)
+          ? isBuy
+            ? q.bid
+            : q.ask
+          : pos.currentPrice && isValidPriceUpdate(pos.symbol, pos.currentPrice)
+          ? pos.currentPrice
+          : pos.entryPrice;
+      const maxSanityDist = pos.symbol.startsWith('XAU') ? 15.0 : 150 * prof.pipValue;
+      if (!curPrice || curPrice <= 0 || Math.abs(curPrice - pos.entryPrice) > maxSanityDist) return;
 
       const profitDist = isBuy ? curPrice - pos.entryPrice : pos.entryPrice - curPrice;
       const profitPips = profitDist / (prof.pipValue || 0.01);
@@ -1232,17 +1258,30 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
                                   {formatPrice(pnlData.curPrice, prof.digits)}
                                 </strong>
                               </div>
-                              {(pos.currentSl > 0 || pos.currentTp > 0) && (
-                                <div className="text-[10px] text-slate-400 dark:text-zinc-500 mt-0.5 whitespace-nowrap">
-                                  <span className="text-rose-500/90 dark:text-rose-400/90">
-                                    SL: {pos.currentSl > 0 ? formatPrice(pos.currentSl, prof.digits) : '—'}
-                                  </span>
-                                  {' • '}
-                                  <span className="text-emerald-600/90 dark:text-emerald-400/90">
-                                    TP: {pos.currentTp > 0 ? formatPrice(pos.currentTp, prof.digits) : '—'}
-                                  </span>
-                                </div>
-                              )}
+                              {(() => {
+                                const effectiveSl = pos.currentSl || pos.virtualSl || (pos.side === 'BUY'
+                                  ? Number((pos.entryPrice - (stopLossPips || 25) * prof.pipValue).toFixed(prof.digits))
+                                  : Number((pos.entryPrice + (stopLossPips || 25) * prof.pipValue).toFixed(prof.digits)));
+                                const effectiveTp = pos.currentTp || pos.virtualTp || (pos.side === 'BUY'
+                                  ? Number((pos.entryPrice + (takeProfitPips || 50) * prof.pipValue).toFixed(prof.digits))
+                                  : Number((pos.entryPrice - (takeProfitPips || 50) * prof.pipValue).toFixed(prof.digits)));
+                                const effectiveTrail = effectiveSl;
+                                return (
+                                  <div className="text-[10px] text-slate-400 dark:text-zinc-500 mt-0.5 whitespace-nowrap">
+                                    <span className="text-rose-500/90 dark:text-rose-400/90">
+                                      SL: {formatPrice(effectiveSl, prof.digits)}
+                                    </span>
+                                    {' • '}
+                                    <span className="text-emerald-600/90 dark:text-emerald-400/90">
+                                      TP: {formatPrice(effectiveTp, prof.digits)}
+                                    </span>
+                                    {' • '}
+                                    <span className="text-amber-600/90 dark:text-amber-400/90">
+                                      Trail: {formatPrice(effectiveTrail, prof.digits)}
+                                    </span>
+                                  </div>
+                                );
+                              })()}
                             </td>
                             <td className="px-3 sm:px-4 py-2.5 whitespace-nowrap">
                               <div
@@ -1263,10 +1302,10 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
                               <button
                                 type="button"
                                 onClick={() => handleClosePosition(pos.id)}
-                                disabled={closingIds[pos.id]}
+                                disabled={Boolean(closingIds[pos.id] || pos.isClosing)}
                                 className="bg-rose-50 dark:bg-rose-500/15 border border-rose-200 dark:border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-100 rounded-lg px-2.5 py-1 text-[11px] font-semibold transition-all cursor-pointer disabled:opacity-50"
                               >
-                                {closingIds[pos.id] ? 'Closing...' : 'Close'}
+                                {closingIds[pos.id] || pos.isClosing ? 'Closing...' : 'Close'}
                               </button>
                             </td>
                           </tr>

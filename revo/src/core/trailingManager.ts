@@ -46,6 +46,8 @@ export interface ManagedPosition {
   currentPrice?: number;
   currentSl: number;
   currentTp: number;
+  virtualSl?: number;
+  virtualTp?: number;
   highestPrice: number;
   lowestPrice: number;
   openTime: number;
@@ -56,6 +58,9 @@ export interface ManagedPosition {
   // Style 2 Hybrid Trailing Stop state locks
   elasticFloorLocked?: boolean;
   strictRatchetLocked?: boolean;
+  // Closing lock & cooldown state (prevents 2 Open <-> 3 Open flicker & zombie close loops)
+  isClosing?: boolean;
+  closingStartedAt?: number;
   // Floating metrics refreshed every tick (UI: ACTIVE OPEN POSITIONS)
   pnl?: number;
   pips?: number;
@@ -63,6 +68,187 @@ export interface ManagedPosition {
   accountId?: string;
   source?: 'EXNESS' | 'LOCAL_LEDGER';
   seenOnBroker?: boolean;
+}
+
+// =========================================================================
+// IN-FLIGHT CLOSE LOCK & 15-SECOND COOLDOWN PER TICKET ID
+// Prevents zombie [STOP LOSS / TRAILING STOP HIT] loops every 3 seconds
+// =========================================================================
+const CLOSE_COOLDOWN_MS = 15_000;
+
+declare global {
+  // eslint-disable-next-line no-var
+  var __inFlightClosingIds: Set<string> | undefined;
+  // eslint-disable-next-line no-var
+  var __closingCooldownMap: Map<string, number> | undefined;
+}
+
+export const inFlightClosingIds: Set<string> =
+  globalThis.__inFlightClosingIds || (globalThis.__inFlightClosingIds = new Set<string>());
+
+export const closingCooldownMap: Map<string, number> =
+  globalThis.__closingCooldownMap || (globalThis.__closingCooldownMap = new Map<string, number>());
+
+function normTicketId(id: string): string {
+  return String(id || '').replace(/^#+/, '').trim();
+}
+
+/**
+ * Returns true ONLY if the ticket is not currently in-flight for closing
+ * AND has not triggered a close attempt within the last 15 seconds.
+ */
+export function canAttemptPositionClose(positionId: string, cooldownMs: number = CLOSE_COOLDOWN_MS): boolean {
+  const cleanId = normTicketId(positionId);
+  if (!cleanId) return false;
+  const now = Date.now();
+  const lastAttempt = closingCooldownMap.get(cleanId) || 0;
+  if (inFlightClosingIds.has(cleanId)) {
+    // Release stale in-flight lock if older than cooldownMs
+    if (now - lastAttempt < cooldownMs) {
+      return false;
+    }
+    inFlightClosingIds.delete(cleanId);
+  }
+  if (now - lastAttempt < cooldownMs) {
+    return false;
+  }
+  return true;
+}
+
+export function markPositionClosingStart(positionId: string): void {
+  const cleanId = normTicketId(positionId);
+  if (!cleanId) return;
+  inFlightClosingIds.add(cleanId);
+  closingCooldownMap.set(cleanId, Date.now());
+}
+
+export function markPositionClosingDone(positionId: string, closedSuccess: boolean = false): void {
+  const cleanId = normTicketId(positionId);
+  if (!cleanId) return;
+  inFlightClosingIds.delete(cleanId);
+  if (!closedSuccess) {
+    // Keep the 15s cooldown active from the attempt timestamp so it won't spam every 3s
+    if (!closingCooldownMap.has(cleanId)) {
+      closingCooldownMap.set(cleanId, Date.now());
+    }
+  }
+}
+
+/**
+ * Sanitizes & validates Stop Loss / Take Profit direction and auto-assigns
+ * Virtual SL, Virtual TP, and initial Hybrid Trailing SL for positions opened
+ * without broker SL/TP (e.g. via Retry 1 Strip Inline SL/TP).
+ *
+ * - Rule for BUY (LONG):
+ *   sl MUST strictly be < entryPrice (unless profit has already exceeded entry AND currentPrice is STILL above sl).
+ *   If sl >= entryPrice while currentPrice <= entryPrice (like BUY @ 4050.06 with bogus SL: 4108.30),
+ *   or if sl >= currentPrice while sl >= entryPrice, immediately recalculate to entryPrice - (slPips * pipVal).
+ * - Rule for SELL (SHORT):
+ *   sl MUST strictly be > entryPrice when at or above entry (in loss).
+ *   If sl <= entryPrice while in loss, or if sl <= currentPrice while sl <= entryPrice,
+ *   immediately recalculate to entryPrice + (slPips * pipVal).
+ */
+export function sanitizePositionSlTp(
+  pos: ManagedPosition,
+  livePrice?: number,
+  slPips: number = 25,
+  tpPips: number = 50
+): ManagedPosition {
+  if (!pos || !(pos.entryPrice > 0)) return pos;
+  const profile = getPairProfile(pos.symbol || 'XAUUSDm');
+  const isGold = profile.symbol === 'XAUUSDm' || profile.symbol.startsWith('XAU');
+  const pipVal = isGold ? 0.10 : profile.pipValue;
+  const digits = profile.digits;
+  const isBuy = pos.side === 'BUY';
+
+  const effectiveSlPips = slPips > 0 ? slPips : 25;
+  const effectiveTpPips = tpPips > 0 ? tpPips : 50;
+
+  const defaultVirtualSl = isBuy
+    ? Number((pos.entryPrice - effectiveSlPips * pipVal).toFixed(digits))
+    : Number((pos.entryPrice + effectiveSlPips * pipVal).toFixed(digits));
+
+  const defaultVirtualTp = isBuy
+    ? Number((pos.entryPrice + effectiveTpPips * pipVal).toFixed(digits))
+    : Number((pos.entryPrice - effectiveTpPips * pipVal).toFixed(digits));
+
+  const curPx =
+    typeof livePrice === 'number' && livePrice > 0 && !isNaN(livePrice)
+      ? livePrice
+      : typeof pos.currentPrice === 'number' && pos.currentPrice > 0 && !isNaN(pos.currentPrice)
+      ? pos.currentPrice
+      : pos.entryPrice;
+
+  // Sanitize highestPrice / lowestPrice against stale baseline pollution (e.g. 4110.30 when entry is 4050.06)
+  const maxExcursionGuard = isGold ? 15.0 : 150 * pipVal;
+  const maxValidHigh = Math.max(pos.entryPrice, curPx) + maxExcursionGuard;
+  const minValidLow = Math.min(pos.entryPrice, curPx) - maxExcursionGuard;
+
+  if (!pos.highestPrice || pos.highestPrice <= 0 || pos.highestPrice > maxValidHigh || pos.highestPrice < pos.entryPrice) {
+    pos.highestPrice = Math.max(pos.entryPrice, curPx);
+    if (isBuy && curPx <= pos.entryPrice + 25 * pipVal) {
+      pos.strictRatchetLocked = false;
+    }
+  }
+  if (!pos.lowestPrice || pos.lowestPrice <= 0 || pos.lowestPrice < minValidLow || pos.lowestPrice > pos.entryPrice) {
+    pos.lowestPrice = Math.min(pos.entryPrice, curPx);
+    if (!isBuy && curPx >= pos.entryPrice - 25 * pipVal) {
+      pos.strictRatchetLocked = false;
+    }
+  }
+
+  // Validate existing SL
+  let rawSl = Number(pos.currentSl || pos.virtualSl || 0);
+  if (!isFinite(rawSl) || rawSl <= 0) {
+    rawSl = defaultVirtualSl;
+  } else if (isBuy) {
+    // Rule for BUY (LONG):
+    // sl MUST strictly be < entryPrice unless profit has already exceeded entry AND currentPrice is STILL above sl.
+    // Also reject any SL that is > $15.00 (150 pips) away from both entryPrice and curPx.
+    const inLossOrAtEntry = curPx <= pos.entryPrice;
+    const isAboveEntryWhileInLoss = rawSl >= pos.entryPrice && inLossOrAtEntry;
+    const isAboveCurrentInProfit = rawSl >= pos.entryPrice && curPx <= rawSl;
+    const isBogusFarSl = Math.abs(rawSl - pos.entryPrice) > maxExcursionGuard && Math.abs(rawSl - curPx) > maxExcursionGuard;
+    if (isAboveEntryWhileInLoss || isAboveCurrentInProfit || isBogusFarSl) {
+      rawSl = defaultVirtualSl;
+      pos.trailingStatus = 'INITIAL';
+      pos.strictRatchetLocked = false;
+    }
+  } else {
+    // Rule for SELL (SHORT):
+    // sl MUST strictly be > entryPrice when at or above entry (in loss).
+    const inLossOrAtEntry = curPx >= pos.entryPrice;
+    const isBelowEntryWhileInLoss = rawSl <= pos.entryPrice && inLossOrAtEntry;
+    const isBelowCurrentInProfit = rawSl <= pos.entryPrice && curPx >= rawSl;
+    const isBogusFarSl = Math.abs(rawSl - pos.entryPrice) > maxExcursionGuard && Math.abs(rawSl - curPx) > maxExcursionGuard;
+    if (isBelowEntryWhileInLoss || isBelowCurrentInProfit || isBogusFarSl) {
+      rawSl = defaultVirtualSl;
+      pos.trailingStatus = 'INITIAL';
+      pos.strictRatchetLocked = false;
+    }
+  }
+
+  // Validate existing TP
+  let rawTp = Number(pos.currentTp || pos.virtualTp || 0);
+  const maxTpGuard = isGold ? 30.0 : 300 * pipVal;
+  if (!isFinite(rawTp) || rawTp <= 0) {
+    rawTp = defaultVirtualTp;
+  } else if (isBuy) {
+    if (rawTp <= pos.entryPrice || Math.abs(rawTp - pos.entryPrice) > maxTpGuard) {
+      rawTp = defaultVirtualTp;
+    }
+  } else {
+    if (rawTp >= pos.entryPrice || Math.abs(rawTp - pos.entryPrice) > maxTpGuard) {
+      rawTp = defaultVirtualTp;
+    }
+  }
+
+  pos.virtualSl = Number(rawSl.toFixed(digits));
+  pos.virtualTp = Number(rawTp.toFixed(digits));
+  pos.currentSl = pos.virtualSl;
+  pos.currentTp = pos.virtualTp;
+
+  return pos;
 }
 
 export interface TrailingAction {
@@ -147,6 +333,9 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
   }
   position.currentPrice = currentPrice;
 
+  // Sanitize & validate SL/TP direction and auto-assign virtualSl / virtualTp before evaluating trailing
+  sanitizePositionSlTp(position, currentPrice, stopLossPips);
+
   // Track Peak and Trough price over lifetime of position
   const updatedHighest = Math.max(position.highestPrice || position.entryPrice, currentPrice);
   const updatedLowest = position.lowestPrice === 0
@@ -196,6 +385,15 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
   const hardSlLimitUsd = -Number((position.volume * pipValueUsdPerLot * effectiveSlPips).toFixed(2));
 
   if (!isInGracePeriod && unrealizedPnl <= hardSlLimitUsd) {
+    if (!canAttemptPositionClose(position.id)) {
+      return {
+        type: 'NONE',
+        positionId: position.id,
+        symbol: position.symbol,
+        reason: `[CLOSE COOLDOWN] Close request for #${position.id} is already in-flight or within 15s cooldown.`,
+        statusUpdate: position.trailingStatus,
+      };
+    }
     return {
       type: 'HARD_SL_CLOSE',
       positionId: position.id,
@@ -372,9 +570,12 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
       const crashSlRaw = isBuy ? (currentPrice - crashTightLockDist) : (currentPrice + crashTightLockDist);
       const formattedCrashSl = formatPrice(crashSlRaw, profile.digits);
       const numericCrashSl = Number(formattedCrashSl);
-      const improvesSl = isBuy
+      const isValidDir = isBuy
+        ? numericCrashSl < currentPrice - profile.pipValue
+        : numericCrashSl > currentPrice + profile.pipValue;
+      const improvesSl = isValidDir && (isBuy
         ? (position.currentSl === 0 || numericCrashSl > position.currentSl)
-        : (position.currentSl === 0 || numericCrashSl < position.currentSl);
+        : (position.currentSl === 0 || numericCrashSl < position.currentSl));
 
       if (improvesSl) {
         return {
@@ -400,7 +601,11 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
 
       if (isBuy) {
         const slImprovement = numericRatchetSl - (position.currentSl || 0);
-        if (numericRatchetSl > (position.currentSl || 0) && slImprovement >= minStep) {
+        if (
+          numericRatchetSl < currentPrice - profile.pipValue &&
+          numericRatchetSl > (position.currentSl || 0) &&
+          slImprovement >= minStep
+        ) {
           return {
             type: 'MODIFY_SL',
             positionId: position.id,
@@ -414,7 +619,11 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
       } else {
         const currentSlVal = position.currentSl === 0 ? Infinity : position.currentSl;
         const slImprovement = currentSlVal - numericRatchetSl;
-        if (numericRatchetSl < currentSlVal && slImprovement >= minStep) {
+        if (
+          numericRatchetSl > currentPrice + profile.pipValue &&
+          numericRatchetSl < currentSlVal &&
+          slImprovement >= minStep
+        ) {
           return {
             type: 'MODIFY_SL',
             positionId: position.id,
@@ -491,7 +700,11 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
         position.elasticFloorLocked = true;
       }
 
-      if (Math.abs(numericCushionSl - (position.currentSl || 0)) >= minStep) {
+      const validCushionDir = isBuy
+        ? numericCushionSl < currentPrice - profile.pipValue
+        : numericCushionSl > currentPrice + profile.pipValue;
+
+      if (validCushionDir && Math.abs(numericCushionSl - (position.currentSl || 0)) >= minStep) {
         return {
           type: 'MODIFY_SL',
           positionId: position.id,
@@ -504,9 +717,12 @@ export function evaluatePositionTrailing(input: TrailingEvaluationInput): Traili
       }
     } else {
       // Advance SL forward to entryPrice (4058.00 at +20p) or peak - $2.00
-      const canAdvanceForward = isBuy
+      const validForwardDir = isBuy
+        ? numericForwardSl < currentPrice - profile.pipValue
+        : numericForwardSl > currentPrice + profile.pipValue;
+      const canAdvanceForward = validForwardDir && (isBuy
         ? (position.currentSl === 0 || (numericForwardSl > position.currentSl && numericForwardSl - position.currentSl >= minStep))
-        : (position.currentSl === 0 || (numericForwardSl < position.currentSl && position.currentSl - numericForwardSl >= minStep));
+        : (position.currentSl === 0 || (numericForwardSl < position.currentSl && position.currentSl - numericForwardSl >= minStep)));
 
       if (canAdvanceForward) {
         const formattedForwardSl = formatPrice(numericForwardSl, profile.digits);

@@ -14,7 +14,14 @@ import { create } from 'zustand';
 import { persist, createJSONStorage } from 'zustand/middleware';
 import { AccountInfo, LiveQuote } from '@/core/exnessClient';
 import { Candle, Timeframe, timeframeToMs, resampleCandles } from '@/core/indicatorEngine';
-import { ManagedPosition, evaluatePositionTrailing } from '@/core/trailingManager';
+import {
+  ManagedPosition,
+  evaluatePositionTrailing,
+  sanitizePositionSlTp,
+  canAttemptPositionClose,
+  markPositionClosingStart,
+  markPositionClosingDone,
+} from '@/core/trailingManager';
 import { getPairProfile, SUPPORTED_SYMBOLS, calculatePnL, evaluatePositionPnL, formatPrice } from '@/core/pairConfig';
 import {
   KronosForecastResult,
@@ -1226,8 +1233,32 @@ export const useTradingStore = create<TradingState>()(
 
               const currentQuotes = get().quotes;
               const currentPrices = get().symbolPrices || {};
+              const slPipsCfg = state.stopLossPips ?? 25;
+              const tpPipsCfg = state.takeProfitPips ?? 50;
+              const normTicket = (id: string) => String(id || '').replace(/^#+/, '').trim().toLowerCase();
 
-              const evaluatedPositions = cleanServerPositions.map((pos: any) => {
+              const evaluatedPositions = cleanServerPositions.map((rawPos: any) => {
+                const matchExisting = existingPositions.find(
+                  (ep: any) => normTicket(ep.id) === normTicket(rawPos.id)
+                );
+                const pos: any = {
+                  ...(matchExisting || {}),
+                  ...rawPos,
+                  currentSl: Number(rawPos.currentSl || rawPos.sl || matchExisting?.currentSl || matchExisting?.virtualSl || 0),
+                  currentTp: Number(rawPos.currentTp || rawPos.tp || matchExisting?.currentTp || matchExisting?.virtualTp || 0),
+                  virtualSl: Number(rawPos.virtualSl || matchExisting?.virtualSl || rawPos.currentSl || rawPos.sl || 0),
+                  virtualTp: Number(rawPos.virtualTp || matchExisting?.virtualTp || rawPos.currentTp || rawPos.tp || 0),
+                  trailingStatus: rawPos.trailingStatus && rawPos.trailingStatus !== 'ACTIVE'
+                    ? rawPos.trailingStatus
+                    : (matchExisting?.trailingStatus || rawPos.trailingStatus || 'ACTIVE'),
+                  highestPrice: Number(rawPos.highestPrice || matchExisting?.highestPrice || rawPos.entryPrice || 0),
+                  lowestPrice: Number(rawPos.lowestPrice || matchExisting?.lowestPrice || rawPos.entryPrice || 0),
+                  isClosing: Boolean(
+                    rawPos.isClosing ||
+                    (matchExisting?.isClosing && (Date.now() - (matchExisting?.closingStartedAt || 0) < 15000))
+                  ),
+                  closingStartedAt: rawPos.closingStartedAt || matchExisting?.closingStartedAt,
+                };
                 const q = currentQuotes[pos.symbol] || currentPrices[pos.symbol];
                 const validPrice = getValidLivePrice(pos.symbol);
                 const prof = getPairProfile(pos.symbol);
@@ -1241,6 +1272,7 @@ export const useTradingStore = create<TradingState>()(
                       timestamp: Date.now(),
                     };
                 const curPrice = pos.side === 'BUY' ? safeQ.bid : safeQ.ask;
+                sanitizePositionSlTp(pos, curPrice, slPipsCfg, tpPipsCfg);
                 const pnlRes = evaluatePositionPnL(pos, safeQ);
                 return {
                   ...pos,
@@ -1300,9 +1332,11 @@ export const useTradingStore = create<TradingState>()(
                         timestamp: Date.now(),
                       };
                   const curPrice = pos.side === 'BUY' ? safeQ.bid : safeQ.ask;
-                  const pnlRes = evaluatePositionPnL(pos, safeQ);
+                  const cloned = { ...pos };
+                  sanitizePositionSlTp(cloned, curPrice, state.stopLossPips ?? 25, state.takeProfitPips ?? 50);
+                  const pnlRes = evaluatePositionPnL(cloned, safeQ);
                   return {
-                    ...pos,
+                    ...cloned,
                     currentPrice: curPrice,
                     unrealizedPnl: pnlRes.pnlUsd,
                   };
@@ -1385,9 +1419,11 @@ export const useTradingStore = create<TradingState>()(
                     timestamp: Date.now(),
                   };
               const curPrice = pos.side === 'BUY' ? safeQ.bid : safeQ.ask;
-              const pnlRes = evaluatePositionPnL(pos, safeQ);
+              const cloned = { ...pos };
+              sanitizePositionSlTp(cloned, curPrice, state.stopLossPips ?? 25, state.takeProfitPips ?? 50);
+              const pnlRes = evaluatePositionPnL(cloned, safeQ);
               return {
-                ...pos,
+                ...cloned,
                 currentPrice: curPrice,
                 unrealizedPnl: pnlRes.pnlUsd,
               };
@@ -1880,10 +1916,19 @@ export const useTradingStore = create<TradingState>()(
             continue;
           }
           pos.currentPrice = curPrice;
+          sanitizePositionSlTp(pos, curPrice, freshState.stopLossPips ?? 25, freshState.takeProfitPips ?? 50);
+          hasModifiedPosition = true;
           const isLiveExness = Boolean(freshState.accountInfo?.isLiveExness || isVaultConfigured(freshState.credentials));
 
           // Check Take Profit hit
           if (pos.currentTp > 0 && (isBuy ? curPrice >= pos.currentTp : curPrice <= pos.currentTp)) {
+            if (!canAttemptPositionClose(pos.id)) {
+              updatedPositions.push(pos);
+              continue;
+            }
+            markPositionClosingStart(pos.id);
+            pos.isClosing = true;
+            pos.closingStartedAt = Date.now();
             const pnlData = evaluatePositionPnL(pos, q);
             const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
             get().addTelemetryLog(pos.symbol, 'ORDER', `[TAKE PROFIT HIT] #${pos.id} ${pos.side} @ ${curPrice} (+$${realizedPnl.toFixed(2)})`);
@@ -1898,9 +1943,18 @@ export const useTradingStore = create<TradingState>()(
                 credentials: credsPayload,
                 payload: { positionId: pos.id, symbol: pos.symbol },
               }),
-            }).then(() => {
+            }).then(async (res) => {
+              const d = await res.json().catch(() => null);
+              const ok = Boolean(res.ok && (d?.ok || d?.success));
+              markPositionClosingDone(pos.id, ok);
+              if (!ok) {
+                pos.isClosing = false;
+              }
               get().fetchAccountInfo();
-            }).catch(() => {});
+            }).catch(() => {
+              markPositionClosingDone(pos.id, false);
+              pos.isClosing = false;
+            });
             hasModifiedPosition = true;
             if (!isLiveExness) {
               continue;
@@ -1912,6 +1966,13 @@ export const useTradingStore = create<TradingState>()(
 
           // Check Stop Loss / Trailing Stop hit
           if (pos.currentSl > 0 && (isBuy ? curPrice <= pos.currentSl : curPrice >= pos.currentSl)) {
+            if (!canAttemptPositionClose(pos.id)) {
+              updatedPositions.push(pos);
+              continue;
+            }
+            markPositionClosingStart(pos.id);
+            pos.isClosing = true;
+            pos.closingStartedAt = Date.now();
             const pnlData = evaluatePositionPnL(pos, q);
             const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
             get().addTelemetryLog(pos.symbol, 'ORDER', `[STOP LOSS / TRAILING STOP HIT] #${pos.id} ${pos.side} @ ${curPrice} (${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)})`);
@@ -1926,9 +1987,18 @@ export const useTradingStore = create<TradingState>()(
                 credentials: credsPayload,
                 payload: { positionId: pos.id, symbol: pos.symbol },
               }),
-            }).then(() => {
+            }).then(async (res) => {
+              const d = await res.json().catch(() => null);
+              const ok = Boolean(res.ok && (d?.ok || d?.success));
+              markPositionClosingDone(pos.id, ok);
+              if (!ok) {
+                pos.isClosing = false;
+              }
               get().fetchAccountInfo();
-            }).catch(() => {});
+            }).catch(() => {
+              markPositionClosingDone(pos.id, false);
+              pos.isClosing = false;
+            });
             hasModifiedPosition = true;
             if (!isLiveExness) {
               continue;
@@ -1996,6 +2066,13 @@ export const useTradingStore = create<TradingState>()(
           });
 
           if (trailingAction.type === 'HARD_SL_CLOSE') {
+            if (!canAttemptPositionClose(pos.id)) {
+              updatedPositions.push(pos);
+              continue;
+            }
+            markPositionClosingStart(pos.id);
+            pos.isClosing = true;
+            pos.closingStartedAt = Date.now();
             const pnlData = evaluatePositionPnL(pos, q);
             const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
             get().addTelemetryLog(pos.symbol, 'RISK', trailingAction.reason);
@@ -2010,9 +2087,18 @@ export const useTradingStore = create<TradingState>()(
                 credentials: credsPayload,
                 payload: { positionId: pos.id, symbol: pos.symbol },
               }),
-            }).then(() => {
+            }).then(async (res) => {
+              const d = await res.json().catch(() => null);
+              const ok = Boolean(res.ok && (d?.ok || d?.success));
+              markPositionClosingDone(pos.id, ok);
+              if (!ok) {
+                pos.isClosing = false;
+              }
               get().fetchAccountInfo();
-            }).catch(() => {});
+            }).catch(() => {
+              markPositionClosingDone(pos.id, false);
+              pos.isClosing = false;
+            });
             hasModifiedPosition = true;
             if (!isLiveExness) {
               continue;
@@ -2048,6 +2134,7 @@ export const useTradingStore = create<TradingState>()(
             if (trailingAction.newSlPrice && trailingAction.newSlPrice !== pos.currentSl) {
               get().addTelemetryLog(pos.symbol, 'TRAILING', trailingAction.reason);
               pos.currentSl = trailingAction.newSlPrice;
+              pos.virtualSl = trailingAction.newSlPrice;
               pos.trailingStatus = trailingAction.statusUpdate;
               fetch('/api/exness', {
                 method: 'POST',
@@ -2229,14 +2316,20 @@ export const useTradingStore = create<TradingState>()(
             const currentQuotes = get().quotes;
             const mappedPositions = mergedPositions.map((pos: ManagedPosition) => {
               const q = currentQuotes[pos.symbol];
-              if (!q) return pos;
-              const curPrice = pos.side === 'BUY' ? q.bid : q.ask;
-              const prevValid = pos.currentPrice || pos.entryPrice;
-              if (prevValid > 0 && Math.abs(curPrice - prevValid) / prevValid > 0.05) {
-                return pos;
+              const cloned = { ...pos };
+              if (!q) {
+                sanitizePositionSlTp(cloned, cloned.currentPrice || cloned.entryPrice, get().stopLossPips ?? 25, get().takeProfitPips ?? 50);
+                return cloned;
               }
-              const res = evaluatePositionPnL(pos, q);
-              return { ...pos, currentPrice: curPrice, unrealizedPnl: res.pnlUsd };
+              const curPrice = cloned.side === 'BUY' ? q.bid : q.ask;
+              const prevValid = cloned.currentPrice || cloned.entryPrice;
+              if (prevValid > 0 && Math.abs(curPrice - prevValid) / prevValid > 0.05) {
+                sanitizePositionSlTp(cloned, prevValid, get().stopLossPips ?? 25, get().takeProfitPips ?? 50);
+                return cloned;
+              }
+              sanitizePositionSlTp(cloned, curPrice, get().stopLossPips ?? 25, get().takeProfitPips ?? 50);
+              const res = evaluatePositionPnL(cloned, q);
+              return { ...cloned, currentPrice: curPrice, unrealizedPnl: res.pnlUsd };
             });
 
             const totalUnrealized = mappedPositions.reduce((sum: number, p: ManagedPosition) => sum + (p.unrealizedPnl || 0), 0);
@@ -2291,6 +2384,10 @@ export const useTradingStore = create<TradingState>()(
           const isPartial = Boolean(volume && pos && volume < pos.volume);
           const closeVol = isPartial ? Number(volume!.toFixed(2)) : (pos ? pos.volume : 0.05);
 
+          if (!isPartial && !canAttemptPositionClose(positionId)) {
+            return;
+          }
+
           const quote = pos ? (state.quotes[pos.symbol] || state.symbolPrices?.[pos.symbol]) : undefined;
           const pnlData = (pos && quote)
             ? evaluatePositionPnL({ ...pos, volume: closeVol }, quote)
@@ -2298,10 +2395,21 @@ export const useTradingStore = create<TradingState>()(
           const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
           const curPrice = pnlData.curPrice;
 
-          get().recordTradePnL(realizedPnl);
-
-          // Optimistically update local state immediately so button responds instantly without UI freeze!
-          if (isPartial && pos) {
+          // Mark position as isClosing: true while keeping it counted in openPositions.length
+          // until the broker confirms the close (prevents 2 Open <-> 3 Open flicker & extra order openings).
+          if (!isPartial) {
+            markPositionClosingStart(positionId);
+            const closingMarked = allPositions.map((p) =>
+              norm(p.id) === targetNorm
+                ? { ...p, isClosing: true, closingStartedAt: Date.now() }
+                : p
+            );
+            set({
+              positions: closingMarked,
+              openPositions: closingMarked,
+            });
+          } else if (pos) {
+            get().recordTradePnL(realizedPnl);
             get().addTelemetryLog(
               pos.symbol,
               'ORDER',
@@ -2321,69 +2429,94 @@ export const useTradingStore = create<TradingState>()(
             const curBal: number | null = isConn ? (get().balance ?? get().accountInfo?.balance ?? null) : null;
             const totalUnrealized = updated.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
             const calculatedEquity: number | null = curBal !== null ? Number((curBal + totalUnrealized).toFixed(2)) : null;
-            set((prev) => ({
+            set({
               positions: isConn ? updated : [],
               openPositions: isConn ? updated : [],
               equity: calculatedEquity,
-            }));
-          } else {
-            get().addTelemetryLog(
-              pos?.symbol || 'XAUUSDm',
-              'ORDER',
-              `[ORDER] CLOSED #${positionId} ${pos?.side || ''} @ ${curPrice} (${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)})`
-            );
-            const remaining = allPositions.filter((p) => norm(p.id) !== targetNorm);
-            const isConn = Boolean(get().accountInfo?.connected);
-            const curBal: number | null = isConn ? (get().balance ?? get().accountInfo?.balance ?? null) : null;
-            const totalUnrealized = remaining.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
-            const calculatedEquity: number | null = curBal !== null
-              ? (remaining.length === 0 ? curBal : Number((curBal + totalUnrealized).toFixed(2)))
-              : null;
-            set((prev) => ({
-              positions: isConn ? remaining : [],
-              openPositions: isConn ? remaining : [],
-              equity: calculatedEquity,
-              accountInfo: prev.accountInfo
-                ? {
-                    ...prev.accountInfo,
-                    equity: calculatedEquity,
-                    freeMargin: calculatedEquity !== null ? Number(Math.max(0, calculatedEquity - (remaining.length === 0 ? 0 : (prev.accountInfo.margin || 0))).toFixed(2)) : null,
-                    margin: remaining.length === 0 ? 0 : prev.accountInfo.margin,
-                  }
-                : prev.accountInfo,
-            }));
+            });
           }
 
-          // Dispatch to server asynchronously to keep UI 100% snappy
-          fetch('/api/exness', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${activeCreds.apiKey}`,
-              'x-api-key': activeCreds.apiKey,
-            },
-            body: JSON.stringify({
-              action: isPartial ? 'partialClose' : 'closePosition',
-              positionId,
-              volumeToClose: closeVol,
-              symbol: pos?.symbol || 'XAUUSDm',
-              credentials: {
-                accountId: activeCreds.accountId || '30000143146',
-                server: activeCreds.server,
-                apiKey: activeCreds.apiKey,
-                token: activeCreds.apiKey,
-                secret: activeCreds.secret,
-                privateKey: activeCreds.secret,
-                password: activeCreds.password,
-                mode: activeCreds.mode || state.accountMode || 'DEMO',
-                initialBalance: activeCreds.initialBalance,
+          let closeSucceeded = false;
+          try {
+            const res = await fetch('/api/exness', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${activeCreds.apiKey}`,
+                'x-api-key': activeCreds.apiKey,
               },
-              payload: { positionId, volumeToClose: closeVol, symbol: pos?.symbol },
-            }),
-          }).catch((err) => console.warn('Background close position sync:', err));
+              body: JSON.stringify({
+                action: isPartial ? 'partialClose' : 'closePosition',
+                positionId,
+                volumeToClose: closeVol,
+                symbol: pos?.symbol || 'XAUUSDm',
+                credentials: {
+                  accountId: activeCreds.accountId || '30000143146',
+                  server: activeCreds.server,
+                  apiKey: activeCreds.apiKey,
+                  token: activeCreds.apiKey,
+                  secret: activeCreds.secret,
+                  privateKey: activeCreds.secret,
+                  password: activeCreds.password,
+                  mode: activeCreds.mode || state.accountMode || 'DEMO',
+                  initialBalance: activeCreds.initialBalance,
+                },
+                payload: { positionId, volumeToClose: closeVol, symbol: pos?.symbol },
+              }),
+            });
+            const resData = await res.json().catch(() => null);
+            closeSucceeded = Boolean(res.ok && (resData?.ok || resData?.success));
+          } catch (err) {
+            console.warn('Close position API error:', err);
+          }
+
+          if (!isPartial) {
+            markPositionClosingDone(positionId, closeSucceeded);
+            const latestPositions = (get().openPositions || get().positions || []);
+            if (closeSucceeded) {
+              get().recordTradePnL(realizedPnl);
+              get().addTelemetryLog(
+                pos?.symbol || 'XAUUSDm',
+                'ORDER',
+                `[ORDER] CLOSED #${positionId} ${pos?.side || ''} @ ${curPrice} (${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)})`
+              );
+              const remaining = latestPositions.filter((p) => norm(p.id) !== targetNorm);
+              const isConn = Boolean(get().accountInfo?.connected);
+              const curBal: number | null = isConn ? (get().balance ?? get().accountInfo?.balance ?? null) : null;
+              const totalUnrealized = remaining.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
+              const calculatedEquity: number | null = curBal !== null
+                ? (remaining.length === 0 ? curBal : Number((curBal + totalUnrealized).toFixed(2)))
+                : null;
+              set((prev) => ({
+                positions: isConn ? remaining : [],
+                openPositions: isConn ? remaining : [],
+                equity: calculatedEquity,
+                accountInfo: prev.accountInfo
+                  ? {
+                      ...prev.accountInfo,
+                      equity: calculatedEquity,
+                      freeMargin: calculatedEquity !== null ? Number(Math.max(0, calculatedEquity - (remaining.length === 0 ? 0 : (prev.accountInfo.margin || 0))).toFixed(2)) : null,
+                      margin: remaining.length === 0 ? 0 : prev.accountInfo.margin,
+                    }
+                  : prev.accountInfo,
+              }));
+            } else {
+              // Broker close did not confirm: unmark isClosing and keep position in openPositions
+              const restored = latestPositions.map((p) =>
+                norm(p.id) === targetNorm
+                  ? { ...p, isClosing: false }
+                  : p
+              );
+              set({
+                positions: restored,
+                openPositions: restored,
+              });
+            }
+          }
 
           await get().fetchAccountInfo();
         } catch (err) {
+          markPositionClosingDone(positionId, false);
           console.error('Error closing position:', err);
         }
       },

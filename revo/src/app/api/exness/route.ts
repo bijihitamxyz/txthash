@@ -397,8 +397,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 3. CLOSE POSITION / PARTIAL CLOSE (closePosition | close | partialClose | close50) -> REAL Exness close
-    if (['closeposition', 'close', 'partialclose', 'close50'].includes(cleanAction)) {
+    // 3. CLOSE POSITION / PARTIAL CLOSE (closePosition | closeOrder | close | partialClose | close50) -> REAL Exness close
+    if (['closeposition', 'closeorder', 'close', 'partialclose', 'close50'].includes(cleanAction)) {
       const closeData = { ...(body || {}), ...(payload || {}) };
       const rawId = closeData.positionId || closeData.id || body.positionId || body.id;
       const positionId = String(rawId || '').trim();
@@ -423,7 +423,7 @@ export async function POST(req: NextRequest) {
       if ((cleanAction === 'partialclose' || cleanAction === 'close50') && !volumeToClose && curPos) {
         volumeToClose = Number((curPos.volume * 0.5).toFixed(2));
       }
-      if (cleanAction === 'closeposition' || cleanAction === 'close') {
+      if (cleanAction === 'closeposition' || cleanAction === 'closeorder' || cleanAction === 'close') {
         if (!curPos || !volumeToClose || Number(volumeToClose) >= curPos.volume) {
           volumeToClose = undefined;
         }

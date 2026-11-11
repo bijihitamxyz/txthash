@@ -3,7 +3,12 @@ import { ExnessClient, realTimeFeed } from '@/core/exnessClient';
 import { getPairProfile, SUPPORTED_SYMBOLS, calculatePnL, evaluatePositionPnL } from '@/core/pairConfig';
 import { evaluateSignalGates } from '@/core/signalGate';
 import { evaluateMultiAiConsensus, AiConfig } from '@/core/aiJudge';
-import { evaluatePositionTrailing, ManagedPosition } from '@/core/trailingManager';
+import {
+  evaluatePositionTrailing,
+  ManagedPosition,
+  sanitizePositionSlTp,
+  canAttemptPositionClose,
+} from '@/core/trailingManager';
 import {
   evaluatePreTradeRisk,
   idempotencyLocks,
@@ -276,31 +281,48 @@ export async function POST(req: NextRequest) {
           }
         }
         pos.currentPrice = curPrice;
+        sanitizePositionSlTp(pos, curPrice, stopLossPips, takeProfitPips);
 
         // 1a. Take Profit hit verification
         if (pos.currentTp > 0 && (isBuy ? curPrice >= pos.currentTp : curPrice <= pos.currentTp)) {
+          if (!canAttemptPositionClose(pos.id)) {
+            pos.isClosing = true;
+            continue;
+          }
           const pnlData = evaluatePositionPnL(pos, quote);
           const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
           log(symbol, 'ORDER', `[TAKE PROFIT HIT] #${pos.id} ${pos.side} @ ${curPrice} (+$${realizedPnl.toFixed(2)})`);
-          await client.closePosition(pos.id, undefined, symbol);
-          closedTrades.push({ id: pos.id, symbol, pnl: realizedPnl, reason: 'TP' });
-          const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
-          if (posIdx !== -1) {
-            updatedPositions.splice(posIdx, 1);
+          pos.isClosing = true;
+          pos.closingStartedAt = Date.now();
+          const closeRes = await client.closePosition(pos.id, undefined, symbol);
+          if (closeRes.success) {
+            closedTrades.push({ id: pos.id, symbol, pnl: realizedPnl, reason: 'TP' });
+            const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
+            if (posIdx !== -1) {
+              updatedPositions.splice(posIdx, 1);
+            }
           }
           continue;
         }
 
         // 1b. Stop Loss / Trailing Stop hit verification
         if (pos.currentSl > 0 && (isBuy ? curPrice <= pos.currentSl : curPrice >= pos.currentSl)) {
+          if (!canAttemptPositionClose(pos.id)) {
+            pos.isClosing = true;
+            continue;
+          }
           const pnlData = evaluatePositionPnL(pos, quote);
           const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
           log(symbol, 'ORDER', `[STOP LOSS / TRAILING STOP HIT] #${pos.id} ${pos.side} @ ${curPrice} (${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)})`);
-          await client.closePosition(pos.id, undefined, symbol);
-          closedTrades.push({ id: pos.id, symbol, pnl: realizedPnl, reason: 'SL' });
-          const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
-          if (posIdx !== -1) {
-            updatedPositions.splice(posIdx, 1);
+          pos.isClosing = true;
+          pos.closingStartedAt = Date.now();
+          const closeRes = await client.closePosition(pos.id, undefined, symbol);
+          if (closeRes.success) {
+            closedTrades.push({ id: pos.id, symbol, pnl: realizedPnl, reason: 'SL' });
+            const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
+            if (posIdx !== -1) {
+              updatedPositions.splice(posIdx, 1);
+            }
           }
           continue;
         }
@@ -327,14 +349,22 @@ export async function POST(req: NextRequest) {
 
         // Hard SL Circuit Breaker handling
         if (trailingAction.type === 'HARD_SL_CLOSE') {
+          if (!canAttemptPositionClose(pos.id)) {
+            pos.isClosing = true;
+            continue;
+          }
           const pnlData = evaluatePositionPnL(pos, quote);
           const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
           log(symbol, 'RISK', trailingAction.reason);
-          await client.closePosition(pos.id, undefined, symbol);
-          closedTrades.push({ id: pos.id, symbol, pnl: realizedPnl, reason: 'HARD_SL' });
-          const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
-          if (posIdx !== -1) {
-            updatedPositions.splice(posIdx, 1);
+          pos.isClosing = true;
+          pos.closingStartedAt = Date.now();
+          const closeRes = await client.closePosition(pos.id, undefined, symbol);
+          if (closeRes.success) {
+            closedTrades.push({ id: pos.id, symbol, pnl: realizedPnl, reason: 'HARD_SL' });
+            const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
+            if (posIdx !== -1) {
+              updatedPositions.splice(posIdx, 1);
+            }
           }
           continue;
         }
@@ -358,17 +388,18 @@ export async function POST(req: NextRequest) {
             const modRes = await client.modifyPosition(pos.id, trailingAction.newSlPrice, undefined, symbol);
             if (modRes) {
               pos.currentSl = trailingAction.newSlPrice;
+              pos.virtualSl = trailingAction.newSlPrice;
               pos.trailingStatus = trailingAction.statusUpdate;
             }
           }
         }
       }
 
-      // 2. Pre-Trade Institutional Circuit Breakers
+      // 2. Pre-Trade Institutional Circuit Breakers (count both currentPositions & updatedPositions so closing in-flight never opens a 3rd slot)
       const riskCheck = evaluatePreTradeRisk(
         symbol,
         quote.spreadPips,
-        updatedPositions.length,
+        Math.max(currentPositions.length, updatedPositions.length),
         dailyLoss,
         mergedRisk
       );

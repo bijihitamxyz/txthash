@@ -16,7 +16,12 @@ import path from 'path';
 import WebSocket from 'ws';
 import { Candle } from './indicatorEngine';
 import { PairProfile, getPairProfile, formatPrice, roundLotVolume, calculatePnL, evaluatePositionPnL } from './pairConfig';
-import { ManagedPosition } from './trailingManager';
+import {
+  ManagedPosition,
+  sanitizePositionSlTp,
+  markPositionClosingStart,
+  markPositionClosingDone,
+} from './trailingManager';
 import { ExnessVaultCredentials } from './exnessVault';
 import { getDataDir, safeMkdirSync, getNemesisMemoryStore } from '@/lib/dataStore';
 
@@ -721,17 +726,30 @@ const normPosId = (id: string) => String(id || '').replace(/^#+/, '').trim();
  */
 export function refreshPositionFloating(pos: ManagedPosition): ManagedPosition {
   try {
-    if (typeof realTimeFeed === 'undefined' || !realTimeFeed) return pos;
+    if (typeof realTimeFeed === 'undefined' || !realTimeFeed) {
+      return sanitizePositionSlTp(pos, pos.currentPrice || pos.entryPrice);
+    }
     const q = realTimeFeed.getLiveQuote(pos.symbol);
-    if (!q || !(q.bid > 0) || !(q.ask > 0) || !(pos.entryPrice > 0)) return pos;
+    if (!q || !(q.bid > 0) || !(q.ask > 0) || !(pos.entryPrice > 0)) {
+      return sanitizePositionSlTp(pos, pos.currentPrice || pos.entryPrice);
+    }
     const res = evaluatePositionPnL(pos, q);
-    if (!(res.curPrice > 0)) return pos;
-    pos.currentPrice = res.curPrice;
-    pos.unrealizedPnl = res.pnlUsd;
-    pos.pnl = res.pnlUsd;
-    pos.pips = res.pnlPips;
-    pos.highestPrice = Math.max(pos.highestPrice || res.curPrice, res.curPrice);
-    pos.lowestPrice = Math.min(pos.lowestPrice || res.curPrice, res.curPrice);
+    if (!(res.curPrice > 0)) {
+      return sanitizePositionSlTp(pos, pos.currentPrice || pos.entryPrice);
+    }
+    // Guard against uninitialized baseline (e.g. 4116.85 when entry is 4050.06) polluting highestPrice/lowestPrice
+    const isGold = pos.symbol === 'XAUUSDm' || pos.symbol.startsWith('XAU');
+    const maxDist = isGold ? 15.0 : 150 * getPairProfile(pos.symbol).pipValue;
+    const isQuoteNearEntry = Math.abs(res.curPrice - pos.entryPrice) <= maxDist;
+    if (isQuoteNearEntry) {
+      pos.currentPrice = res.curPrice;
+      pos.unrealizedPnl = res.pnlUsd;
+      pos.pnl = res.pnlUsd;
+      pos.pips = res.pnlPips;
+      pos.highestPrice = Math.max(pos.highestPrice || pos.entryPrice, res.curPrice);
+      pos.lowestPrice = Math.min(pos.lowestPrice || pos.entryPrice, res.curPrice);
+    }
+    sanitizePositionSlTp(pos, pos.currentPrice || pos.entryPrice);
   } catch {}
   return pos;
 }
@@ -781,13 +799,20 @@ export function mergeRemoteWithActiveForexPositions(
     const effectiveSl =
       local?.currentSl && local.currentSl > 0 && (r.currentSl === 0 || local.lastSlUpdateTime)
         ? local.currentSl
-        : r.currentSl || local?.currentSl || 0;
-    const effectiveTp = r.currentTp && r.currentTp > 0 ? r.currentTp : local?.currentTp || 0;
+        : r.currentSl || local?.currentSl || local?.virtualSl || r.virtualSl || 0;
+    const effectiveTp =
+      r.currentTp && r.currentTp > 0
+        ? r.currentTp
+        : local?.currentTp || local?.virtualTp || r.virtualTp || 0;
+    const activeClosing =
+      Boolean(local?.isClosing && local?.closingStartedAt && Date.now() - local.closingStartedAt < 15000);
     const pos: ManagedPosition = {
       ...(local || {}),
       ...r,
       currentSl: effectiveSl,
       currentTp: effectiveTp,
+      virtualSl: effectiveSl,
+      virtualTp: effectiveTp,
       lastSlUpdateTime: local?.lastSlUpdateTime || r.lastSlUpdateTime,
       highestPrice: Math.max(local?.highestPrice || 0, r.highestPrice || 0, r.currentPrice || 0),
       lowestPrice:
@@ -797,11 +822,14 @@ export function mergeRemoteWithActiveForexPositions(
       trailingStatus: local?.trailingStatus || r.trailingStatus || 'INITIAL',
       partialClosed: Boolean(local?.partialClosed || r.partialClosed),
       initialVolume: local?.initialVolume || r.initialVolume || r.volume,
+      isClosing: activeClosing,
+      closingStartedAt: activeClosing ? local?.closingStartedAt : undefined,
       accountId: cleanId,
       source: 'EXNESS',
       seenOnBroker: true,
     };
     refreshPositionFloating(pos);
+    sanitizePositionSlTp(pos, pos.currentPrice || pos.entryPrice);
     merged.push(pos);
     nextLedger.push(pos);
   }
@@ -1539,15 +1567,17 @@ export function normalizeExnessPosition(raw: any, previous?: ManagedPosition): M
 
   const entryPrice = num(raw.open_price, raw.openPrice, raw.price_open, raw.entry_price, raw.entryPrice, raw.price, previous?.entryPrice) ?? 0;
   const currentPrice = num(raw.current_price, raw.currentPrice, raw.price_current, raw.market_price, previous?.currentPrice, entryPrice) ?? entryPrice;
-  const livePrice = (typeof realTimeFeed !== 'undefined' && realTimeFeed.getLatestKnownPrice(symbol)) || entryPrice;
-  const resolvedCurrentPrice = currentPrice > 0 ? currentPrice : livePrice;
+  const rawLivePrice = (typeof realTimeFeed !== 'undefined' && realTimeFeed.getLatestKnownPrice(symbol)) || entryPrice;
+  const maxQuoteDev = symbol.startsWith('XAU') ? 15.0 : 150 * profile.pipValue;
+  const safeLivePrice = entryPrice > 0 && Math.abs(rawLivePrice - entryPrice) > maxQuoteDev ? entryPrice : rawLivePrice;
+  const resolvedCurrentPrice = currentPrice > 0 && Math.abs(currentPrice - entryPrice) <= maxQuoteDev ? currentPrice : safeLivePrice;
 
-  const sl = num(raw.sl, raw.stop_loss, raw.stopLoss, raw.sl_price, previous?.currentSl) ?? 0;
-  const tp = num(raw.tp, raw.take_profit, raw.takeProfit, raw.tp_price, previous?.currentTp) ?? 0;
+  const sl = num(raw.sl, raw.stop_loss, raw.stopLoss, raw.sl_price, previous?.currentSl, previous?.virtualSl) ?? 0;
+  const tp = num(raw.tp, raw.take_profit, raw.takeProfit, raw.tp_price, previous?.currentTp, previous?.virtualTp) ?? 0;
   const profit = num(raw.profit, raw.unrealized_pnl, raw.unrealizedPnl, raw.pnl, raw.floating_profit);
   const resolvedPnl = profit !== undefined ? profit : calculatePnL(side, entryPrice, resolvedCurrentPrice, volume, profile).pnlUsd;
 
-  return {
+  const normalized: ManagedPosition = {
     id,
     symbol,
     side,
@@ -1557,14 +1587,17 @@ export function normalizeExnessPosition(raw: any, previous?: ManagedPosition): M
     currentPrice: resolvedCurrentPrice,
     currentSl: sl,
     currentTp: tp,
-    highestPrice: Math.max(previous?.highestPrice ?? resolvedCurrentPrice, resolvedCurrentPrice),
-    lowestPrice: Math.min(previous?.lowestPrice ?? resolvedCurrentPrice, resolvedCurrentPrice),
+    virtualSl: sl,
+    virtualTp: tp,
+    highestPrice: Math.max(previous?.highestPrice ?? entryPrice, resolvedCurrentPrice),
+    lowestPrice: Math.min(previous?.lowestPrice ?? entryPrice, resolvedCurrentPrice),
     openTime: toMs(raw.open_time ?? raw.openTime ?? raw.time ?? raw.create_time ?? raw.created_at ?? previous?.openTime),
     partialClosed: previous?.partialClosed ?? (previous ? volume < previous.initialVolume : false),
     trailingStatus: previous?.trailingStatus ?? 'INITIAL',
     lastSlUpdateTime: previous?.lastSlUpdateTime,
     unrealizedPnl: resolvedPnl !== undefined ? Number(resolvedPnl.toFixed(2)) : previous?.unrealizedPnl,
-  } as ManagedPosition;
+  };
+  return sanitizePositionSlTp(normalized, resolvedCurrentPrice);
 }
 
 export function matchAccountFromPayload(
@@ -3002,8 +3035,8 @@ export class ExnessClient {
           side: req.side,
           fillPrice,
           volume: filledVolume,
-          stopLoss: sl,
-          takeProfit: tp,
+          stopLoss: ledgerPos.currentSl || sl,
+          takeProfit: ledgerPos.currentTp || tp,
           timestamp: Date.now(),
           marginAutoScaleLog,
           message: `Exness FILLED: ${req.side} ${filledVolume} ${profile.symbol}${fillPrice ? ` @ ${formatPrice(fillPrice, profile.digits)}` : ''}${orderId ? ` (#${orderId})` : ''}${marginAutoScaleLog ? ` | ${marginAutoScaleLog}` : ''}`,
@@ -3116,12 +3149,25 @@ export class ExnessClient {
     const cleanId = String(positionId || '').replace(/^#+/, '').trim();
     if (!cleanId) return false;
     const accountId = String(this.credentials.accountId || '').trim();
-    const cached = realTimeFeed.getPositions().find((p) => String(p.id) === cleanId);
+    const cached =
+      realTimeFeed.getPositions().find((p) => normPosId(p.id) === cleanId) ||
+      getActiveForexPositionsForAccount(accountId).find((p) => normPosId(p.id) === cleanId);
     const profile = getPairProfile(symbol || cached?.symbol || 'XAUUSDm');
 
+    let safeStopLoss = stopLoss;
+    if (safeStopLoss !== undefined && safeStopLoss !== null && cached && cached.entryPrice > 0) {
+      const curPx = cached.currentPrice || cached.entryPrice;
+      const isBuy = cached.side === 'BUY';
+      if (isBuy && safeStopLoss >= cached.entryPrice && curPx <= cached.entryPrice) {
+        safeStopLoss = Number((cached.entryPrice - 25 * (profile.symbol.startsWith('XAU') ? 0.10 : profile.pipValue)).toFixed(profile.digits));
+      } else if (!isBuy && safeStopLoss <= cached.entryPrice && curPx >= cached.entryPrice) {
+        safeStopLoss = Number((cached.entryPrice + 25 * (profile.symbol.startsWith('XAU') ? 0.10 : profile.pipValue)).toFixed(profile.digits));
+      }
+    }
+
     const body: Record<string, any> = {};
-    if (stopLoss !== undefined && stopLoss !== null) {
-      body.stop_loss = formatPrice(stopLoss, profile.digits);
+    if (safeStopLoss !== undefined && safeStopLoss !== null) {
+      body.stop_loss = formatPrice(safeStopLoss, profile.digits);
     }
     if (takeProfit !== undefined && takeProfit !== null) {
       body.take_profit = formatPrice(takeProfit, profile.digits);
@@ -3130,21 +3176,36 @@ export class ExnessClient {
 
     const idempotencyKey = `mod-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
 
-    // Try modifying via Exness API orders endpoint
+    // Try modifying via Exness API positions / orders endpoints
     try {
       await this.signedRequest(
         'PATCH',
-        `/v1/trading/accounts/${encodeURIComponent(accountId)}/orders/${encodeURIComponent(cleanId)}`,
+        `/v1/trading/accounts/${encodeURIComponent(accountId)}/positions/${encodeURIComponent(cleanId)}`,
         body,
         idempotencyKey
       );
     } catch {
-      // Pending order not found or endpoint not applicable to market positions; will update local trailing manager
+      try {
+        await this.signedRequest(
+          'PATCH',
+          `/v1/trading/accounts/${encodeURIComponent(accountId)}/orders/${encodeURIComponent(cleanId)}`,
+          body,
+          `mod-ord-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`
+        );
+      } catch {
+        // Endpoint not applicable to market positions on this node; local virtual/hybrid trailing manager enforces SL/TP
+      }
     }
 
     const updates: Partial<ManagedPosition> = { lastSlUpdateTime: Date.now() };
-    if (stopLoss !== undefined && stopLoss !== null) updates.currentSl = stopLoss;
-    if (takeProfit !== undefined && takeProfit !== null) updates.currentTp = takeProfit;
+    if (safeStopLoss !== undefined && safeStopLoss !== null) {
+      updates.currentSl = safeStopLoss;
+      updates.virtualSl = safeStopLoss;
+    }
+    if (takeProfit !== undefined && takeProfit !== null) {
+      updates.currentTp = takeProfit;
+      updates.virtualTp = takeProfit;
+    }
     realTimeFeed.updatePosition(cleanId, updates);
     if (accountId) {
       const ledgerEntry = getActiveForexPositionsForAccount(accountId).find(
@@ -3166,44 +3227,185 @@ export class ExnessClient {
     if (!positionId) return { success: false, message: 'Position ID is required' };
 
     const accountId = String(this.credentials.accountId || '').trim();
-    const cached = realTimeFeed.getPositions().find((p) => String(p.id) === positionId);
+    const cached =
+      realTimeFeed.getPositions().find((p) => normPosId(p.id) === positionId) ||
+      getActiveForexPositionsForAccount(accountId).find((p) => normPosId(p.id) === positionId);
     const profile = getPairProfile(symbol || cached?.symbol || 'XAUUSDm');
+    const isPartial = Boolean(volumeToClose && cached && volumeToClose < cached.volume);
+    const closeVol = isPartial
+      ? roundLotVolume(Number(volumeToClose), profile.minLot, profile.lotStep)
+      : cached?.volume
+      ? roundLotVolume(cached.volume, profile.minLot, profile.lotStep)
+      : undefined;
 
-    const idempotencyKey = `close-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-
-    // Support partial close by appending ?volume=... in query string per Exness Trader API
-    let queryPath = `/v1/trading/accounts/${encodeURIComponent(accountId)}/positions/${encodeURIComponent(positionId)}`;
-    if (volumeToClose && volumeToClose > 0 && (!cached || volumeToClose < cached.volume)) {
-      const validVol = roundLotVolume(volumeToClose, profile.minLot, profile.lotStep);
-      queryPath += `?volume=${encodeURIComponent(String(validVol))}`;
+    // Mark as isClosing in memory while keeping it in openPositions until broker confirms close
+    markPositionClosingStart(positionId);
+    const closingNow = Date.now();
+    realTimeFeed.updatePosition(positionId, { isClosing: true, closingStartedAt: closingNow });
+    if (accountId && cached) {
+      saveActiveForexPosition(accountId, { ...cached, isClosing: true, closingStartedAt: closingNow });
     }
 
-    try {
-      const raw = await this.signedRequest('DELETE', queryPath, undefined, idempotencyKey);
-      const data = unwrap(raw) || {};
+    const encAcc = encodeURIComponent(accountId);
+    const encPos = encodeURIComponent(positionId);
+    const baseInst = profile.symbol.endsWith('m') ? profile.symbol.slice(0, -1) : profile.symbol;
 
-      const isPartial = Boolean(volumeToClose && cached && volumeToClose < cached.volume);
+    const closeStrategies: Array<{ method: string; path: string; body?: any }> = [];
+    if (isPartial && closeVol) {
+      closeStrategies.push(
+        {
+          method: 'DELETE',
+          path: `/v1/trading/accounts/${encAcc}/positions/${encPos}?volume=${encodeURIComponent(String(closeVol))}`,
+        },
+        {
+          method: 'POST',
+          path: `/v1/trading/accounts/${encAcc}/positions/${encPos}/close`,
+          body: { volume: String(closeVol) },
+        },
+        {
+          method: 'DELETE',
+          path: `/v1/trading/accounts/${encAcc}/positions/${encPos}`,
+          body: { volume: String(closeVol) },
+        },
+        {
+          method: 'POST',
+          path: `/v1/trading/accounts/${encAcc}/positions/close`,
+          body: { position_id: positionId, volume: String(closeVol) },
+        }
+      );
+    } else {
+      closeStrategies.push(
+        {
+          method: 'DELETE',
+          path: `/v1/trading/accounts/${encAcc}/positions/${encPos}`,
+        },
+        {
+          method: 'POST',
+          path: `/v1/trading/accounts/${encAcc}/positions/${encPos}/close`,
+          body: closeVol ? { volume: String(closeVol) } : {},
+        },
+        {
+          method: 'DELETE',
+          path: `/v2/trading/accounts/${encAcc}/positions/${encPos}`,
+        },
+        {
+          method: 'POST',
+          path: `/v1/trading/accounts/${encAcc}/positions/close`,
+          body: { position_id: positionId, ...(closeVol ? { volume: String(closeVol) } : {}) },
+        }
+      );
+      if (closeVol) {
+        closeStrategies.push({
+          method: 'DELETE',
+          path: `/v1/trading/accounts/${encAcc}/positions/${encPos}?volume=${encodeURIComponent(String(closeVol))}`,
+        });
+      }
+      if (cached && closeVol) {
+        const oppositeSide = cached.side === 'BUY' ? 'sell' : 'buy';
+        closeStrategies.push({
+          method: 'POST',
+          path: `/v1/trading/accounts/${encAcc}/positions`,
+          body: {
+            instrument: baseInst,
+            side: oppositeSide,
+            volume: String(closeVol),
+            position_id: positionId,
+          },
+        });
+      }
+    }
+
+    let closeConfirmed = false;
+    let lastErr: any = null;
+
+    for (const strat of closeStrategies) {
+      const idempotencyKey = `close-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+      try {
+        const raw = await this.signedRequest(strat.method, strat.path, strat.body, idempotencyKey);
+        const data = unwrap(raw) || {};
+        const operationId = String(data.operation_id ?? data.operationId ?? '');
+
+        if (operationId) {
+          let opRejected = false;
+          for (let i = 0; i < 5; i++) {
+            await new Promise((r) => setTimeout(r, 250));
+            try {
+              const opRaw = await this.signedRequest(
+                'GET',
+                `/v1/trading/accounts/${encAcc}/operations/${encodeURIComponent(operationId)}`
+              );
+              const opData = unwrap(opRaw) || opRaw || {};
+              const opStatus = String(opData?.status || '').toLowerCase();
+              if (['rejected', 'failed', 'error', 'cancelled', 'canceled'].includes(opStatus)) {
+                opRejected = true;
+                lastErr = new Error(`Close operation #${operationId} ${opStatus}: ${JSON.stringify(opData)}`);
+                break;
+              }
+              if (['confirmed', 'executed', 'filled', 'done', 'closed'].includes(opStatus)) {
+                break;
+              }
+            } catch {}
+          }
+          if (opRejected) {
+            continue;
+          }
+        }
+
+        closeConfirmed = true;
+        break;
+      } catch (err: any) {
+        lastErr = err;
+      }
+    }
+
+    if (closeConfirmed) {
       if (!isPartial) {
-        // Manual close (X) / trailing / panic: drop from activeForexPositions ledger BEFORE re-polling
         removeActiveForexPosition(accountId, positionId);
       }
 
-      await new Promise((r) => setTimeout(r, 150));
+      await new Promise((r) => setTimeout(r, 250));
       getGlobalExnessState().lastPositionsPollTime = 0;
-      await this.fetchOpenPositions().catch(() => {});
+      const latestAfterClose = await this.fetchOpenPositions().catch(() => [] as ManagedPosition[]);
+      const stillOnBroker =
+        !isPartial && latestAfterClose.some((p) => normPosId(p.id) === positionId && p.seenOnBroker !== false);
 
+      if (stillOnBroker) {
+        // Broker still reports the position open: keep it in openPositions without flickering and keep 15s cooldown
+        realTimeFeed.updatePosition(positionId, { isClosing: false, closingStartedAt: undefined });
+        markPositionClosingDone(positionId, false);
+        return {
+          success: false,
+          message: `Close #${positionId} belum terkonfirmasi di server Exness (cooldown 15s aktif).`,
+        };
+      }
+
+      markPositionClosingDone(positionId, true);
       const liveQuote = realTimeFeed.getLiveQuote(profile.symbol);
       const closePrice = cached?.side === 'BUY' ? liveQuote.bid : liveQuote.ask;
-      const realizedPnl = cached && closePrice ? calculatePnL(cached.side, cached.entryPrice, closePrice, volumeToClose || cached.volume, profile).pnlUsd : undefined;
+      const realizedPnl =
+        cached && closePrice
+          ? calculatePnL(cached.side, cached.entryPrice, closePrice, volumeToClose || cached.volume, profile).pnlUsd
+          : undefined;
 
       if (realizedPnl !== undefined) realTimeFeed.recordRealizedPnL(realizedPnl);
 
-      if (volumeToClose && cached && volumeToClose < cached.volume) {
+      if (isPartial && volumeToClose && cached) {
         const remaining = Number((cached.volume - volumeToClose).toFixed(2));
-        realTimeFeed.updatePosition(positionId, { volume: remaining, partialClosed: true });
+        realTimeFeed.updatePosition(positionId, {
+          volume: remaining,
+          partialClosed: true,
+          isClosing: false,
+          closingStartedAt: undefined,
+        });
         const ledgerEntry = getActiveForexPositionsForAccount(accountId).find((p) => normPosId(p.id) === positionId);
         if (ledgerEntry) {
-          saveActiveForexPosition(accountId, { ...ledgerEntry, volume: remaining, partialClosed: true });
+          saveActiveForexPosition(accountId, {
+            ...ledgerEntry,
+            volume: remaining,
+            partialClosed: true,
+            isClosing: false,
+            closingStartedAt: undefined,
+          });
         }
         const pnlTxt = realizedPnl !== undefined ? ` (${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)})` : '';
         const priceTxt = closePrice !== undefined ? ` @ ${formatPrice(closePrice, profile.digits)}` : '';
@@ -3224,32 +3426,50 @@ export class ExnessClient {
           closePrice,
         };
       }
-    } catch (err: any) {
-      // Local ledger position never confirmed on the broker (fallback / demo fill): close it locally
-      const ledgerEntry = getActiveForexPositionsForAccount(accountId).find((p) => normPosId(p.id) === positionId);
-      if (ledgerEntry && !ledgerEntry.seenOnBroker) {
-        const lq = realTimeFeed.getLiveQuote(ledgerEntry.symbol);
-        const localClosePx = ledgerEntry.side === 'BUY' ? lq.bid : lq.ask;
-        const localProfile = getPairProfile(ledgerEntry.symbol);
-        const isPartialLocal = Boolean(volumeToClose && volumeToClose < ledgerEntry.volume);
-        const closedVol = isPartialLocal ? roundLotVolume(Number(volumeToClose), localProfile.minLot, localProfile.lotStep) : ledgerEntry.volume;
-        const localPnl = calculatePnL(ledgerEntry.side, ledgerEntry.entryPrice, localClosePx, closedVol, localProfile).pnlUsd;
-        realTimeFeed.recordRealizedPnL(localPnl);
-        if (isPartialLocal) {
-          const remaining = Number((ledgerEntry.volume - closedVol).toFixed(2));
-          saveActiveForexPosition(accountId, { ...ledgerEntry, volume: remaining, partialClosed: true });
-        } else {
-          removeActiveForexPosition(accountId, positionId);
-        }
-        return {
-          success: true,
-          message: `${isPartialLocal ? `Partial Close: ${closedVol} lots of` : 'Position'} #${positionId} closed (local ledger) @ ${formatPrice(localClosePx, localProfile.digits)} (${localPnl >= 0 ? '+' : ''}$${localPnl.toFixed(2)})`,
-          realizedPnl: localPnl,
-          closePrice: localClosePx,
-        };
-      }
-      return { success: false, message: `Close #${positionId} gagal: ${err?.message || err}` };
     }
+
+    // Local ledger position never confirmed on the broker (fallback / demo fill): close it locally
+    const ledgerEntry = getActiveForexPositionsForAccount(accountId).find((p) => normPosId(p.id) === positionId);
+    if (ledgerEntry && !ledgerEntry.seenOnBroker) {
+      markPositionClosingDone(positionId, true);
+      const lq = realTimeFeed.getLiveQuote(ledgerEntry.symbol);
+      const localClosePx = ledgerEntry.side === 'BUY' ? lq.bid : lq.ask;
+      const localProfile = getPairProfile(ledgerEntry.symbol);
+      const isPartialLocal = Boolean(volumeToClose && volumeToClose < ledgerEntry.volume);
+      const closedVol = isPartialLocal
+        ? roundLotVolume(Number(volumeToClose), localProfile.minLot, localProfile.lotStep)
+        : ledgerEntry.volume;
+      const localPnl = calculatePnL(
+        ledgerEntry.side,
+        ledgerEntry.entryPrice,
+        localClosePx,
+        closedVol,
+        localProfile
+      ).pnlUsd;
+      realTimeFeed.recordRealizedPnL(localPnl);
+      if (isPartialLocal) {
+        const remaining = Number((ledgerEntry.volume - closedVol).toFixed(2));
+        saveActiveForexPosition(accountId, {
+          ...ledgerEntry,
+          volume: remaining,
+          partialClosed: true,
+          isClosing: false,
+          closingStartedAt: undefined,
+        });
+      } else {
+        removeActiveForexPosition(accountId, positionId);
+      }
+      return {
+        success: true,
+        message: `${isPartialLocal ? `Partial Close: ${closedVol} lots of` : 'Position'} #${positionId} closed (local ledger) @ ${formatPrice(localClosePx, localProfile.digits)} (${localPnl >= 0 ? '+' : ''}$${localPnl.toFixed(2)})`,
+        realizedPnl: localPnl,
+        closePrice: localClosePx,
+      };
+    }
+
+    realTimeFeed.updatePosition(positionId, { isClosing: false, closingStartedAt: undefined });
+    markPositionClosingDone(positionId, false);
+    return { success: false, message: `Close #${positionId} gagal: ${lastErr?.message || lastErr}` };
   }
 
   public async closeAllPositions(): Promise<{ closedCount: number; message: string }> {
