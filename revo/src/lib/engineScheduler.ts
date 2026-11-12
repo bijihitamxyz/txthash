@@ -50,6 +50,13 @@ import {
   getCryptoDynamicThreshold,
 } from '@/core/cryptoSignalEngine';
 import { computeIndicatorSnapshot } from '@/core/indicatorEngine';
+import { globalSingleton, withTimeout } from './globalSingleton';
+import { tryAcquireEngineLock, releaseEngineLock } from './engineLock';
+
+// Hard upper bound for one engine cycle. Every network call already has its own timeout,
+// this is the last line of defence so a single hung await can never freeze the engine forever.
+const FOREX_TICK_TIMEOUT_MS = Number(process.env.FOREX_TICK_TIMEOUT_MS || 75_000);
+const CRYPTO_TICK_TIMEOUT_MS = Number(process.env.CRYPTO_TICK_TIMEOUT_MS || 60_000);
 
 export interface SchedulerExecutionResult {
   executed: boolean;
@@ -62,8 +69,12 @@ export interface SchedulerExecutionResult {
 class EngineScheduler {
   private timer: NodeJS.Timeout | null = null;
   private isTickExecuting = false;
-  private tickIntervalMs = 3000; // 3 seconds per specification
+  private isCryptoTickExecuting = false;
+  private tickIntervalMs = Number(process.env.ENGINE_TICK_INTERVAL_MS) || 3000; // 3 seconds per specification
   private isInitialized = false;
+  public lastHeartbeatAt = 0;
+  public lastHeartbeatDurationMs = 0;
+  public lastHeartbeatMessage = '';
 
   // Crypto Room 2 Automation Controls
   public activeRoom: 'FOREX' | 'CRYPTO' = 'FOREX';
@@ -166,20 +177,24 @@ class EngineScheduler {
         clearInterval(this.timer);
       }
 
-      this.timer = setInterval(async () => {
-        try {
-          await this.heartbeatTick();
-        } catch (err) {
+      this.timer = setInterval(() => {
+        // Forex and Crypto run independently: a slow crypto exchange must never delay
+        // trailing stops on Exness (and vice versa).
+        this.heartbeatTick().catch((err) => {
           console.error('[EngineScheduler] Error during heartbeat tick:', err);
-        }
-        try {
-          // Strict idle gate: never touch Bitget/Binance unless crypto auto-trading is ON
-          // or the user is actively viewing the Crypto room (live in-memory flag).
-          if (this.cryptoAutoTradingEnabled || this.activeRoom === 'CRYPTO') {
-            await this.executeCryptoTick();
-          }
-        } catch {
-          // Keep crypto tick non-blocking
+        });
+
+        // Strict idle gate: never touch Bitget/Binance unless crypto auto-trading is ON
+        // or the user is actively viewing the Crypto room (live in-memory flag).
+        if ((this.cryptoAutoTradingEnabled || this.activeRoom === 'CRYPTO') && !this.isCryptoTickExecuting) {
+          this.isCryptoTickExecuting = true;
+          withTimeout(this.executeCryptoTick(), CRYPTO_TICK_TIMEOUT_MS, 'Crypto tick')
+            .catch((err) => {
+              console.warn(`[EngineScheduler] ${err?.message || err}`);
+            })
+            .finally(() => {
+              this.isCryptoTickExecuting = false;
+            });
         }
       }, this.tickIntervalMs);
 
@@ -213,8 +228,47 @@ class EngineScheduler {
       return { executed: false, timestamp: Date.now(), positions: [], telemetryCount: 0, message: 'Tick already in progress' };
     }
 
-    this.isTickExecuting = true;
+    // Cheap idle gate: skip lock + I/O entirely when auto-trading is off
+    const preState = await stateSync.getRuntimeState();
+    if (!preState.isAutoTrading) {
+      return {
+        executed: false,
+        timestamp: Date.now(),
+        positions: preState.positions || [],
+        telemetryCount: preState.telemetryLogs.length,
+        message: 'Auto-trading inactive (Engine Idle)',
+      };
+    }
 
+    // Shared lock with POST /api/engine-tick so only ONE forex engine cycle runs at a time
+    const lockToken = tryAcquireEngineLock('scheduler');
+    if (!lockToken) {
+      return { executed: false, timestamp: Date.now(), positions: [], telemetryCount: 0, message: 'Engine cycle already running (dashboard/daemon)' };
+    }
+
+    this.isTickExecuting = true;
+    const startedAt = Date.now();
+    try {
+      const result = await withTimeout(this.runHeartbeatTick(), FOREX_TICK_TIMEOUT_MS, 'Forex heartbeat tick');
+      this.lastHeartbeatMessage = result.message || (result.executed ? 'OK' : '');
+      return result;
+    } catch (err: any) {
+      // Timeout: release the flags so the next tick can run instead of freezing forever.
+      this.lastHeartbeatMessage = String(err?.message || err);
+      console.error(`[EngineScheduler] ${this.lastHeartbeatMessage} — releasing lock so the engine keeps running.`);
+      return { executed: false, timestamp: Date.now(), positions: [], telemetryCount: 0, message: this.lastHeartbeatMessage };
+    } finally {
+      this.isTickExecuting = false;
+      this.lastHeartbeatAt = Date.now();
+      this.lastHeartbeatDurationMs = this.lastHeartbeatAt - startedAt;
+      if (this.lastHeartbeatDurationMs > 15_000) {
+        console.warn(`[EngineScheduler] Slow forex tick: ${this.lastHeartbeatDurationMs}ms`);
+      }
+      releaseEngineLock(lockToken);
+    }
+  }
+
+  private async runHeartbeatTick(): Promise<SchedulerExecutionResult> {
     try {
       const state = await stateSync.getRuntimeState();
 
@@ -817,8 +871,6 @@ class EngineScheduler {
         telemetryCount: 0,
         message: err?.message || 'Heartbeat tick execution error',
       };
-    } finally {
-      this.isTickExecuting = false;
     }
   }
 
@@ -1264,15 +1316,15 @@ export async function routeCryptoKlines(symbol: string, interval: string = '5m',
   return await binance.getKlines(symbol, interval, limit);
 }
 
-// Global in-process singleton
+// Global in-process singleton.
+// IMPORTANT: must be pinned on globalThis in PRODUCTION too. Otherwise instrumentation.ts and every
+// route bundle create their own EngineScheduler => multiple 3s loops running in parallel on a VPS.
 const globalForScheduler = globalThis as unknown as {
   __exnessEngineScheduler?: EngineScheduler;
 };
 
 export const engineScheduler = globalForScheduler.__exnessEngineScheduler ?? new EngineScheduler();
-if (process.env.NODE_ENV !== 'production') {
-  globalForScheduler.__exnessEngineScheduler = engineScheduler;
-}
+globalForScheduler.__exnessEngineScheduler = engineScheduler;
 
 export function ensureSchedulerStarted() {
   try {

@@ -195,7 +195,9 @@ export class DualRoomProtectionEngine {
   }
 }
 
-export const dualRoomProtections = new DualRoomProtectionEngine();
+// Process-wide singleton (shared by scheduler + API routes even across separate Next.js bundles)
+export const dualRoomProtections: DualRoomProtectionEngine =
+  (globalThis as any).__nemesisDualRoomProtections ?? ((globalThis as any).__nemesisDualRoomProtections = new DualRoomProtectionEngine());
 export const freqtradeProtections = dualRoomProtections;
 
 export function hasRecentStopLoss(
@@ -276,7 +278,10 @@ class IdempotencyLockManager {
   }
 }
 
-export const idempotencyLocks = new IdempotencyLockManager();
+// Process-wide singleton: the anti-double-order lock MUST be shared between the scheduler and
+// POST /api/engine-tick, otherwise each bundle has its own lock and can fire the same signal twice.
+export const idempotencyLocks: IdempotencyLockManager =
+  (globalThis as any).__nemesisIdempotencyLocks ?? ((globalThis as any).__nemesisIdempotencyLocks = new IdempotencyLockManager());
 
 /**
  * Checks whether current UTC time is inside the Exness rollover blackout window (21:00 - 22:15 UTC)

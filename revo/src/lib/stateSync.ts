@@ -98,12 +98,17 @@ function getStateFilePath(): string {
   }
 }
 
+const PERSIST_MIN_INTERVAL_MS = Number(process.env.STATE_PERSIST_INTERVAL_MS || 5000);
+
 class StateSyncManager {
   private inMemoryState: BotRuntimeState = {
     ...DEFAULT_STATE,
     positions: [],
   };
   private isLoadedFromDisk = false;
+  private lastPersistAt = 0;
+  private persistTimer: NodeJS.Timeout | null = null;
+  private persistInFlight = false;
 
   constructor() {
     try {
@@ -250,6 +255,40 @@ class StateSyncManager {
   private async persistToDisk(): Promise<void> {
     // Keep in-memory singleton up to date
     globalThis.__EXNESS_BOT_STATE__ = { ...this.inMemoryState };
+
+    // Debounced/coalesced disk write: encrypting (PBKDF2 100k) + rewriting the whole state file on
+    // EVERY 3s tick burns CPU on small VPS instances. In-memory state is always authoritative;
+    // the disk copy is only for restart recovery, so writing at most every PERSIST_MIN_INTERVAL_MS is enough.
+    const now = Date.now();
+    const elapsed = now - this.lastPersistAt;
+    if (elapsed >= PERSIST_MIN_INTERVAL_MS && !this.persistInFlight) {
+      await this.writeStateToDisk();
+      return;
+    }
+    if (!this.persistTimer) {
+      const delay = Math.max(250, PERSIST_MIN_INTERVAL_MS - elapsed);
+      this.persistTimer = setTimeout(() => {
+        this.persistTimer = null;
+        this.writeStateToDisk().catch(() => {});
+      }, delay);
+      if (typeof this.persistTimer.unref === 'function') this.persistTimer.unref();
+    }
+  }
+
+  private async writeStateToDisk(): Promise<void> {
+    if (this.persistInFlight) {
+      // A write is already running; make sure the latest state is written afterwards
+      if (!this.persistTimer) {
+        this.persistTimer = setTimeout(() => {
+          this.persistTimer = null;
+          this.writeStateToDisk().catch(() => {});
+        }, 1000);
+        if (typeof this.persistTimer.unref === 'function') this.persistTimer.unref();
+      }
+      return;
+    }
+    this.persistInFlight = true;
+    this.lastPersistAt = Date.now();
     try {
       const json = JSON.stringify(this.inMemoryState);
       const encrypted = await encryptCredential(json);
@@ -261,9 +300,14 @@ class StateSyncManager {
       const targetFile = getStateFilePath();
       const dir = path.dirname(targetFile);
       safeMkdirSync(dir);
-      await fs.promises.writeFile(targetFile, encrypted, 'utf8');
+      // Atomic write (tmp + rename) so a crash/kill mid-write never leaves a corrupted state file
+      const tmpFile = `${targetFile}.tmp`;
+      await fs.promises.writeFile(tmpFile, encrypted, 'utf8');
+      await fs.promises.rename(tmpFile, targetFile);
     } catch {
       // Silently fall back to in-memory globalThis.__EXNESS_BOT_STATE__ singleton without throwing any error
+    } finally {
+      this.persistInFlight = false;
     }
   }
 
@@ -287,15 +331,13 @@ class StateSyncManager {
   }
 }
 
-// Global singleton instance for Node.js process
+// Global singleton instance for Node.js process (pinned in production too, see globalSingleton.ts)
 const globalForStateSync = globalThis as unknown as {
   __exnessStateSyncManager?: StateSyncManager;
 };
 
 export const stateSync = globalForStateSync.__exnessStateSyncManager ?? new StateSyncManager();
-if (process.env.NODE_ENV !== 'production') {
-  globalForStateSync.__exnessStateSyncManager = stateSync;
-}
+globalForStateSync.__exnessStateSyncManager = stateSync;
 
 if (typeof globalThis !== 'undefined') {
   (globalThis as any).__emitVaultTelemetry = (category: string, message: string) => {

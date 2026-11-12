@@ -22,6 +22,7 @@ import {
 import { stateSync, TargetMarket } from '@/lib/stateSync';
 import { ensureSchedulerStarted } from '@/lib/engineScheduler';
 import { getActiveExnessCredentials } from '@/lib/cryptoVault';
+import { tryAcquireEngineLock, releaseEngineLock } from '@/lib/engineLock';
 import {
   readCentralAiConfig,
   getActiveAiProviders,
@@ -104,6 +105,7 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   const telemetryLogs: EngineTickTelemetry[] = [];
+  let lockToken = 0;
   try {
     // Ensure the background engine scheduler is running inside the Node.js server process
     ensureSchedulerStarted();
@@ -118,6 +120,24 @@ export async function POST(req: NextRequest) {
     } catch {}
 
     const runtimeState = await stateSync.getRuntimeState();
+
+    // Acquire execution lock so API tick does not collide with the in-process 3s scheduler
+    lockToken = tryAcquireEngineLock('api-tick');
+    if (!lockToken) {
+      // Background scheduler or another tick is already actively running right now.
+      // Return fresh state immediately to avoid parallel broker spam or request queuing.
+      return NextResponse.json({
+        ok: true,
+        success: true,
+        circuitBreakerTriggered: runtimeState.circuitBreakerTriggered || false,
+        telemetry: runtimeState.telemetryLogs || [],
+        positions: runtimeState.positions || [],
+        orders: [],
+        closedTrades: [],
+        inFlight: true,
+      }, { status: 200 });
+    }
+
     const activeCreds = getActiveExnessCredentials(runtimeState.credentials);
 
     // Exness credentials are ALWAYS loaded from the server-side AES vault or rehydrated from session.
@@ -679,5 +699,9 @@ export async function POST(req: NextRequest) {
       },
       { status: 200 }
     );
+  } finally {
+    if (lockToken) {
+      releaseEngineLock(lockToken);
+    }
   }
 }

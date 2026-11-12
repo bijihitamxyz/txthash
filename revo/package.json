@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev --webpack",
-    "start": "next dev --webpack -p 3000",
+    "start": "next start -p 3000",
+    "start:dev": "next dev --webpack -p 3000",
     "prod:build": "next build --webpack",
     "build": "next build --webpack",
     "lint": "node --max-old-space-size=400 ./node_modules/typescript/bin/tsc --noEmit",

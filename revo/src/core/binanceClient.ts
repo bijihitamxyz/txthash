@@ -157,6 +157,7 @@ export class BinanceFuturesClient {
     try {
       const res = await fetch(`${this.baseUrl}/fapi/v1/exchangeInfo`, {
         headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(7000),
       });
 
       if (!res.ok) {
@@ -212,6 +213,7 @@ export class BinanceFuturesClient {
     try {
       const res = await fetch(`${this.baseUrl}/fapi/v1/ticker/24hr`, {
         headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(6000),
       });
 
       if (!res.ok) throw new Error(`Binance ticker/24hr HTTP ${res.status}`);
@@ -252,7 +254,7 @@ export class BinanceFuturesClient {
     else if (interval === 'H1') binanceInterval = '1h';
 
     const url = `${this.baseUrl}/fapi/v1/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
-    const res = await fetch(url, { headers: { 'Content-Type': 'application/json' } });
+    const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(6000) });
 
     if (!res.ok) {
       throw new Error(`Binance klines HTTP ${res.status}: ${res.statusText}`);
@@ -276,7 +278,7 @@ export class BinanceFuturesClient {
     const url = symbol
       ? `${this.baseUrl}/fapi/v1/premiumIndex?symbol=${symbol}`
       : `${this.baseUrl}/fapi/v1/premiumIndex?symbol=BTCUSDT`;
-    const res = await fetch(url, { headers: { 'Content-Type': 'application/json' } });
+    const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(6000) });
     if (!res.ok) throw new Error(`Binance premiumIndex HTTP ${res.status}`);
     const data = await res.json();
     return {
@@ -314,6 +316,7 @@ export class BinanceFuturesClient {
         'X-MBX-APIKEY': this.apiKey,
         'Content-Type': 'application/json',
       },
+      signal: AbortSignal.timeout(6000),
     });
 
     if (!res.ok) {
@@ -371,6 +374,7 @@ export class BinanceFuturesClient {
         'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: signedQuery,
+      signal: AbortSignal.timeout(6000),
     });
 
     if (!res.ok) {
@@ -398,6 +402,7 @@ export class BinanceFuturesClient {
         'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: signedQuery,
+      signal: AbortSignal.timeout(6000),
     });
 
     if (!res.ok) {
@@ -454,6 +459,7 @@ export class BinanceFuturesClient {
         'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: signedQuery,
+      signal: AbortSignal.timeout(7000),
     });
 
     if (!res.ok) {

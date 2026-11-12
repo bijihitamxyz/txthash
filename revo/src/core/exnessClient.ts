@@ -899,20 +899,60 @@ export function getGlobalExnessState(): ExnessCoreState {
 // SERIALIZED REST THROTTLER (STRICT 1200ms SPACING)
 // ==========================================
 
+export interface ThrottlerScheduleOptions {
+  /** HTTP method. Non-GET (orders / close / modify SL) jump ahead of read-only polling. */
+  method?: string;
+  /** Max time a READ request may wait in the queue before it is dropped as stale. */
+  maxQueueWaitMs?: number;
+}
+
+const THROTTLER_MIN_SPACING_MS = Number(process.env.EXNESS_MIN_REQUEST_SPACING_MS || 1200);
+const THROTTLER_MAX_READ_QUEUE_WAIT_MS = Number(process.env.EXNESS_MAX_QUEUE_WAIT_MS || 15000);
+
 export class ExnessRestThrottler {
   private queue: Array<{
     task: () => Promise<any>;
     resolve: (val: any) => void;
     reject: (err: any) => void;
+    priority: boolean;
+    enqueuedAt: number;
+    maxWaitMs: number;
   }> = [];
   private isProcessing = false;
   private lastRequestTime = 0;
-  private readonly minSpacingMs = 1200;
+  private readonly minSpacingMs = THROTTLER_MIN_SPACING_MS;
   private backoffUntil = 0;
+  private lastQueueWarnAt = 0;
 
-  public async schedule<T>(task: () => Promise<T>): Promise<T> {
+  public getQueueLength(): number {
+    return this.queue.length;
+  }
+
+  public async schedule<T>(task: () => Promise<T>, opts: ThrottlerScheduleOptions = {}): Promise<T> {
+    const method = String(opts.method || 'GET').toUpperCase();
+    const priority = method !== 'GET';
     return new Promise<T>((resolve, reject) => {
-      this.queue.push({ task, resolve, reject });
+      const item = {
+        task,
+        resolve,
+        reject,
+        priority,
+        enqueuedAt: Date.now(),
+        // Trading actions are never dropped; read-only polling becomes stale quickly
+        maxWaitMs: priority ? Number.POSITIVE_INFINITY : (opts.maxQueueWaitMs ?? THROTTLER_MAX_READ_QUEUE_WAIT_MS),
+      };
+      if (priority) {
+        // Insert after other priority items but before all read-only requests
+        const firstReadIdx = this.queue.findIndex((q) => !q.priority);
+        if (firstReadIdx === -1) this.queue.push(item);
+        else this.queue.splice(firstReadIdx, 0, item);
+      } else {
+        this.queue.push(item);
+      }
+      if (this.queue.length >= 15 && Date.now() - this.lastQueueWarnAt > 30000) {
+        this.lastQueueWarnAt = Date.now();
+        console.warn(`[ExnessThrottler] REST queue backlog: ${this.queue.length} pending requests (spacing ${this.minSpacingMs}ms).`);
+      }
       this.processQueue();
     });
   }
@@ -927,11 +967,8 @@ export class ExnessRestThrottler {
     if (this.isProcessing) return;
     this.isProcessing = true;
 
-    while (this.queue.length > 0) {
-      const item = this.queue.shift();
-      if (!item) continue;
-
-      try {
+    try {
+      while (this.queue.length > 0) {
         const now = Date.now();
         if (this.backoffUntil > now) {
           const waitMs = this.backoffUntil - now;
@@ -943,19 +980,35 @@ export class ExnessRestThrottler {
           await new Promise((r) => setTimeout(r, this.minSpacingMs - elapsed));
         }
 
-        this.lastRequestTime = Date.now();
-        const res = await item.task();
-        item.resolve(res);
-      } catch (err) {
-        item.reject(err);
-      }
-    }
+        // Pick the item AFTER waiting so a priority order that arrived meanwhile goes first
+        const item = this.queue.shift();
+        if (!item) continue;
 
-    this.isProcessing = false;
+        // Drop stale read requests instead of executing them late (prevents unbounded backlog)
+        const waited = Date.now() - item.enqueuedAt;
+        if (waited > item.maxWaitMs) {
+          item.reject(new Error(`Exness REST request dropped after waiting ${waited}ms in throttler queue (backlog ${this.queue.length}).`));
+          continue;
+        }
+
+        try {
+          this.lastRequestTime = Date.now();
+          const res = await item.task();
+          item.resolve(res);
+        } catch (err) {
+          item.reject(err);
+        }
+      }
+    } finally {
+      this.isProcessing = false;
+    }
   }
 }
 
-export const exnessRestThrottler = new ExnessRestThrottler();
+// Process-wide singleton: a second throttler instance (separate Next.js bundle) would double
+// the request rate and trigger HTTP 429 back-offs from Exness.
+export const exnessRestThrottler: ExnessRestThrottler =
+  (globalThis as any).__exnessRestThrottler ?? ((globalThis as any).__exnessRestThrottler = new ExnessRestThrottler());
 
 // ==========================================
 // IN-MEMORY CANDLE CACHE & WS TICK AGGREGATOR
@@ -969,7 +1022,22 @@ export interface CandleCacheEntry {
   ttlMs: number;
 }
 
-export const exnessCandleMemoryCache = new Map<string, CandleCacheEntry>();
+export const exnessCandleMemoryCache: Map<string, CandleCacheEntry> =
+  (globalThis as any).__exnessCandleMemoryCache ?? ((globalThis as any).__exnessCandleMemoryCache = new Map<string, CandleCacheEntry>());
+
+/** Timestamp of the last tick received over the Exness WebSocket (0 = never). */
+export function getLastWsTickAt(): number {
+  return Number((globalThis as any).__exnessLastWsTickAt || 0);
+}
+
+function markWsTick(): void {
+  (globalThis as any).__exnessLastWsTickAt = Date.now();
+}
+
+/** True if live WebSocket ticks arrived recently (prices are streaming). */
+export function isWsTickStreamAlive(maxAgeMs: number = 15000): boolean {
+  return Date.now() - getLastWsTickAt() < maxAgeMs;
+}
 
 export function getCandleTtlMs(timeframe: string): number {
   const tf = timeframe.toUpperCase();
@@ -1507,7 +1575,8 @@ export class RealTimeMarketFeed {
   }
 }
 
-export const realTimeFeed = new RealTimeMarketFeed();
+export const realTimeFeed: RealTimeMarketFeed =
+  (globalThis as any).__exnessRealTimeFeed ?? ((globalThis as any).__exnessRealTimeFeed = new RealTimeMarketFeed());
 
 // ==========================================
 // DATA UNWRAPPING & NORMALIZATION
@@ -1860,21 +1929,39 @@ export async function resolveAccessPoint(
         timestampMs: getSyncedTimestamp(),
       });
 
-      const { signal, cleanup } = createTimeoutSignal(7000);
       let res: Response;
       let rawBody = '';
       const resHeadersObj: Record<string, string> = {};
 
-      try {
+      {
+        // NOTE: the timeout signal is created INSIDE the throttled task. Previously it was created
+        // before queueing, so time spent waiting in the REST queue counted against the 7s budget and
+        // discovery aborted before the request was even sent whenever the queue was busy.
         const fetchResult = await exnessRestThrottler.schedule(async () => {
-          const r = await fetch(fullDiscoveryUrl, {
-            method: 'GET',
-            headers,
-            signal,
-            cache: 'no-store',
-          });
-          const b = await r.text().catch(() => '');
-          return { res: r, rawBody: b };
+          const { signal, cleanup } = createTimeoutSignal(7000);
+          try {
+            // Re-sign right before sending: the request may have waited in the queue, and a stale
+            // signature timestamp would be rejected as clock drift.
+            const freshHeaders = buildExnessAuthHeaders({
+              apiKey: cleanApiKey,
+              privateKey,
+              method: 'GET',
+              path: discoveryPath,
+              bodyStr: '',
+              idempotencyKey: '',
+              timestampMs: getSyncedTimestamp(),
+            });
+            const r = await fetch(fullDiscoveryUrl, {
+              method: 'GET',
+              headers: freshHeaders || headers,
+              signal,
+              cache: 'no-store',
+            });
+            const b = await r.text().catch(() => '');
+            return { res: r, rawBody: b };
+          } finally {
+            cleanup();
+          }
         });
         res = fetchResult.res;
         rawBody = fetchResult.rawBody;
@@ -1882,8 +1969,6 @@ export async function resolveAccessPoint(
           resHeadersObj[key] = val;
         });
         updateExnessTimeOffsetFromHeaders(res.headers);
-      } finally {
-        cleanup();
       }
 
       // Check for timestamp drift (code: 1001, "outside allowed window", AUTH_INVALID_SIGNATURE)
@@ -2125,7 +2210,49 @@ class ExnessWebSocketManager {
   private initStreams(): void {
     if (!this.lastCreds || !this.activeAccountId) return;
     const { accessPoint, accountId, apiKey, privateKey } = this.lastCreds;
+    this.initStreamsInner(accessPoint, accountId, apiKey, privateKey);
+    if (this.ticksWs) this.attachKeepAlive(this.ticksWs, 'Ticks');
+    if (this.eventsWs) this.attachKeepAlive(this.eventsWs, 'Events');
+  }
 
+  /**
+   * Ping/pong keep-alive. On VPS/cloud networks idle TCP connections are often silently dropped by
+   * NAT/firewalls without a FIN, so 'close' never fires and the bot keeps a dead socket forever
+   * (prices freeze). If no pong arrives within 2 ping intervals the socket is terminated, which
+   * triggers the normal 'close' → scheduleReconnect() path.
+   */
+  private attachKeepAlive(ws: WebSocket, label: 'Ticks' | 'Events'): void {
+    const anyWs = ws as any;
+    if (anyWs.__keepAliveAttached) return;
+    anyWs.__keepAliveAttached = true;
+    const PING_INTERVAL_MS = Number(process.env.EXNESS_WS_PING_MS || 20000);
+    let lastPong = Date.now();
+    ws.on('pong', () => {
+      lastPong = Date.now();
+    });
+    ws.on('message', () => {
+      lastPong = Date.now();
+    });
+    const timer = setInterval(() => {
+      try {
+        if (ws.readyState !== WebSocket.OPEN) {
+          if (ws.readyState === WebSocket.CLOSED) clearInterval(timer);
+          return;
+        }
+        if (Date.now() - lastPong > PING_INTERVAL_MS * 2.5) {
+          console.warn(`[ExnessWS] ${label} stream unresponsive (no pong for ${Math.round((Date.now() - lastPong) / 1000)}s). Terminating to force reconnect.`);
+          clearInterval(timer);
+          ws.terminate();
+          return;
+        }
+        ws.ping();
+      } catch {}
+    }, PING_INTERVAL_MS);
+    if (typeof (timer as any).unref === 'function') (timer as any).unref();
+    ws.on('close', () => clearInterval(timer));
+  }
+
+  private initStreamsInner(accessPoint: string, accountId: string, apiKey: string, privateKey: string): void {
     let host = 'api.exness-api.com';
     try {
       host = new URL(accessPoint).host;
@@ -2191,6 +2318,7 @@ class ExnessWebSocketManager {
             const bid = num(t.bid, t.price, t.b);
             const ask = num(t.ask, t.a);
             if (inst && bid && bid > 0) {
+              markWsTick();
               const baseInst = inst.replace(/m$/i, '');
               const suffixedInst = `${baseInst}m`;
               realTimeFeed.updateQuote(baseInst, bid, ask);
@@ -2399,7 +2527,10 @@ class ExnessWebSocketManager {
   }
 }
 
-export const exnessWsManager = new ExnessWebSocketManager();
+// Process-wide singleton: separate Next.js bundles must NOT open duplicate WebSocket streams
+// (Exness rejects parallel handshakes with HTTP 429 → long reconnect back-offs → frozen prices).
+export const exnessWsManager: ExnessWebSocketManager =
+  (globalThis as any).__exnessWsManager ?? ((globalThis as any).__exnessWsManager = new ExnessWebSocketManager());
 
 // ==========================================
 // 4. BULLETPROOF EXNESS CLIENT CLASS
@@ -2590,7 +2721,7 @@ export class ExnessClient {
       }
 
       return data as T;
-    });
+    }, { method });
   }
 
   /**
@@ -3749,6 +3880,11 @@ export class ExnessClient {
     // If realTimeFeed has a fresh quote with bid > 0, return it
     if (existing && existing.bid > 0) {
       if (!cleanSym.startsWith('XAU') || (existing.bid >= 1500 && Math.abs(existing.bid - 3875.70) > 1.0)) {
+        // WebSocket down/rejected (common on VPS): refresh in background so prices don't freeze
+        // until the 3-minute candle cache expires. Non-blocking so the engine tick never waits on it.
+        if (this.hasCredentials() && !isWsTickStreamAlive()) {
+          this.refreshStaleQuote(cleanSym).catch(() => {});
+        }
         return existing;
       }
     }
@@ -3773,6 +3909,61 @@ export class ExnessClient {
 
   public async getSymbolQuote(symbolSnapshot: string): Promise<LiveQuote> {
     return this.getQuote(symbolSnapshot);
+  }
+
+  /**
+   * REST fallback for live prices when the WebSocket tick stream is not delivering.
+   * Fetches the last ~20 minutes of M1 candles (small payload) and feeds the latest close into the
+   * quote feed and every cached candle series. Budgeted globally (1 request / 3s across all symbols)
+   * and backs off for 5 minutes per symbol when the market is closed, so it never floods the
+   * shared 1.2s REST queue.
+   */
+  private async refreshStaleQuote(cleanSym: string): Promise<void> {
+    const g = globalThis as any;
+    const now = Date.now();
+    const quote = realTimeFeed.getLiveQuote(cleanSym);
+    if (quote && now - (quote.timestamp || 0) < 5000) return; // already fresh enough
+
+    g.__exnessStaleQuoteState = g.__exnessStaleQuoteState || { lastAt: 0, inFlight: {} as Record<string, boolean>, cooldown: {} as Record<string, number> };
+    const st = g.__exnessStaleQuoteState as { lastAt: number; inFlight: Record<string, boolean>; cooldown: Record<string, number> };
+    if (st.inFlight[cleanSym]) return;
+    if ((st.cooldown[cleanSym] || 0) > now) return;
+    if (now - st.lastAt < 3000) return;
+    if (exnessRestThrottler.getQueueLength() > 6) return; // REST queue busy: trading calls first
+
+    const accountId = String(this.credentials.accountId || '').trim();
+    if (!accountId) return;
+
+    st.lastAt = now;
+    st.inFlight[cleanSym] = true;
+    try {
+      const baseInst = cleanSym.endsWith('m') ? cleanSym.slice(0, -1) : cleanSym;
+      const from = new Date(now - 20 * 60 * 1000).toISOString();
+      const to = new Date(now).toISOString();
+      const path = `/v1/market-data/accounts/${encodeURIComponent(accountId)}/candles?instrument=${encodeURIComponent(baseInst)}&timeframe=M1&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
+      const raw = await this.signedRequest('GET', path);
+      const list: any[] = Array.isArray(raw?.candles) ? raw.candles : [];
+      if (list.length === 0) {
+        st.cooldown[cleanSym] = Date.now() + 5 * 60 * 1000; // market closed / no data
+        return;
+      }
+      const last = list[list.length - 1];
+      const close = Number(last?.close);
+      const lastTs = toMs(last?.time);
+      if (lastTs && Date.now() - lastTs > 10 * 60 * 1000) {
+        st.cooldown[cleanSym] = Date.now() + 5 * 60 * 1000; // stale bar → market closed
+      }
+      if (close > 0) {
+        const profile = getPairProfile(cleanSym);
+        const spread = cleanSym.startsWith('XAU') ? 0.20 : profile.pipValue;
+        realTimeFeed.updateQuote(cleanSym, close, close + spread);
+        updateCachedCandlesWithTick(baseInst, close);
+      }
+    } catch {
+      // ignore: next tick retries within budget
+    } finally {
+      st.inFlight[cleanSym] = false;
+    }
   }
 
   public async getCandles(symbol: string, timeframe: string = 'M5', limit: number = 80): Promise<Candle[]> {
