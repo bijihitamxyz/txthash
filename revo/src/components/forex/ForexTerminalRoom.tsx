@@ -167,54 +167,42 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
     initTerminal();
   }, [isActiveRoom]);
 
-  // When room becomes active from background, fetch fresh forex data immediately
+  // When room becomes active from background, rehydrate immediately from VPS server
   useEffect(() => {
     if (isActiveRoom) {
-      useTradingStore.getState().executeLiveTickStream().catch(() => {});
+      useTradingStore.getState().hydrateFromServer().catch(() => {});
       useTradingStore.getState().fetchAccountInfo().catch(() => {});
       useTradingStore.getState().fetchKronosPrediction().catch(() => {});
     }
   }, [isActiveRoom]);
 
-  // Real-time Kronos + Multi-AI forecast sync via POST /api/kronos
-  const lastCandleClose = candles && candles.length > 0 ? candles[candles.length - 1]?.close : 0;
+  // Auto-Rehydrate instantaneously (0ms delay) when user switches back to Chrome from another app or regains window focus
   useEffect(() => {
-    if (!isForexActive && !isAutoTrading && (!openPositions || openPositions.length === 0)) return;
-    let isCancelled = false;
-    const syncKronosVps = async () => {
-      const state = useTradingStore.getState();
-      try {
-        const res = await fetch('/api/kronos', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            symbol: activeSymbol,
-            timeframe,
-            candles: (state.candles || []).slice(-60),
-          }),
-        });
-        if (!isCancelled && res.ok) {
-          const data = await res.json();
-          if (data.ok || data.success) {
-            useTradingStore.setState({
-              kronosPrediction: {
-                ...data,
-                symbol: activeSymbol,
-                timeframe,
-              },
-            });
-          }
-        }
-      } catch {}
+    const handleInstantRehydrate = () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      const st = useTradingStore.getState();
+      st.hydrateFromServer().catch(() => {});
+      st.fetchQuote(st.focusSymbol || st.selectedSymbol || 'XAUUSDm').catch(() => {});
     };
 
-    syncKronosVps();
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleInstantRehydrate);
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', handleInstantRehydrate);
+    }
+
     return () => {
-      isCancelled = true;
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleInstantRehydrate);
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('focus', handleInstantRehydrate);
+      }
     };
-  }, [isForexActive, activeSymbol, timeframe, lastCandleClose]);
+  }, []);
 
-  // Singleton Coordinated Tick, Health Polling & Execution Loop
+  // Pure Read-Only VPS Status Polling Loop (2s interval) — Browser NEVER drives trading, SL/TP, or AI execution
   useEffect(() => {
     if (isDashboardLoopRunning || loopLockRef.current) {
       return;
@@ -223,83 +211,42 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
     loopLockRef.current = true;
 
     let tickCounter = 0;
-    let isExecuting = false;
+    let isPolling = false;
 
-    useTradingStore.getState().executeLiveTickStream().catch(() => {});
+    useTradingStore.getState().hydrateFromServer().catch(() => {});
 
     const intervalId = setInterval(async () => {
-      if (isExecuting) return;
-      isExecuting = true;
+      if (isPolling) return;
+      isPolling = true;
       try {
         if (typeof document !== 'undefined' && document.hidden) return;
         tickCounter++;
         const st = useTradingStore.getState();
         const currentRoom = useRoomStore.getState().activeRoom;
         const currentIsForexActive = isActiveRoom && currentRoom !== 'CRYPTO' && currentRoom !== 'ROOM_2_BINANCE';
-        const isAuto = st.isAutoTrading;
-        const rawOpen =
-          Array.isArray(st.openPositions) && st.openPositions.length > 0
-            ? st.openPositions
-            : Array.isArray(st.positions)
-            ? st.positions
-            : [];
-        const currentOpenList = rawOpen.filter((p) => p && p.id !== 'F-637' && p.id !== '#F-637');
-        const hasPositions = currentOpenList.length > 0;
-        const isFullCapacity = currentOpenList.length >= MAX_OPEN_POSITIONS;
 
-        if (!currentIsForexActive && !isAuto && !hasPositions) {
+        if (!currentIsForexActive && !st.isAutoTrading) {
           return;
         }
 
-        // 1. Real-time GET /api/kronos health polling every ~9s
-        if (tickCounter % 3 === 0) {
-          await st.checkKronosHealth();
-        }
+        // 1. Read-Only Poll of VPS Node.js Engine State (GET /api/engine-tick) every 2s
+        await st.hydrateFromServer();
 
-        // 2. Forex tick stream & Trailing Stop Guardian execution
-        await st.executeLiveTickStream();
+        // 2. Refresh live chart quote for focused symbol
+        const sym = st.focusSymbol || st.selectedSymbol || 'XAUUSDm';
+        await st.fetchQuote(sym);
 
-        if (isFullCapacity) {
-          // Slot 2/2 Full: Entry Scanner IDLE — Log ONLY ONCE on transition into full capacity
-          if (!hasLoggedFullCapacityTransition) {
-            hasLoggedFullCapacityTransition = true;
-            const guardMsg =
-              '[POSITION-GUARD] Slot 2/2 terisi penuh — Entry Scanner IDLE. Mengalihkan pemrosesan ke Prediksi Arah & Trailing Stop.';
-            const alreadyLogged = (st.telemetryLogs || [])
-              .slice(0, 8)
-              .some((l) => l.message.includes('[POSITION-GUARD] Slot'));
-            if (!alreadyLogged) {
-              const sym = st.focusSymbol || st.selectedSymbol || currentOpenList[0]?.symbol || 'XAUUSDm';
-              st.addTelemetryLog(sym, 'AI', guardMsg);
-            }
-          }
-          // Reallocate cycle strictly to Forward Market Forecast & Trailing Stop Management (no entry calls)
-          if (tickCounter % 2 === 0) {
-            await st.fetchKronosPrediction();
-          }
-        } else {
-          hasLoggedFullCapacityTransition = false;
-          if (isAuto) {
-            await st.executeEngineTick();
-          }
-        }
-
+        // 3. Lightweight display-only health & account refresh every ~8s
         if (tickCounter % 4 === 0) {
-          await useTradingStore.getState().fetchAccountInfo();
-          if (!isFullCapacity) {
-            await useTradingStore.getState().fetchKronosPrediction();
-          }
-        }
-
-        if (tickCounter % 8 === 0) {
-          await useTradingStore.getState().syncWithServerState();
+          await st.checkKronosHealth();
+          await st.fetchAccountInfo();
         }
       } catch (err) {
-        console.error('[NMSSx Execution Loop] Error:', err);
+        console.error('[NMSSx Read-Only Monitor Poll] Error:', err);
       } finally {
-        isExecuting = false;
+        isPolling = false;
       }
-    }, 3000);
+    }, 2000);
 
     return () => {
       clearInterval(intervalId);

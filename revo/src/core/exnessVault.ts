@@ -10,7 +10,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { getDataDir, safeMkdirSync, getNemesisMemoryStore } from '@/lib/dataStore';
+import { getDataDir, safeMkdirSync, getNemesisMemoryStore, isServerless } from '@/lib/dataStore';
 
 export type AccountMode = 'DEMO' | 'REAL';
 
@@ -149,7 +149,17 @@ export async function saveVaultCredentials(creds: ExnessVaultCredentials): Promi
     const targetPath = getVaultFilePath();
     const targetDir = path.dirname(targetPath);
     safeMkdirSync(targetDir);
-    await fs.promises.writeFile(targetPath, JSON.stringify(encrypted, null, 2), 'utf8');
+    await fs.promises.writeFile(targetPath, JSON.stringify(encrypted, null, 2), { encoding: 'utf8', mode: 0o600 });
+
+    // Also persist to VPS data/ directory so credentials survive restarts & are immediately available to engineScheduler
+    if (!isServerless()) {
+      const vpsDataDir = path.join(process.cwd(), 'data');
+      safeMkdirSync(vpsDataDir);
+      const vpsVaultPath = path.join(vpsDataDir, 'exness-vault.enc');
+      if (vpsVaultPath !== targetPath) {
+        await fs.promises.writeFile(vpsVaultPath, JSON.stringify(encrypted, null, 2), { encoding: 'utf8', mode: 0o600 });
+      }
+    }
   } catch (fsErr) {
     console.warn('[exnessVault] Filesystem write failed, running in memory-only fallback:', fsErr);
   }
@@ -293,6 +303,12 @@ export async function clearVaultCredentials(): Promise<void> {
     const targetPath = getVaultFilePath();
     if (fs.existsSync(targetPath)) {
       await fs.promises.unlink(targetPath);
+    }
+    if (!isServerless()) {
+      const vpsVaultPath = path.join(process.cwd(), 'data', 'exness-vault.enc');
+      if (vpsVaultPath !== targetPath && fs.existsSync(vpsVaultPath)) {
+        await fs.promises.unlink(vpsVaultPath);
+      }
     }
   } catch (err) {
     console.warn('[exnessVault] clearVaultCredentials unlink warning:', err);

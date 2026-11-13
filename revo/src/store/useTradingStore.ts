@@ -16,7 +16,6 @@ import { AccountInfo, LiveQuote } from '@/core/exnessClient';
 import { Candle, Timeframe, timeframeToMs, resampleCandles } from '@/core/indicatorEngine';
 import {
   ManagedPosition,
-  evaluatePositionTrailing,
   sanitizePositionSlTp,
   canAttemptPositionClose,
   markPositionClosingStart,
@@ -353,6 +352,16 @@ export interface TradingState {
   candles: Candle[];
   kronosPrediction: KronosForecastResult | null;
   kronosHealth: KronosHealthResult | null;
+  latestAiVerdict: {
+    symbol: string;
+    decision: string;
+    confidence_score: number;
+    dynamicThreshold: number;
+    source: string;
+    reasoning: string;
+    timestamp: number;
+  } | null;
+  entryScannerState: string;
 
   // 5. Active Positions & Telemetry Logs
   telemetryLogs: TelemetryItem[];
@@ -485,6 +494,8 @@ export const useTradingStore = create<TradingState>()(
       symbolPrices: getPersistedSymbolPrices(),
       candles: createLocalFallbackCandles(defaultFocusSymbol, 50, defaultTimeframe),
       kronosPrediction: null,
+      latestAiVerdict: null,
+      entryScannerState: 'IDLE',
       kronosHealth: null,
       getSymbolQuote: (sym: string) => {
         const p = getPairProfile(sym);
@@ -769,12 +780,6 @@ export const useTradingStore = create<TradingState>()(
             payload,
           }),
         }).catch(() => {});
-
-        fetch('/api/engine-tick', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        }).catch(() => {});
       },
 
       setFocusSymbol: (symbol: string) => {
@@ -908,15 +913,6 @@ export const useTradingStore = create<TradingState>()(
             }),
           });
         } catch {}
-        try {
-          await fetch('/api/engine-tick', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              orderVolume: valid,
-            }),
-          });
-        } catch {}
       },
 
       setStopLossPips: async (pips: number) => {
@@ -964,11 +960,6 @@ export const useTradingStore = create<TradingState>()(
             action: 'sync-state',
             payload: { enablePartialClose: enabled },
           }),
-        }).catch(() => {});
-        fetch('/api/engine-tick', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ enablePartialClose: enabled }),
         }).catch(() => {});
       },
 
@@ -1873,506 +1864,19 @@ export const useTradingStore = create<TradingState>()(
         } catch {}
       },
 
+      // Pure Read-Only Monitor: All trading, SL/TP & Trailing Stop execution runs autonomously on VPS Node.js backend.
       executeLiveTickStream: async () => {
         const state = get();
         const activeSym = state.focusSymbol || state.selectedSymbol || 'XAUUSDm';
-        const openPositions = state.openPositions || state.positions || [];
-        const openSyms = openPositions.map((p) => p.symbol);
-        const symbolsToFetch = Array.from(new Set([activeSym, ...openSyms]));
-
-        // Continuously update live bid / ask for active symbol and all open positions
-        await Promise.all(symbolsToFetch.map((sym) => get().fetchQuote(sym)));
-
-        // Advance Tight ATR Trailing Stop smoothly in real time
-        const freshState = get();
-        const currentOpenPositions = freshState.openPositions || freshState.positions || [];
-        if (currentOpenPositions.length === 0) return;
-
-        const liveCreds = getActiveExnessCredentials(freshState.credentials);
-        const credsPayload = {
-          accountId: liveCreds.accountId || '30000143146',
-          server: liveCreds.server,
-          apiKey: liveCreds.apiKey,
-          token: liveCreds.apiKey,
-          secret: liveCreds.secret,
-          privateKey: liveCreds.secret,
-          password: liveCreds.password,
-          mode: liveCreds.mode || freshState.accountMode || 'DEMO',
-          initialBalance: liveCreds.initialBalance,
-        };
-
-        let hasModifiedPosition = false;
-        const updatedPositions: ManagedPosition[] = [];
-
-        for (const pos of currentOpenPositions) {
-          const profile = getPairProfile(pos.symbol);
-          const q = freshState.quotes[pos.symbol] || freshState.symbolPrices?.[pos.symbol];
-          if (!q) {
-            updatedPositions.push(pos);
-            continue;
-          }
-
-          const isBuy = pos.side === 'BUY';
-          const curPrice = isBuy ? q.bid : q.ask;
-          if (curPrice <= 0 || isNaN(curPrice) || !isValidPriceUpdate(pos.symbol, curPrice)) {
-            updatedPositions.push(pos);
-            continue;
-          }
-          pos.currentPrice = curPrice;
-          sanitizePositionSlTp(pos, curPrice, freshState.stopLossPips ?? 25, freshState.takeProfitPips ?? 50);
-          hasModifiedPosition = true;
-          const isLiveExness = Boolean(freshState.accountInfo?.isLiveExness || isVaultConfigured(freshState.credentials));
-
-          // Check Take Profit hit
-          if (pos.currentTp > 0 && (isBuy ? curPrice >= pos.currentTp : curPrice <= pos.currentTp)) {
-            if (!canAttemptPositionClose(pos.id)) {
-              updatedPositions.push(pos);
-              continue;
-            }
-            markPositionClosingStart(pos.id);
-            pos.isClosing = true;
-            pos.closingStartedAt = Date.now();
-            const pnlData = evaluatePositionPnL(pos, q);
-            const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
-            get().addTelemetryLog(pos.symbol, 'ORDER', `[TAKE PROFIT HIT] #${pos.id} ${pos.side} @ ${curPrice} (+$${realizedPnl.toFixed(2)})`);
-            if (!isLiveExness) {
-              get().recordTradePnL(realizedPnl);
-            }
-            fetch('/api/exness', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                action: 'CLOSE_POSITION',
-                credentials: credsPayload,
-                payload: { positionId: pos.id, symbol: pos.symbol },
-              }),
-            }).then(async (res) => {
-              const d = await res.json().catch(() => null);
-              const ok = Boolean(res.ok && (d?.ok || d?.success));
-              markPositionClosingDone(pos.id, ok);
-              if (!ok) {
-                pos.isClosing = false;
-              }
-              get().fetchAccountInfo();
-            }).catch(() => {
-              markPositionClosingDone(pos.id, false);
-              pos.isClosing = false;
-            });
-            hasModifiedPosition = true;
-            if (!isLiveExness) {
-              continue;
-            } else {
-              updatedPositions.push(pos);
-              continue;
-            }
-          }
-
-          // Check Stop Loss / Trailing Stop hit
-          if (pos.currentSl > 0 && (isBuy ? curPrice <= pos.currentSl : curPrice >= pos.currentSl)) {
-            if (!canAttemptPositionClose(pos.id)) {
-              updatedPositions.push(pos);
-              continue;
-            }
-            markPositionClosingStart(pos.id);
-            pos.isClosing = true;
-            pos.closingStartedAt = Date.now();
-            const pnlData = evaluatePositionPnL(pos, q);
-            const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
-            get().addTelemetryLog(pos.symbol, 'ORDER', `[STOP LOSS / TRAILING STOP HIT] #${pos.id} ${pos.side} @ ${curPrice} (${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)})`);
-            if (!isLiveExness) {
-              get().recordTradePnL(realizedPnl);
-            }
-            fetch('/api/exness', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                action: 'CLOSE_POSITION',
-                credentials: credsPayload,
-                payload: { positionId: pos.id, symbol: pos.symbol },
-              }),
-            }).then(async (res) => {
-              const d = await res.json().catch(() => null);
-              const ok = Boolean(res.ok && (d?.ok || d?.success));
-              markPositionClosingDone(pos.id, ok);
-              if (!ok) {
-                pos.isClosing = false;
-              }
-              get().fetchAccountInfo();
-            }).catch(() => {
-              markPositionClosingDone(pos.id, false);
-              pos.isClosing = false;
-            });
-            hasModifiedPosition = true;
-            if (!isLiveExness) {
-              continue;
-            } else {
-              updatedPositions.push(pos);
-              continue;
-            }
-          }
-
-          // Compute ATR(14), Middle BB, and Expected Market Move for Style 2 Hybrid Trailing Stop
-          let middleBB = curPrice;
-          let atr14 = profile.pipValue * (pos.symbol === 'XAUUSDm' ? 15 : 10);
-          let expectedMovePct: number | undefined;
-          let expectedTargetPrice: number | undefined;
-          let expectedMoveUsd: number | undefined;
-          let pocPrice: number | undefined;
-          let vahPrice: number | undefined;
-          let valPrice: number | undefined;
-          let zScore: number | undefined;
-          let currentRsi: number | undefined;
-          let bbwExpansionPct: number | undefined;
-
-          if (pos.symbol === (freshState.focusSymbol || freshState.selectedSymbol) && freshState.candles.length >= 20) {
-            try {
-              const { computeIndicatorSnapshot } = await import('@/core/indicatorEngine');
-              const ind = computeIndicatorSnapshot(freshState.candles, profile.preset.rsiPeriod, profile.preset.bbPeriod, profile.preset.bbStdDev);
-              middleBB = ind.c0.middleBB;
-              atr14 = ind.c0.atr14;
-              expectedMovePct = ind.expectedMovePct;
-              expectedTargetPrice = ind.expectedTargetPrice;
-              expectedMoveUsd = ind.expectedMoveUsd;
-              pocPrice = ind.pocPrice;
-              vahPrice = ind.vahPrice;
-              valPrice = ind.valPrice;
-              zScore = ind.c0.zScore;
-              currentRsi = ind.c0.rsi;
-              bbwExpansionPct = ind.bbwExpansionPct;
-            } catch {}
-          }
-
-          const kp = freshState.kronosPrediction?.symbol === pos.symbol ? freshState.kronosPrediction : undefined;
-          const opposingRegimePct = kp
-            ? (isBuy ? (kp.bearishPct ?? 50) : (kp.bullishPct ?? 50))
-            : undefined;
-
-          const trailingAction = evaluatePositionTrailing({
-            position: pos,
-            currentBid: q.bid,
-            currentAsk: q.ask,
-            middleBB,
-            atr14,
-            bbwExpansionPct,
-            currentRsi,
-            pairProfile: profile,
-            enablePartialClose: freshState.enablePartialClose,
-            stopLossPips: freshState.stopLossPips ?? 25,
-            expectedMovePct,
-            expectedTargetPrice,
-            expectedMoveUsd,
-            pocPrice: kp?.pocPrice || pocPrice,
-            vahPrice: kp?.vahPrice || vahPrice,
-            valPrice: kp?.valPrice || valPrice,
-            zScore: kp?.zScore ?? zScore,
-            opposingRegimePct,
-          });
-
-          if (trailingAction.type === 'HARD_SL_CLOSE') {
-            if (!canAttemptPositionClose(pos.id)) {
-              updatedPositions.push(pos);
-              continue;
-            }
-            markPositionClosingStart(pos.id);
-            pos.isClosing = true;
-            pos.closingStartedAt = Date.now();
-            const pnlData = evaluatePositionPnL(pos, q);
-            const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
-            get().addTelemetryLog(pos.symbol, 'RISK', trailingAction.reason);
-            if (!isLiveExness) {
-              get().recordTradePnL(realizedPnl);
-            }
-            fetch('/api/exness', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                action: 'CLOSE_POSITION',
-                credentials: credsPayload,
-                payload: { positionId: pos.id, symbol: pos.symbol },
-              }),
-            }).then(async (res) => {
-              const d = await res.json().catch(() => null);
-              const ok = Boolean(res.ok && (d?.ok || d?.success));
-              markPositionClosingDone(pos.id, ok);
-              if (!ok) {
-                pos.isClosing = false;
-              }
-              get().fetchAccountInfo();
-            }).catch(() => {
-              markPositionClosingDone(pos.id, false);
-              pos.isClosing = false;
-            });
-            hasModifiedPosition = true;
-            if (!isLiveExness) {
-              continue;
-            } else {
-              updatedPositions.push(pos);
-              continue;
-            }
-          }
-
-          if (trailingAction.type === 'PARTIAL_CLOSE' || trailingAction.type === 'PARTIAL_AND_MODIFY_SL') {
-            get().addTelemetryLog(pos.symbol, 'TRAILING', trailingAction.reason);
-            const closeVol = trailingAction.closeVolume || (pos.volume * 0.5);
-            const partialPnl = Number(evaluatePositionPnL({ ...pos, volume: closeVol }, q).pnlUsd.toFixed(2));
-            if (!isLiveExness) {
-              get().recordTradePnL(partialPnl);
-            }
-            pos.volume = trailingAction.remainingVolume || (pos.volume - closeVol);
-            pos.partialClosed = true;
-            pos.trailingStatus = trailingAction.statusUpdate;
-            fetch('/api/exness', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                action: 'CLOSE_POSITION',
-                credentials: credsPayload,
-                payload: { positionId: pos.id, volumeToClose: closeVol, symbol: pos.symbol },
-              }),
-            }).catch(() => {});
-            hasModifiedPosition = true;
-          }
-
-          if (trailingAction.type === 'MODIFY_SL' || trailingAction.type === 'PARTIAL_AND_MODIFY_SL') {
-            if (trailingAction.newSlPrice && trailingAction.newSlPrice !== pos.currentSl) {
-              get().addTelemetryLog(pos.symbol, 'TRAILING', trailingAction.reason);
-              pos.currentSl = trailingAction.newSlPrice;
-              pos.virtualSl = trailingAction.newSlPrice;
-              pos.trailingStatus = trailingAction.statusUpdate;
-              fetch('/api/exness', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  action: 'MODIFY_POSITION',
-                  credentials: credsPayload,
-                  payload: { positionId: pos.id, stopLoss: trailingAction.newSlPrice, symbol: pos.symbol },
-                }),
-              }).catch(() => {});
-              hasModifiedPosition = true;
-            }
-          }
-
-          updatedPositions.push(pos);
-        }
-
-        if (hasModifiedPosition) {
-          const isConn = Boolean(freshState.accountInfo?.connected || isVaultConfigured(freshState.credentials));
-          const balance = freshState.balance ?? freshState.accountInfo?.balance ?? (isConn ? getPersistedVerifiedAccount()?.balance ?? null : null);
-          const totalUnrealized = updatedPositions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
-          const calculatedEquity = balance !== null
-            ? (updatedPositions.length === 0 ? balance : Number((balance + totalUnrealized).toFixed(2)))
-            : null;
-          set({
-            positions: updatedPositions,
-            openPositions: updatedPositions,
-            equity: calculatedEquity,
-          });
-        }
+        await Promise.all([
+          get().hydrateFromServer(),
+          get().fetchQuote(activeSym),
+        ]);
       },
 
-      executeEngineTick: async (syntheticSignal) => {
-        const state = get();
-        // Engine tick must strictly only run when isAutoTrading is true
-        if (!state.isAutoTrading) {
-          return;
-        }
-        if (state.isTickRunning) return;
-
-        set({ isTickRunning: true });
-        const currentActive = state.focusSymbol || state.selectedSymbol || 'XAUUSDm';
-        const symbolsToScan = state.targetMarket === 'GOLD'
-          ? ['XAUUSDm']
-          : (state.targetMarket === 'FOREX'
-              ? Array.from(new Set([currentActive, 'XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm']))
-              : (state.isMultiPairMode ? state.scannedSymbols : [currentActive]));
-        const activeCreds = getActiveExnessCredentials(state.credentials);
-        const previousPositions = state.openPositions || state.positions || [];
-
-        try {
-          const res = await fetch('/api/engine-tick', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              credentials: {
-                accountId: activeCreds.accountId,
-                server: activeCreds.server,
-                token: activeCreds.apiKey,
-                apiKey: activeCreds.apiKey,
-                secret: activeCreds.secret,
-                privateKey: activeCreds.secret,
-                password: activeCreds.password,
-                initialBalance: activeCreds.initialBalance,
-                mode: state.accountMode || 'DEMO',
-              },
-              symbols: symbolsToScan,
-              targetMarket: state.targetMarket,
-              timeframe: state.timeframe || 'M5',
-              orderVolume: state.lotSize,
-              stopLossPips: state.stopLossPips ?? 25,
-              takeProfitPips: state.takeProfitPips ?? 50,
-              enablePartialClose: state.enablePartialClose,
-              activePositions: state.openPositions || state.positions,
-              dailyRealizedLossUsd: state.accountInfo?.dailyRealizedLossUsd || 0,
-              syntheticSignal,
-            }),
-          });
-
-          const json = await res.json();
-          if (json.telemetry && Array.isArray(json.telemetry)) {
-            for (const t of json.telemetry) {
-              get().addTelemetryLog(t.symbol, t.category, t.message);
-            }
-          }
-
-          // Automatically record realized PnL from closed trades returned by engine (TP, SL, Trailing Stop, Partial Close)
-          if (json.closedTrades && Array.isArray(json.closedTrades)) {
-            for (const ct of json.closedTrades) {
-              if (typeof ct.pnl === 'number') {
-                get().recordTradePnL(ct.pnl);
-              }
-            }
-          }
-
-          // Positions diff detection: auto-record any positions closed on server without explicit closedTrades entry
-          if (json.positions && Array.isArray(json.positions)) {
-            for (const oldP of previousPositions) {
-              const stillOpen = json.positions.find((np: ManagedPosition) => np.id === oldP.id);
-              if (!stillOpen) {
-                const alreadyHandled = json.closedTrades?.some((ct: any) => ct.id === oldP.id);
-                if (!alreadyHandled) {
-                  const quote = get().quotes[oldP.symbol];
-                  const pnlData = quote
-                    ? evaluatePositionPnL(oldP, quote)
-                    : { pnlUsd: oldP.unrealizedPnl || 0 };
-                  get().recordTradePnL(Number(pnlData.pnlUsd.toFixed(2)));
-                }
-              } else if (stillOpen.volume < oldP.volume) {
-                const alreadyHandled = json.closedTrades?.some((ct: any) => ct.id === oldP.id && ct.reason === 'PARTIAL_CLOSE');
-                if (!alreadyHandled) {
-                  const closedVol = Number((oldP.volume - stillOpen.volume).toFixed(2));
-                  const quote = get().quotes[oldP.symbol];
-                  const pnlData = quote
-                    ? evaluatePositionPnL({ ...oldP, volume: closedVol }, quote)
-                    : { pnlUsd: (oldP.unrealizedPnl || 0) * (closedVol / oldP.volume) };
-                  get().recordTradePnL(Number(pnlData.pnlUsd.toFixed(2)));
-                }
-              }
-            }
-          }
-
-          // Client-side Zustand store remains single source of truth for active positions in Demo mode.
-          // Never blindly overwrite client openPositions with stale server positions to prevent resurrection.
-          if (get().isAutoTrading) {
-            const currentClientPositions = get().openPositions || get().positions || [];
-            let mergedPositions = [...currentClientPositions];
-
-            // 1. If engine placed new orders, add them strictly if matching targetMarket and not already present
-            if (json.orders && Array.isArray(json.orders)) {
-              for (const ord of json.orders) {
-                if (ord && ord.orderId && !mergedPositions.some((p) => p.id === ord.orderId)) {
-                  // Enforce targetMarket strictly: GOLD restricts to XAUUSDm only
-                  if (get().targetMarket === 'GOLD' && ord.symbol !== 'XAUUSDm') {
-                    continue;
-                  }
-                  mergedPositions.push({
-                    id: ord.orderId,
-                    symbol: ord.symbol,
-                    side: ord.side,
-                    volume: ord.volume,
-                    initialVolume: ord.volume,
-                    entryPrice: ord.fillPrice,
-                    currentPrice: ord.fillPrice,
-                    currentSl: ord.stopLoss || 0,
-                    currentTp: ord.takeProfit || 0,
-                    highestPrice: ord.fillPrice,
-                    lowestPrice: ord.fillPrice,
-                    openTime: Date.now(),
-                    partialClosed: false,
-                    trailingStatus: 'INITIAL',
-                  });
-                }
-              }
-            }
-
-            // 2. If trades closed on server, remove them from active positions
-            if (json.closedTrades && Array.isArray(json.closedTrades)) {
-              const closedIds = new Set(json.closedTrades.map((ct: any) => ct.id));
-              mergedPositions = mergedPositions.filter((p) => !closedIds.has(p.id));
-            }
-
-            // 3. Update trailing stop modifications from server for remaining active positions
-            if (json.positions && Array.isArray(json.positions)) {
-              for (const sPos of json.positions) {
-                const targetPos = mergedPositions.find((p) => p.id === sPos.id);
-                if (targetPos) {
-                  if (sPos.currentSl !== undefined) targetPos.currentSl = sPos.currentSl;
-                  if (sPos.currentTp !== undefined) targetPos.currentTp = sPos.currentTp;
-                  if (sPos.volume !== undefined) targetPos.volume = sPos.volume;
-                  if (sPos.partialClosed !== undefined) targetPos.partialClosed = sPos.partialClosed;
-                  if (sPos.trailingStatus) targetPos.trailingStatus = sPos.trailingStatus;
-                }
-              }
-            }
-
-            const isConn = Boolean(get().accountInfo?.connected);
-            const balance: number | null = isConn ? (get().balance ?? get().accountInfo?.balance ?? null) : null;
-            const currentQuotes = get().quotes;
-            const mappedPositions = mergedPositions.map((pos: ManagedPosition) => {
-              const q = currentQuotes[pos.symbol];
-              const cloned = { ...pos };
-              if (!q) {
-                sanitizePositionSlTp(cloned, cloned.currentPrice || cloned.entryPrice, get().stopLossPips ?? 25, get().takeProfitPips ?? 50);
-                return cloned;
-              }
-              const curPrice = cloned.side === 'BUY' ? q.bid : q.ask;
-              const prevValid = cloned.currentPrice || cloned.entryPrice;
-              if (prevValid > 0 && Math.abs(curPrice - prevValid) / prevValid > 0.05) {
-                sanitizePositionSlTp(cloned, prevValid, get().stopLossPips ?? 25, get().takeProfitPips ?? 50);
-                return cloned;
-              }
-              sanitizePositionSlTp(cloned, curPrice, get().stopLossPips ?? 25, get().takeProfitPips ?? 50);
-              const res = evaluatePositionPnL(cloned, q);
-              return { ...cloned, currentPrice: curPrice, unrealizedPnl: res.pnlUsd };
-            });
-
-            const totalUnrealized = mappedPositions.reduce((sum: number, p: ManagedPosition) => sum + (p.unrealizedPnl || 0), 0);
-            const dynamicEquity: number | null = balance !== null
-              ? (mappedPositions.length === 0 ? balance : Number((balance + totalUnrealized).toFixed(2)))
-              : null;
-            set((prev) => ({
-              positions: isConn ? mappedPositions : [],
-              openPositions: isConn ? mappedPositions : [],
-              equity: dynamicEquity,
-              accountInfo: prev.accountInfo
-                ? {
-                    ...prev.accountInfo,
-                    equity: dynamicEquity,
-                    freeMargin: dynamicEquity !== null ? Number(Math.max(0, dynamicEquity - (mappedPositions.length === 0 ? 0 : (prev.accountInfo.margin || 0))).toFixed(2)) : null,
-                    margin: mappedPositions.length === 0 ? 0 : prev.accountInfo.margin,
-                  }
-                : prev.accountInfo,
-            }));
-          }
-
-          if (json.circuitBreakerTriggered) {
-            set({ isAutoTrading: false, positions: [], openPositions: [] });
-            get().addTelemetryLog('CIRCUIT_BREAKER', 'RISK', '🚨 EMERGENCY SHUTDOWN: Daily Drawdown limit reached.');
-          }
-
-          set({ lastTickTime: Date.now() });
-
-          // Refresh account & quote data for currently active focus symbol
-          const curSym = get().focusSymbol || get().selectedSymbol;
-          get().fetchAccountInfo();
-          get().fetchQuote(curSym);
-          if (Date.now() - lastCandlesFetchTime > 60000) {
-            get().fetchCandles(curSym);
-          }
-        } catch {
-          // Silently handle engine tick errors without throwing
-        } finally {
-          set({ isTickRunning: false });
-        }
+      // Pure Read-Only State Sync: Frontend never drives trading or AI execution.
+      executeEngineTick: async () => {
+        await get().hydrateFromServer();
       },
 
       closePosition: async (positionId, volume) => {
@@ -2764,19 +2268,67 @@ export const useTradingStore = create<TradingState>()(
                 ? d.positions.filter((p: any) => p && p.id !== 'F-637' && p.id !== '#F-637')
                 : [];
 
-              set((prev) => ({
-                isAutoTrading: serverRunning,
-                lotSize: serverLot,
-                stopLossPips: serverSl,
-                takeProfitPips: serverTp,
-                targetMarket: d.targetMarket || prev.targetMarket,
-                selectedSymbol: d.selectedSymbol || prev.selectedSymbol,
-                focusSymbol: d.selectedSymbol || prev.focusSymbol,
-                scannedSymbols: Array.isArray(d.scannedSymbols) && d.scannedSymbols.length > 0 ? d.scannedSymbols : prev.scannedSymbols,
-                enablePartialClose: d.enablePartialClose !== undefined ? Boolean(d.enablePartialClose) : prev.enablePartialClose,
-                ...(serverPositions.length > 0 ? { positions: serverPositions, openPositions: serverPositions } : {}),
-                isServerHydrated: true,
-              }));
+              set((prev) => {
+                // Merge server telemetry logs with local UI logs without duplicates
+                const serverLogs: TelemetryItem[] = Array.isArray(d.telemetryLogs) ? d.telemetryLogs : [];
+                let mergedLogs = prev.telemetryLogs;
+                if (serverLogs.length > 0) {
+                  const seen = new Set<string>();
+                  const combined: TelemetryItem[] = [];
+                  for (const item of [...serverLogs, ...prev.telemetryLogs]) {
+                    const key = item.id || `${item.timestamp}_${item.symbol}_${item.message}`;
+                    if (!seen.has(key)) {
+                      seen.add(key);
+                      combined.push(item);
+                    }
+                  }
+                  combined.sort((a, b) => b.timestamp - a.timestamp);
+                  mergedLogs = combined.slice(0, 200);
+                }
+
+                const mergedQuotes = d.quotes && typeof d.quotes === 'object'
+                  ? { ...prev.quotes, ...d.quotes }
+                  : prev.quotes;
+
+                const totalUnrealized = serverPositions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
+                const serverBalance = typeof d.accountInfo?.balance === 'number' && d.accountInfo.balance > 0
+                  ? d.accountInfo.balance
+                  : prev.balance;
+                const nextEquity = serverBalance !== null
+                  ? (serverPositions.length === 0 ? serverBalance : Number((serverBalance + totalUnrealized).toFixed(2)))
+                  : (typeof d.accountInfo?.equity === 'number' ? d.accountInfo.equity : prev.equity);
+
+                return {
+                  isAutoTrading: d.circuitBreakerTriggered ? false : serverRunning,
+                  lotSize: serverLot,
+                  stopLossPips: serverSl,
+                  takeProfitPips: serverTp,
+                  targetMarket: d.targetMarket || prev.targetMarket,
+                  selectedSymbol: d.selectedSymbol || prev.selectedSymbol,
+                  focusSymbol: d.selectedSymbol || prev.focusSymbol,
+                  scannedSymbols: Array.isArray(d.scannedSymbols) && d.scannedSymbols.length > 0 ? d.scannedSymbols : prev.scannedSymbols,
+                  enablePartialClose: d.enablePartialClose !== undefined ? Boolean(d.enablePartialClose) : prev.enablePartialClose,
+                  positions: Array.isArray(d.positions) ? serverPositions : prev.positions,
+                  openPositions: Array.isArray(d.positions) ? serverPositions : prev.openPositions,
+                  telemetryLogs: mergedLogs,
+                  quotes: mergedQuotes,
+                  ...(d.kronosPrediction ? { kronosPrediction: d.kronosPrediction } : {}),
+                  ...(d.latestAiVerdict !== undefined ? { latestAiVerdict: d.latestAiVerdict } : {}),
+                  ...(d.entryScannerState ? { entryScannerState: d.entryScannerState } : {}),
+                  ...(d.lastTickTimestamp ? { lastTickTime: d.lastTickTimestamp } : {}),
+                  ...(typeof d.dailyRealizedPnL === 'number' ? { dailyPnl: d.dailyRealizedPnL } : {}),
+                  balance: serverBalance,
+                  equity: nextEquity,
+                  accountInfo: d.accountInfo
+                    ? {
+                        ...(prev.accountInfo || {}),
+                        ...d.accountInfo,
+                        equity: nextEquity ?? d.accountInfo.equity,
+                      }
+                    : prev.accountInfo,
+                  isServerHydrated: true,
+                };
+              });
               return;
             }
           }
@@ -2785,62 +2337,15 @@ export const useTradingStore = create<TradingState>()(
       },
 
       syncWithServerState: async () => {
-        if (!get().isServerHydrated) {
-          await get().hydrateFromServer();
-          return;
-        }
         const now = Date.now();
-        if (isSyncingLock || (now - lastSyncTime < 500)) {
+        if (isSyncingLock || (now - lastSyncTime < 400)) {
           return;
         }
         lastSyncTime = now;
         isSyncingLock = true;
         set({ isSyncing: true });
-
         try {
-          // SINGLE AUTHORITATIVE SOURCE OF TRUTH:
-          // Local useTradingStore openPositions is authoritative.
-          // Synchronize local positions & financial ledger state TO the server.
-          const isConn = Boolean(get().accountInfo?.connected);
-          const localPositions = isConn ? (get().openPositions || get().positions || []) : [];
-          const curBal = isConn ? (get().balance ?? get().accountInfo?.balance ?? null) : null;
-
-          const activeCreds = getActiveExnessCredentials(get().credentials);
-          const res = await fetch('/api/exness', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              ...(activeCreds.apiKey ? { 'Authorization': `Bearer ${activeCreds.apiKey}`, 'x-api-key': activeCreds.apiKey } : {}),
-            },
-            body: JSON.stringify({
-              action: 'sync-state',
-              credentials: {
-                accountId: activeCreds.accountId || '30000143146',
-                server: activeCreds.server,
-                apiKey: activeCreds.apiKey,
-                token: activeCreds.apiKey,
-                secret: activeCreds.secret,
-                privateKey: activeCreds.secret,
-                password: activeCreds.password,
-                mode: activeCreds.mode || get().accountMode || 'DEMO',
-                initialBalance: activeCreds.initialBalance,
-              },
-              payload: {
-                positions: localPositions,
-                currentBalance: curBal,
-                dailyPnl: isConn ? get().dailyPnl : null,
-                isAutoTrading: get().isAutoTrading,
-              },
-            }),
-          });
-          const json = await res.json();
-          if (json.success && json.data) {
-            const d = json.data;
-            if (d.circuitBreakerTriggered) {
-              set({ isAutoTrading: false, positions: [], openPositions: [] });
-            }
-          }
-        } catch {
+          await get().hydrateFromServer();
         } finally {
           isSyncingLock = false;
           set({ isSyncing: false });

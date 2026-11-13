@@ -65,6 +65,30 @@ export interface BotRuntimeState {
   lastTickTimestamp: number;
   circuitBreakerTriggered: boolean;
   telemetryLogs: StateTelemetryItem[];
+  kronosPrediction?: any;
+  kronosBySymbol?: Record<string, any>;
+  latestAiVerdict?: {
+    symbol: string;
+    decision: string;
+    confidence_score: number;
+    dynamicThreshold: number;
+    source: string;
+    reasoning: string;
+    timestamp: number;
+  } | null;
+  quotes?: Record<string, { symbol: string; bid: number; ask: number; spreadPips: number; timestamp: number }>;
+  accountInfo?: {
+    connected: boolean;
+    balance: number;
+    equity: number;
+    margin: number;
+    freeMargin: number;
+    mode: string;
+    accountId: string;
+    server: string;
+    isLiveExness: boolean;
+  } | null;
+  entryScannerState?: string;
 }
 
 export const DEFAULT_STATE: BotRuntimeState = {
@@ -96,6 +120,12 @@ export const DEFAULT_STATE: BotRuntimeState = {
   lastTickTimestamp: 0,
   circuitBreakerTriggered: false,
   telemetryLogs: [],
+  kronosPrediction: null,
+  kronosBySymbol: {},
+  latestAiVerdict: null,
+  quotes: {},
+  accountInfo: null,
+  entryScannerState: 'IDLE',
 };
 
 declare global {
@@ -157,6 +187,12 @@ class StateSyncManager {
       credentials: partial.credentials
         ? { ...this.inMemoryState.credentials, ...partial.credentials }
         : this.inMemoryState.credentials,
+      quotes: partial.quotes
+        ? { ...(this.inMemoryState.quotes || {}), ...partial.quotes }
+        : this.inMemoryState.quotes,
+      kronosBySymbol: partial.kronosBySymbol
+        ? { ...(this.inMemoryState.kronosBySymbol || {}), ...partial.kronosBySymbol }
+        : this.inMemoryState.kronosBySymbol,
     };
 
     // Synchronize isRunning <-> isAutoTrading

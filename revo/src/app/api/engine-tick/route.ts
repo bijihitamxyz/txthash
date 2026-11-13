@@ -157,8 +157,18 @@ export async function POST(req: NextRequest) {
 
     const activeCreds = getActiveExnessCredentials(runtimeState.credentials);
 
-    // Exness credentials are ALWAYS loaded from the server-side AES vault or rehydrated from session.
+    // Exness credentials are ALWAYS loaded from the server-side AES vault or server state.
     let vaultCreds = await loadVaultCredentials();
+    if (!vaultCreds && activeCreds.apiKey && activeCreds.secret && activeCreds.secret.length >= 32) {
+      vaultCreds = {
+        accountId: activeCreds.accountId || '30000143146',
+        mode: activeCreds.mode === 'REAL' ? 'REAL' : 'DEMO',
+        server: activeCreds.server || 'https://api.exness-api.com',
+        apiKey: activeCreds.apiKey,
+        privateKey: activeCreds.secret,
+        updatedAt: Date.now(),
+      };
+    }
     if (!vaultCreds && body.credentials && (body.credentials.apiKey || body.credentials.token || body.credentials.accountId)) {
       vaultCreds = {
         accountId: String(body.credentials.accountId || '30000143146').trim(),

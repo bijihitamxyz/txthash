@@ -1,5 +1,5 @@
 import path from 'path';
-import { readDataFileAsync, writeDataFileAsync, getDataDir, getNemesisMemoryStore } from '@/lib/dataStore';
+import { readDataFileAsync, writeDataFileAsync, getDataDir, getNemesisMemoryStore, isServerless, safeMkdirSync } from '@/lib/dataStore';
 import { resetAiEndpointFailureCache, normalizeAiEndpoint } from '@/core/aiJudge';
 
 export interface EngineSwitches {
@@ -566,7 +566,22 @@ export async function writeCentralAiConfig(
       nemesis['ai_config.json'] = updated;
     } catch {}
 
-    await writeDataFileAsync('ai_config.json', JSON.stringify(updated, null, 2));
+    const serialized = JSON.stringify(updated, null, 2);
+    await writeDataFileAsync('ai_config.json', serialized);
+
+    // Also persist to VPS data/ai_config.json so AI/Kronos config survives restarts
+    if (!isServerless() && typeof window === 'undefined') {
+      try {
+        const nodeFs = eval('require')('fs');
+        const vpsDataDir = path.join(process.cwd(), 'data');
+        safeMkdirSync(vpsDataDir);
+        const vpsConfigPath = path.join(vpsDataDir, 'ai_config.json');
+        if (vpsConfigPath !== getAiConfigPath()) {
+          await nodeFs.promises.writeFile(vpsConfigPath, serialized, 'utf8');
+        }
+      } catch {}
+    }
+
     resetAiEndpointFailureCache();
     return updated;
   } catch (err) {

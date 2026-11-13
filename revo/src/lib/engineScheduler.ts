@@ -13,7 +13,7 @@ import {
   CryptoVaultData,
 } from './cryptoVault';
 import { ExnessClient } from '@/core/exnessClient';
-import { loadVaultCredentials } from '@/core/exnessVault';
+import { loadVaultCredentials, saveVaultCredentials } from '@/core/exnessVault';
 import { BinanceFuturesClient, formatQuantityByStepSize, FALLBACK_SYMBOLS } from '@/core/binanceClient';
 import { BitgetFuturesService } from '@/services/bitgetService';
 import { getPairProfile, SUPPORTED_SYMBOLS, calculatePnL, evaluatePositionPnL } from '@/core/pairConfig';
@@ -290,7 +290,21 @@ class EngineScheduler {
         };
       }
 
-      const vaultCreds = await loadVaultCredentials();
+      let vaultCreds = await loadVaultCredentials();
+      if (!vaultCreds && state.credentials) {
+        const activeCreds = getActiveExnessCredentials(state.credentials);
+        if (activeCreds.apiKey && activeCreds.secret && activeCreds.secret.length >= 32) {
+          vaultCreds = {
+            accountId: activeCreds.accountId || '30000143146',
+            mode: activeCreds.mode === 'REAL' ? 'REAL' : 'DEMO',
+            server: activeCreds.server || 'https://api.exness-api.com',
+            apiKey: activeCreds.apiKey,
+            privateKey: activeCreds.secret,
+            updatedAt: Date.now(),
+          };
+          await saveVaultCredentials(vaultCreds).catch(() => {});
+        }
+      }
       if (!vaultCreds) {
         return {
           executed: false,
@@ -327,10 +341,24 @@ class EngineScheduler {
         };
       }
       let accountEquity: number | undefined;
+      let latestAccountInfo = state.accountInfo || null;
       try {
         const acct = await client.getAccountInfo();
         if (acct?.equity && acct.equity > 0) {
           accountEquity = acct.equity;
+        }
+        if (acct) {
+          latestAccountInfo = {
+            connected: true,
+            balance: Number(acct.balance || 0),
+            equity: Number(acct.equity || acct.balance || 0),
+            margin: Number(acct.margin || 0),
+            freeMargin: Number(acct.freeMargin ?? acct.equity ?? acct.balance ?? 0),
+            mode: vaultCreds.mode,
+            accountId: vaultCreds.accountId,
+            server: vaultCreds.server,
+            isLiveExness: true,
+          };
         }
       } catch {}
 
@@ -383,12 +411,28 @@ class EngineScheduler {
       updatedPositions = reconcileOrphanPositions(updatedPositions, state.positions || [], slPipsCfg, tpPipsCfg);
 
       const initialPositionCount = updatedPositions.length;
+      const quotesMap: Record<string, { symbol: string; bid: number; ask: number; spreadPips: number; timestamp: number }> = {};
+      const kronosBySymbolUpdate: Record<string, any> = {};
+      let latestKronosPrediction = state.kronosPrediction || null;
+      let latestAiVerdictUpdate = state.latestAiVerdict || null;
+      let realizedPnlDelta = 0;
+      let realizedLossDelta = 0;
+      const activeFocusSym = state.selectedSymbol || targetSymbols[0] || 'XAUUSDm';
 
-      // 1. Process Watchdog Emergency Close & Trailing Stops / Partial Closes for all active positions
+      const recordClosedPnl = (pnl: number) => {
+        realizedPnlDelta += pnl;
+        if (pnl < 0) {
+          realizedLossDelta += Math.abs(pnl);
+        }
+      };
+
+      // 1. Process Watchdog Emergency Close, SL/TP Hits & Trailing Stops / Partial Closes for all active positions
       for (const pos of [...updatedPositions]) {
         const profile = getPairProfile(pos.symbol);
         const quote = await client.getSymbolQuote(pos.symbol);
-        const curPrice = pos.side === 'BUY' ? quote.bid : quote.ask;
+        quotesMap[pos.symbol] = quote;
+        const isBuy = pos.side === 'BUY';
+        const curPrice = isBuy ? quote.bid : quote.ask;
 
         // Extreme Price Deviation Guard (> 15% jump):
         // Prevents corrupted 0/NaN or mismatched quotes from triggering SL/TP prematurely
@@ -403,7 +447,7 @@ class EngineScheduler {
         pos.currentPrice = curPrice;
         sanitizePositionSlTp(pos, curPrice, slPipsCfg, tpPipsCfg);
 
-        // Backend Watchdog Emergency Close Sweeper (checks every 3s regardless of candle count)
+        // 1a. Backend Watchdog Emergency Close Sweeper (checks every 3s regardless of candle count)
         const watchdog = evaluateWatchdogEmergencyClose(pos, curPrice, profile, slPipsCfg);
         if (watchdog.shouldClose) {
           if (canAttemptPositionClose(pos.id)) {
@@ -413,6 +457,53 @@ class EngineScheduler {
             pos.closingStartedAt = Date.now();
             const closeRes = await client.closePosition(pos.id, undefined, pos.symbol);
             if (closeRes.success) {
+              recordClosedPnl(watchdog.unrealizedPnl);
+              const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
+              if (posIdx !== -1) {
+                updatedPositions.splice(posIdx, 1);
+              }
+            }
+          }
+          continue;
+        }
+
+        // 1b. Explicit Take Profit Hit Verification (Server-Side Authoritative)
+        if (pos.currentTp > 0 && (isBuy ? curPrice >= pos.currentTp : curPrice <= pos.currentTp)) {
+          if (canAttemptPositionClose(pos.id)) {
+            const pnlData = evaluatePositionPnL(pos, quote);
+            const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
+            log(pos.symbol, 'ORDER', `[TAKE PROFIT HIT] #${pos.id} ${pos.side} @ ${curPrice} (+$${realizedPnl.toFixed(2)})`);
+            dualRoomProtections.recordProfitHit(pos.symbol, 'forex');
+            pos.isClosing = true;
+            pos.closingStartedAt = Date.now();
+            const closeRes = await client.closePosition(pos.id, undefined, pos.symbol);
+            if (closeRes.success) {
+              recordClosedPnl(realizedPnl);
+              const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
+              if (posIdx !== -1) {
+                updatedPositions.splice(posIdx, 1);
+              }
+            }
+          }
+          continue;
+        }
+
+        // 1c. Explicit Stop Loss / Trailing Stop Hit Verification (Server-Side Authoritative)
+        if (pos.currentSl > 0 && (isBuy ? curPrice <= pos.currentSl : curPrice >= pos.currentSl)) {
+          if (canAttemptPositionClose(pos.id)) {
+            const pnlData = evaluatePositionPnL(pos, quote);
+            const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
+            log(pos.symbol, 'ORDER', `[STOP LOSS / TRAILING STOP HIT] #${pos.id} ${pos.side} @ ${curPrice} (${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)})`);
+            if (realizedPnl < 0) {
+              dualRoomProtections.recordStopLossHit(pos.symbol, 'forex', 'HARD_SL_HIT');
+            } else {
+              dualRoomProtections.recordProfitHit(pos.symbol, 'forex');
+            }
+            pos.isClosing = true;
+            pos.closingStartedAt = Date.now();
+            const closeRes = await client.closePosition(pos.id, undefined, pos.symbol);
+            if (closeRes.success) {
+              recordClosedPnl(realizedPnl);
               const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
               if (posIdx !== -1) {
                 updatedPositions.splice(posIdx, 1);
@@ -438,6 +529,10 @@ class EngineScheduler {
             candles,
             aiModel: activeAiSummaryLabel,
           });
+          kronosBySymbolUpdate[pos.symbol] = { ...kronosForPos, symbol: pos.symbol, timeframe: 'M5', updatedAt: Date.now() };
+          if (pos.symbol === activeFocusSym) {
+            latestKronosPrediction = kronosBySymbolUpdate[pos.symbol];
+          }
 
           const forwardOutlook = computeForwardMarketOutlook({
             symbol: pos.symbol,
@@ -517,6 +612,8 @@ class EngineScheduler {
               pos.isClosing = true;
               continue;
             }
+            const pnlData = evaluatePositionPnL(pos, quote);
+            const realizedPnl = Number(pnlData.pnlUsd.toFixed(2));
             log(pos.symbol, 'RISK', trailingAction.reason);
             dualRoomProtections.recordStopLossHit(
               pos.symbol,
@@ -527,6 +624,7 @@ class EngineScheduler {
             pos.closingStartedAt = Date.now();
             const closeRes = await client.closePosition(pos.id, undefined, pos.symbol);
             if (closeRes.success) {
+              recordClosedPnl(realizedPnl);
               const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
               if (posIdx !== -1) {
                 updatedPositions.splice(posIdx, 1);
@@ -540,6 +638,9 @@ class EngineScheduler {
             dualRoomProtections.recordProfitHit(pos.symbol, 'forex');
             const closeRes = await client.closePosition(pos.id, trailingAction.closeVolume, pos.symbol);
             if (closeRes.success) {
+              const closedVol = trailingAction.closeVolume || (pos.volume * 0.5);
+              const partialPnl = Number(evaluatePositionPnL({ ...pos, volume: closedVol }, quote).pnlUsd.toFixed(2));
+              recordClosedPnl(partialPnl);
               pos.volume = trailingAction.remainingVolume || pos.volume;
               pos.partialClosed = true;
               pos.trailingStatus = trailingAction.statusUpdate;
@@ -615,6 +716,7 @@ class EngineScheduler {
         const symbolSnapshot = symbol;
         const profile = getPairProfile(symbolSnapshot);
         const quote = await client.getSymbolQuote(symbolSnapshot);
+        quotesMap[symbolSnapshot] = quote;
         const candles = await client.getCandles(symbolSnapshot, 'M5', 200);
 
         if (candles.length < 35) {
@@ -707,6 +809,10 @@ class EngineScheduler {
           candles,
           aiModel: activeAiSummaryLabel,
         });
+        kronosBySymbolUpdate[symbolSnapshot] = { ...kronosForecast, symbol: symbolSnapshot, timeframe: 'M5', updatedAt: Date.now() };
+        if (symbolSnapshot === activeFocusSym) {
+          latestKronosPrediction = kronosBySymbolUpdate[symbolSnapshot];
+        }
 
         // Kronos Volume Profile Gravity (POC Magnet Alignment)
         const middleBB = signalResult.indicators.c0.middleBB;
@@ -768,6 +874,15 @@ class EngineScheduler {
 
         const isSignalVerified = aiVerdict.executionAllowed || aiVerdict.confidence_score >= dynamicThresholdRes.threshold;
         const autoGovDecision = isSignalVerified ? 'EXECUTE' : 'REJECT';
+        latestAiVerdictUpdate = {
+          symbol: symbolSnapshot,
+          decision: autoGovDecision === 'EXECUTE' ? 'EXECUTE' : aiVerdict.decision,
+          confidence_score: aiVerdict.confidence_score,
+          dynamicThreshold: dynamicThresholdRes.threshold,
+          source: aiVerdict.source,
+          reasoning: aiVerdict.reasoning,
+          timestamp: Date.now(),
+        };
         log(
           symbolSnapshot,
           'AI',
@@ -893,9 +1008,37 @@ class EngineScheduler {
         }
       }
 
+      // Ensure active focus symbol always has a fresh Kronos forecast & quote for UI Monitor
+      if (!kronosBySymbolUpdate[activeFocusSym]) {
+        try {
+          if (!quotesMap[activeFocusSym]) {
+            quotesMap[activeFocusSym] = await client.getSymbolQuote(activeFocusSym);
+          }
+          const focusCandles = await client.getCandles(activeFocusSym, 'M5', 100);
+          if (focusCandles.length >= 25) {
+            const focusKronos = computeRealTimeKronosForecast({
+              symbol: activeFocusSym,
+              timeframe: 'M5',
+              candles: focusCandles,
+              aiModel: activeAiSummaryLabel,
+            });
+            kronosBySymbolUpdate[activeFocusSym] = {
+              ...focusKronos,
+              symbol: activeFocusSym,
+              timeframe: 'M5',
+              updatedAt: Date.now(),
+            };
+            latestKronosPrediction = kronosBySymbolUpdate[activeFocusSym];
+          }
+        } catch {}
+      }
+
       // Accurately compute unrealizedPnl for all open positions strictly using live Bid for BUY and live Ask for SELL
       for (const p of updatedPositions) {
-        const q = await client.getQuote(p.symbol);
+        const q = quotesMap[p.symbol] || await client.getQuote(p.symbol);
+        if (q && q.bid > 0) {
+          quotesMap[p.symbol] = q;
+        }
         const curPrice = p.side === 'BUY' ? q.bid : q.ask;
         if (curPrice <= 0 || isNaN(curPrice)) continue;
         const res = evaluatePositionPnL(p, q);
@@ -903,8 +1046,19 @@ class EngineScheduler {
         p.unrealizedPnl = res.pnlUsd;
       }
 
+      const nextDailyPnl = Number(((state.dailyRealizedPnL || 0) + realizedPnlDelta).toFixed(2));
+      const nextDailyLoss = Number(((state.dailyRealizedLossUsd || 0) + realizedLossDelta).toFixed(2));
+
       await stateSync.updateRuntimeState({
         positions: updatedPositions,
+        quotes: quotesMap,
+        kronosPrediction: latestKronosPrediction,
+        kronosBySymbol: kronosBySymbolUpdate,
+        latestAiVerdict: latestAiVerdictUpdate,
+        accountInfo: latestAccountInfo,
+        entryScannerState: this.entryScannerState,
+        dailyRealizedPnL: nextDailyPnl,
+        dailyRealizedLossUsd: nextDailyLoss,
         lastTickTimestamp: Date.now(),
       });
 
