@@ -137,7 +137,7 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
     setIsMounted(true);
   }, []);
 
-  // Initial load on mount - hydrate authoritative server state FIRST, then load Exness vault, account, and Kronos
+  // Initial load on mount - hydrate authoritative server state (Single Source of Truth: GET /api/engine-tick)
   useEffect(() => {
     const initTerminal = async () => {
       await useTradingStore.getState().hydrateFromServer();
@@ -147,7 +147,6 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
       await Promise.allSettled([
         useTradingStore.getState().checkKronosHealth(),
         useTradingStore.getState().loadVaultOnStartup(),
-        useTradingStore.getState().fetchAccountInfo(),
         useTradingStore.getState().fetchKronosPrediction(),
       ]);
       const st = useTradingStore.getState();
@@ -171,7 +170,6 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
   useEffect(() => {
     if (isActiveRoom) {
       useTradingStore.getState().hydrateFromServer().catch(() => {});
-      useTradingStore.getState().fetchAccountInfo().catch(() => {});
       useTradingStore.getState().fetchKronosPrediction().catch(() => {});
     }
   }, [isActiveRoom]);
@@ -182,7 +180,6 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
       if (typeof document !== 'undefined' && document.hidden) return;
       const st = useTradingStore.getState();
       st.hydrateFromServer().catch(() => {});
-      st.fetchQuote(st.focusSymbol || st.selectedSymbol || 'XAUUSDm').catch(() => {});
     };
 
     if (typeof document !== 'undefined') {
@@ -202,7 +199,7 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
     };
   }, []);
 
-  // Pure Read-Only VPS Status Polling Loop (2s interval) — Browser NEVER drives trading, SL/TP, or AI execution
+  // Single Source of Truth VPS Status Polling Loop (2s interval) — ONLY polls GET /api/engine-tick
   useEffect(() => {
     if (isDashboardLoopRunning || loopLockRef.current) {
       return;
@@ -229,17 +226,12 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
           return;
         }
 
-        // 1. Read-Only Poll of VPS Node.js Engine State (GET /api/engine-tick) every 2s
+        // Single Source of Truth poll (GET /api/engine-tick) for balance, equity, positions, quotes, and isRunning
         await st.hydrateFromServer();
 
-        // 2. Refresh live chart quote for focused symbol
-        const sym = st.focusSymbol || st.selectedSymbol || 'XAUUSDm';
-        await st.fetchQuote(sym);
-
-        // 3. Lightweight display-only health & account refresh every ~8s
+        // Lightweight display-only Kronos health check every ~8s
         if (tickCounter % 4 === 0) {
           await st.checkKronosHealth();
-          await st.fetchAccountInfo();
         }
       } catch (err) {
         console.error('[NMSSx Read-Only Monitor Poll] Error:', err);
@@ -255,14 +247,13 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
     };
   }, []);
 
-  // Live Active Forex Positions — sanitized & enriched with virtualSl/virtualTp
+  // Live Active Forex Positions — bound directly to SSOT openPositions
   const activePositions = useMemo(() => {
-    const raw =
-      Array.isArray(openPositions) && openPositions.length > 0
-        ? openPositions
-        : Array.isArray(positions)
-        ? positions
-        : [];
+    const raw = Array.isArray(openPositions)
+      ? openPositions
+      : Array.isArray(positions)
+      ? positions
+      : [];
     return raw
       .filter((p) => p && p.id !== 'F-637' && p.id !== '#F-637')
       .map((p) => {
@@ -282,9 +273,11 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
 
   const isSlotsFull = activePositions.length >= MAX_OPEN_POSITIONS;
   const entryScannerState = isSlotsFull
-    ? 'IDLE (2/2 FULL — GUARDING POSITIONS)'
+    ? '2/2 FULL — GUARDING'
     : isAutoTrading
-    ? 'ACTIVE'
+    ? 'VPS LIVE'
+    : kronosHealth?.vpsReady
+    ? 'VPS STANDBY'
     : 'IDLE';
   const forwardTightenLockRef = useRef<Record<string, number>>({});
 
@@ -1468,21 +1461,23 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
                 </div>
               </div>
 
-              {/* Multi-AI Consensus / Risk Governance + Kronos Quant Metrics Widget */}
+              {/* Kronos Quant Metrics & Risk Governance Widget */}
               <div className="p-4 rounded-xl bg-[#F8FAFC] dark:bg-slate-950/70 border border-slate-200/90 dark:border-zinc-800 space-y-3">
                 <div className="flex items-center justify-between gap-2">
                   <span className="font-mono text-xs uppercase tracking-wider font-semibold text-[#0F172A] dark:text-slate-100 flex items-center gap-1.5">
                     <BrainCircuit className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                    <span>Multi-AI Consensus / Risk Governance</span>
+                    <span>Kronos Quant Metrics</span>
                   </span>
                   <span
                     className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border shrink-0 ${
-                      kronosHealth?.vpsReady
+                      isSlotsFull
+                        ? 'bg-amber-50 dark:bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-200/80 dark:border-amber-500/30'
+                        : isAutoTrading
                         ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200/80 dark:border-emerald-500/30'
                         : 'bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
                     }`}
                   >
-                    {kronosHealth?.vpsReady ? 'VPS LIVE' : 'QUANT ENGINE'}
+                    {entryScannerState}
                   </span>
                 </div>
 

@@ -279,17 +279,6 @@ class EngineScheduler {
     try {
       const state = await stateSync.getRuntimeState();
 
-      // If auto-trading is paused or inactive, strictly stay idle without scanning or opening new signals
-      if (!state.isAutoTrading) {
-        return {
-          executed: false,
-          timestamp: Date.now(),
-          positions: state.positions || [],
-          telemetryCount: state.telemetryLogs.length,
-          message: 'Auto-trading inactive (Engine Idle)',
-        };
-      }
-
       let vaultCreds = await loadVaultCredentials();
       if (!vaultCreds && state.credentials) {
         const activeCreds = getActiveExnessCredentials(state.credentials);
@@ -309,7 +298,7 @@ class EngineScheduler {
         return {
           executed: false,
           timestamp: Date.now(),
-          positions: [],
+          positions: state.positions || [],
           telemetryCount: state.telemetryLogs.length,
           message: 'No Exness credentials configured in Vault (Engine Idle)',
         };
@@ -328,32 +317,42 @@ class EngineScheduler {
         targetSymbols = state.scannedSymbols;
       }
 
-      let updatedPositions: ManagedPosition[];
+      const slPipsCfg = state.stopLossPips ?? state.slPips ?? 25;
+      const tpPipsCfg = state.takeProfitPips ?? state.tpPips ?? 50;
+      const activeFocusSym = state.selectedSymbol || targetSymbols[0] || 'XAUUSDm';
+
+      // Authoritative live open positions from Exness (forceLive=true).
+      // On timeout/network failure, retain lastKnownGoodState (state.positions) instead of overwriting with [].
+      let updatedPositions: ManagedPosition[] = Array.isArray(state.positions) ? [...state.positions] : [];
+      let positionsFetchSucceeded = false;
       try {
-        updatedPositions = await client.fetchOpenPositions();
+        const livePositions = await client.fetchOpenPositions(true);
+        if (Array.isArray(livePositions)) {
+          updatedPositions = reconcileOrphanPositions(livePositions, state.positions || [], slPipsCfg, tpPipsCfg);
+          positionsFetchSucceeded = true;
+        }
       } catch (err: any) {
-        return {
-          executed: false,
-          timestamp: Date.now(),
-          positions: state.positions || [],
-          telemetryCount: state.telemetryLogs.length,
-          message: `Failed to fetch Exness positions: ${err?.message || err}`,
-        };
+        console.warn(`[EngineScheduler] fetchOpenPositions failed (retaining lastKnownGoodState): ${err?.message || err}`);
       }
-      let accountEquity: number | undefined;
+
+      // Authoritative account info from Exness.
+      // Never overwrite valid balance/equity with null/0/fallback on timeout.
+      let accountEquity: number | undefined =
+        typeof state.accountInfo?.equity === 'number' && state.accountInfo.equity > 0
+          ? state.accountInfo.equity
+          : undefined;
       let latestAccountInfo = state.accountInfo || null;
       try {
         const acct = await client.getAccountInfo();
-        if (acct?.equity && acct.equity > 0) {
-          accountEquity = acct.equity;
-        }
-        if (acct) {
+        if (acct && acct.connected && typeof acct.balance === 'number' && acct.balance > 0) {
+          const validEq = typeof acct.equity === 'number' && acct.equity > 0 ? acct.equity : acct.balance;
+          accountEquity = validEq;
           latestAccountInfo = {
             connected: true,
-            balance: Number(acct.balance || 0),
-            equity: Number(acct.equity || acct.balance || 0),
+            balance: Number(acct.balance),
+            equity: Number(validEq),
             margin: Number(acct.margin || 0),
-            freeMargin: Number(acct.freeMargin ?? acct.equity ?? acct.balance ?? 0),
+            freeMargin: Number(acct.freeMargin ?? validEq),
             mode: vaultCreds.mode,
             accountId: vaultCreds.accountId,
             server: vaultCreds.server,
@@ -363,6 +362,53 @@ class EngineScheduler {
       } catch {}
 
       const riskConfig: RiskGuardConfig = { ...DEFAULT_RISK_CONFIG };
+      const maxOpenPositions = riskConfig.maxOpenPositions || 2;
+
+      // If auto-trading is paused or inactive, perform read-only broker sync (quotes, positions, balance) and stay idle
+      if (!state.isAutoTrading) {
+        const standbyQuotes: Record<string, { symbol: string; bid: number; ask: number; spreadPips: number; timestamp: number }> = {};
+        const symbolsToQuote = Array.from(new Set([activeFocusSym, ...updatedPositions.map((p) => p.symbol)]));
+        for (const sym of symbolsToQuote) {
+          try {
+            const q = await client.getSymbolQuote(sym);
+            if (q && q.bid > 0 && q.ask > 0) {
+              standbyQuotes[sym] = q;
+            }
+          } catch {}
+        }
+        for (const p of updatedPositions) {
+          const q = standbyQuotes[p.symbol];
+          if (!q) continue;
+          const curPrice = p.side === 'BUY' ? q.bid : q.ask;
+          if (curPrice > 0 && !isNaN(curPrice)) {
+            const res = evaluatePositionPnL(p, q);
+            p.currentPrice = curPrice;
+            p.unrealizedPnl = res.pnlUsd;
+          }
+        }
+        const standbyScannerState =
+          updatedPositions.length >= maxOpenPositions
+            ? `IDLE (${updatedPositions.length}/${maxOpenPositions} FULL — GUARDING POSITIONS)`
+            : 'IDLE';
+        this.entryScannerState = standbyScannerState;
+        this.hasLoggedFullCapacityGuard = updatedPositions.length >= maxOpenPositions;
+
+        await stateSync.updateRuntimeState({
+          ...(positionsFetchSucceeded ? { positions: updatedPositions } : {}),
+          ...(latestAccountInfo ? { accountInfo: latestAccountInfo } : {}),
+          ...(Object.keys(standbyQuotes).length > 0 ? { quotes: standbyQuotes } : {}),
+          entryScannerState: standbyScannerState,
+          lastTickTimestamp: Date.now(),
+        });
+
+        return {
+          executed: false,
+          timestamp: Date.now(),
+          positions: updatedPositions,
+          telemetryCount: state.telemetryLogs.length,
+          message: 'Auto-trading inactive (Standby Broker Sync)',
+        };
+      }
 
       // Daily Circuit Breaker at -6% daily drawdown
       if (accountEquity && accountEquity > 0) {
@@ -404,20 +450,12 @@ class EngineScheduler {
         stateSync.addTelemetry(symbol, category, message);
       };
 
-      const slPipsCfg = state.stopLossPips ?? state.slPips ?? 25;
-      const tpPipsCfg = state.takeProfitPips ?? state.tpPips ?? 50;
-
-      // Reconcile any orphan positions from Exness (e.g. after server restart) into trailingManager
-      updatedPositions = reconcileOrphanPositions(updatedPositions, state.positions || [], slPipsCfg, tpPipsCfg);
-
-      const initialPositionCount = updatedPositions.length;
       const quotesMap: Record<string, { symbol: string; bid: number; ask: number; spreadPips: number; timestamp: number }> = {};
       const kronosBySymbolUpdate: Record<string, any> = {};
       let latestKronosPrediction = state.kronosPrediction || null;
       let latestAiVerdictUpdate = state.latestAiVerdict || null;
       let realizedPnlDelta = 0;
       let realizedLossDelta = 0;
-      const activeFocusSym = state.selectedSymbol || targetSymbols[0] || 'XAUUSDm';
 
       const recordClosedPnl = (pnl: number) => {
         realizedPnlDelta += pnl;
@@ -675,8 +713,8 @@ class EngineScheduler {
         };
       }
 
-      const maxOpenPositions = riskConfig.maxOpenPositions || 2;
-      const effectivePositionCount = Math.max(initialPositionCount, updatedPositions.length);
+      // Always compute POSITION-GUARD directly from liveOpenPositions (updatedPositions.length)
+      const effectivePositionCount = updatedPositions.length;
       const isFullCapacity = effectivePositionCount >= maxOpenPositions;
       if (isFullCapacity) {
         this.entryScannerState = 'IDLE (2/2 FULL — GUARDING POSITIONS)';

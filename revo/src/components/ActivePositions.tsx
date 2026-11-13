@@ -46,8 +46,8 @@ export const ActivePositions: React.FC = () => {
     );
   }
 
-  // Retain active open positions across reloads for passive quote updates and floating PnL/SL monitoring
-  const rawPositions = Array.isArray(openPositions) && openPositions.length > 0
+  // Single Source of Truth: bind directly to openPositions (synced from GET /api/engine-tick)
+  const rawPositions = Array.isArray(openPositions)
     ? openPositions
     : (Array.isArray(positions) ? positions : []);
   const activePositions = rawPositions.filter((p) => p && p.id !== 'F-637' && p.id !== '#F-637');

@@ -1275,9 +1275,12 @@ export const useTradingStore = create<TradingState>()(
                 };
               });
 
+              const safeBal = liveBal > 0 ? liveBal : state.balance;
+              const safeEquity = liveEquity > 0 ? liveEquity : state.equity;
+
               set({
-                balance: liveBal,
-                equity: liveEquity,
+                balance: safeBal,
+                equity: safeEquity,
                 dailyPnl: liveDailyPnL,
                 positions: evaluatedPositions,
                 openPositions: evaluatedPositions,
@@ -1285,8 +1288,8 @@ export const useTradingStore = create<TradingState>()(
                   accountNumber: snap.accountId || snap.account?.accountNumber || accountId,
                   server: snap.server || snap.account?.server || serverName,
                   currency: snap.currency || snap.account?.currency || 'USD',
-                  balance: liveBal,
-                  equity: liveEquity,
+                  balance: safeBal,
+                  equity: safeEquity,
                   margin: Number(snap.margin ?? snap.account?.margin ?? 0),
                   freeMargin: Number(snap.freeMargin ?? snap.account?.freeMargin ?? Math.max(0, liveEquity - (snap.margin ?? 0))),
                   marginLevelPct: Number(snap.marginLevelPct ?? snap.account?.marginLevelPct ?? 0),
@@ -2264,9 +2267,12 @@ export const useTradingStore = create<TradingState>()(
               const serverLot = typeof d.lotSize === 'number' && d.lotSize > 0 ? d.lotSize : 0.10;
               const serverSl = typeof d.slPips === 'number' && d.slPips > 0 ? d.slPips : (typeof d.stopLossPips === 'number' && d.stopLossPips > 0 ? d.stopLossPips : 25);
               const serverTp = typeof d.tpPips === 'number' && d.tpPips > 0 ? d.tpPips : (typeof d.takeProfitPips === 'number' && d.takeProfitPips > 0 ? d.takeProfitPips : 50);
-              const serverPositions: ManagedPosition[] = Array.isArray(d.positions)
-                ? d.positions.filter((p: any) => p && p.id !== 'F-637' && p.id !== '#F-637')
-                : [];
+              const rawServerPos = Array.isArray(d.openPositions)
+                ? d.openPositions
+                : (Array.isArray(d.positions) ? d.positions : null);
+              const serverPositions: ManagedPosition[] | null = rawServerPos
+                ? rawServerPos.filter((p: any) => p && p.id !== 'F-637' && p.id !== '#F-637')
+                : null;
 
               set((prev) => {
                 // Merge server telemetry logs with local UI logs without duplicates
@@ -2286,17 +2292,54 @@ export const useTradingStore = create<TradingState>()(
                   mergedLogs = combined.slice(0, 200);
                 }
 
-                const mergedQuotes = d.quotes && typeof d.quotes === 'object'
-                  ? { ...prev.quotes, ...d.quotes }
-                  : prev.quotes;
+                // Single Source of Truth for quotes & symbolPrices (only accept valid non-zero quotes)
+                const mergedQuotes = { ...prev.quotes };
+                const mergedSymbolPrices = { ...(prev.symbolPrices || {}) };
+                if (d.quotes && typeof d.quotes === 'object') {
+                  for (const [sym, q] of Object.entries<any>(d.quotes)) {
+                    if (q && typeof q.bid === 'number' && q.bid > 0 && typeof q.ask === 'number' && q.ask > 0) {
+                      const mid = (q.bid + q.ask) / 2;
+                      if (isValidPriceUpdate(sym, mid)) {
+                        mergedQuotes[sym] = q;
+                        mergedSymbolPrices[sym] = { bid: q.bid, ask: q.ask };
+                      }
+                    }
+                  }
+                }
 
-                const totalUnrealized = serverPositions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
-                const serverBalance = typeof d.accountInfo?.balance === 'number' && d.accountInfo.balance > 0
-                  ? d.accountInfo.balance
-                  : prev.balance;
+                // Update active chart last candle from SSOT quote
+                const activeSym = d.selectedSymbol || prev.focusSymbol || prev.selectedSymbol || 'XAUUSDm';
+                const activeQuote = mergedQuotes[activeSym];
+                let updatedCandles = prev.candles;
+                if (activeQuote && activeQuote.bid > 0 && prev.candles.length > 0) {
+                  const lastCandle = prev.candles[prev.candles.length - 1];
+                  const barBoundaryMs = timeframeToMs(prev.timeframe || 'M5');
+                  const nowTs = Date.now();
+                  if (nowTs - lastCandle.timestamp < barBoundaryMs * 2.5) {
+                    const nextCandle = { ...lastCandle };
+                    nextCandle.close = activeQuote.bid;
+                    nextCandle.high = Math.max(nextCandle.high, activeQuote.bid);
+                    nextCandle.low = Math.min(nextCandle.low, activeQuote.bid);
+                    updatedCandles = [...prev.candles.slice(0, -1), nextCandle];
+                  }
+                }
+
+                const nextPositions = serverPositions !== null ? serverPositions : prev.positions;
+                const nextOpenPositions = serverPositions !== null ? serverPositions : prev.openPositions;
+                const totalUnrealized = nextPositions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
+
+                // Never overwrite valid balance/equity with 0 or fallback on timeout
+                const hasValidServerBalance = Boolean(
+                  d.accountInfo?.connected &&
+                  typeof d.accountInfo?.balance === 'number' &&
+                  d.accountInfo.balance > 0
+                );
+                const serverBalance = hasValidServerBalance ? d.accountInfo.balance : prev.balance;
                 const nextEquity = serverBalance !== null
-                  ? (serverPositions.length === 0 ? serverBalance : Number((serverBalance + totalUnrealized).toFixed(2)))
-                  : (typeof d.accountInfo?.equity === 'number' ? d.accountInfo.equity : prev.equity);
+                  ? (nextPositions.length === 0 ? serverBalance : Number((serverBalance + totalUnrealized).toFixed(2)))
+                  : (hasValidServerBalance && typeof d.accountInfo?.equity === 'number' && d.accountInfo.equity > 0
+                    ? d.accountInfo.equity
+                    : prev.equity);
 
                 return {
                   isAutoTrading: d.circuitBreakerTriggered ? false : serverRunning,
@@ -2308,10 +2351,12 @@ export const useTradingStore = create<TradingState>()(
                   focusSymbol: d.selectedSymbol || prev.focusSymbol,
                   scannedSymbols: Array.isArray(d.scannedSymbols) && d.scannedSymbols.length > 0 ? d.scannedSymbols : prev.scannedSymbols,
                   enablePartialClose: d.enablePartialClose !== undefined ? Boolean(d.enablePartialClose) : prev.enablePartialClose,
-                  positions: Array.isArray(d.positions) ? serverPositions : prev.positions,
-                  openPositions: Array.isArray(d.positions) ? serverPositions : prev.openPositions,
+                  positions: nextPositions,
+                  openPositions: nextOpenPositions,
                   telemetryLogs: mergedLogs,
                   quotes: mergedQuotes,
+                  symbolPrices: mergedSymbolPrices,
+                  candles: updatedCandles,
                   ...(d.kronosPrediction ? { kronosPrediction: d.kronosPrediction } : {}),
                   ...(d.latestAiVerdict !== undefined ? { latestAiVerdict: d.latestAiVerdict } : {}),
                   ...(d.entryScannerState ? { entryScannerState: d.entryScannerState } : {}),
@@ -2319,10 +2364,11 @@ export const useTradingStore = create<TradingState>()(
                   ...(typeof d.dailyRealizedPnL === 'number' ? { dailyPnl: d.dailyRealizedPnL } : {}),
                   balance: serverBalance,
                   equity: nextEquity,
-                  accountInfo: d.accountInfo
+                  accountInfo: hasValidServerBalance
                     ? {
                         ...(prev.accountInfo || {}),
                         ...d.accountInfo,
+                        balance: serverBalance,
                         equity: nextEquity ?? d.accountInfo.equity,
                       }
                     : prev.accountInfo,
@@ -2467,7 +2513,7 @@ export const useTradingStore = create<TradingState>()(
           isFetchingAccountLock = false;
 
           // Sync credentials ONLY with backend server (never overwrite authoritative server isAutoTrading or positions on browser mount)
-          fetch('/api/exness', {
+          await fetch('/api/exness', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -2479,7 +2525,7 @@ export const useTradingStore = create<TradingState>()(
             }),
           }).catch(() => {});
 
-          await get().fetchAccountInfo();
+          await get().hydrateFromServer();
         }
       },
 

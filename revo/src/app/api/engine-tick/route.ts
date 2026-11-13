@@ -44,10 +44,17 @@ export const dynamic = 'force-dynamic';
 
 function sanitizeRuntimeState(state: any) {
   if (!state) return state;
+  const cleanPositions = Array.isArray(state.positions)
+    ? state.positions.filter((p: any) => p && p.id !== 'F-637' && p.id !== '#F-637')
+    : [];
   const base = {
     ...state,
     isRunning: Boolean(state.isAutoTrading),
     isAutoTrading: Boolean(state.isAutoTrading),
+    positions: cleanPositions,
+    openPositions: cleanPositions,
+    balance: typeof state.accountInfo?.balance === 'number' && state.accountInfo.balance > 0 ? state.accountInfo.balance : null,
+    equity: typeof state.accountInfo?.equity === 'number' && state.accountInfo.equity > 0 ? state.accountInfo.equity : null,
     lotSize: typeof state.lotSize === 'number' && state.lotSize > 0 ? state.lotSize : 0.10,
     maxPositions: 2,
     slPips: state.stopLossPips ?? state.slPips ?? 25,
@@ -247,10 +254,11 @@ export async function POST(req: NextRequest) {
       validSymbols = ['XAUUSDm'];
     }
 
-    // Authoritative open positions are ALWAYS read from Exness (never from the browser / local cache).
+    // Authoritative open positions are ALWAYS read live from Exness (forceLive=true).
+    // On timeout/failure, retain lastKnownGoodState (runtimeState.positions) instead of wiping to [].
     let currentPositions: ManagedPosition[];
     try {
-      currentPositions = await client.fetchOpenPositions();
+      currentPositions = await client.fetchOpenPositions(true);
       currentPositions = reconcileOrphanPositions(currentPositions, runtimeState.positions || [], stopLossPips, takeProfitPips);
     } catch (err: any) {
       log('SYSTEM', 'RISK', `Gagal membaca posisi dari Exness: ${err?.message || err}. Tick dilewati.`);
@@ -259,7 +267,7 @@ export async function POST(req: NextRequest) {
         success: false,
         error: String(err?.message || err),
         telemetry: telemetryLogs,
-        positions: [],
+        positions: runtimeState.positions || [],
         orders: [],
       }, { status: 200 });
     }
@@ -466,11 +474,11 @@ export async function POST(req: NextRequest) {
         }
       }
 
-      // 2. Pre-Trade Institutional Circuit Breakers (count both currentPositions & updatedPositions so closing in-flight never opens a 3rd slot)
+      // 2. Pre-Trade Institutional Circuit Breakers (computed directly from live updatedPositions.length)
       const riskCheck = evaluatePreTradeRisk(
         symbol,
         quote.spreadPips,
-        Math.max(currentPositions.length, updatedPositions.length),
+        updatedPositions.length,
         dailyLoss,
         mergedRisk
       );
