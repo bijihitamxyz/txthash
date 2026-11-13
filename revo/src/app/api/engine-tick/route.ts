@@ -8,6 +8,8 @@ import {
   ManagedPosition,
   sanitizePositionSlTp,
   canAttemptPositionClose,
+  reconcileOrphanPositions,
+  evaluateWatchdogEmergencyClose,
 } from '@/core/trailingManager';
 import {
   evaluatePreTradeRisk,
@@ -22,7 +24,12 @@ import {
 import { stateSync, TargetMarket } from '@/lib/stateSync';
 import { ensureSchedulerStarted } from '@/lib/engineScheduler';
 import { getActiveExnessCredentials } from '@/lib/cryptoVault';
-import { tryAcquireEngineLock, releaseEngineLock } from '@/lib/engineLock';
+import {
+  tryAcquireEngineLock,
+  releaseEngineLock,
+  tryAcquireOrderExecutionLock,
+  releaseOrderExecutionLock,
+} from '@/lib/engineLock';
 import {
   readCentralAiConfig,
   getActiveAiProviders,
@@ -36,9 +43,19 @@ import { Timeframe } from '@/core/indicatorEngine';
 export const dynamic = 'force-dynamic';
 
 function sanitizeRuntimeState(state: any) {
-  if (!state || !state.credentials) return state;
-  return {
+  if (!state) return state;
+  const base = {
     ...state,
+    isRunning: Boolean(state.isAutoTrading),
+    isAutoTrading: Boolean(state.isAutoTrading),
+    lotSize: typeof state.lotSize === 'number' && state.lotSize > 0 ? state.lotSize : 0.10,
+    maxPositions: 2,
+    slPips: state.stopLossPips ?? state.slPips ?? 25,
+    tpPips: state.takeProfitPips ?? state.tpPips ?? 50,
+  };
+  if (!state.credentials) return base;
+  return {
+    ...base,
     credentials: {
       accountMode: state.credentials.accountMode,
       demoAccountId: state.credentials.demoAccountId,
@@ -224,6 +241,7 @@ export async function POST(req: NextRequest) {
     let currentPositions: ManagedPosition[];
     try {
       currentPositions = await client.fetchOpenPositions();
+      currentPositions = reconcileOrphanPositions(currentPositions, runtimeState.positions || [], stopLossPips, takeProfitPips);
     } catch (err: any) {
       log('SYSTEM', 'RISK', `Gagal membaca posisi dari Exness: ${err?.message || err}. Tick dilewati.`);
       return NextResponse.json({
@@ -302,6 +320,29 @@ export async function POST(req: NextRequest) {
         }
         pos.currentPrice = curPrice;
         sanitizePositionSlTp(pos, curPrice, stopLossPips, takeProfitPips);
+
+        // 1.0 Watchdog Emergency Close Sweeper (checks every tick regardless of candle/trailing state)
+        const watchdog = evaluateWatchdogEmergencyClose(pos, curPrice, profile, stopLossPips);
+        if (watchdog.shouldClose) {
+          if (!canAttemptPositionClose(pos.id)) {
+            pos.isClosing = true;
+            continue;
+          }
+          const realizedPnl = watchdog.unrealizedPnl;
+          log(symbol, 'RISK', watchdog.reason || `[WATCHDOG EMERGENCY CLOSE] #${pos.id} breached Hard SL (-${stopLossPips} pips).`);
+          dualRoomProtections.recordStopLossHit(symbol, 'forex', 'WATCHDOG_HARD_SL');
+          pos.isClosing = true;
+          pos.closingStartedAt = Date.now();
+          const closeRes = await client.closePosition(pos.id, undefined, symbol);
+          if (closeRes.success) {
+            closedTrades.push({ id: pos.id, symbol, pnl: realizedPnl, reason: 'WATCHDOG_HARD_SL' });
+            const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
+            if (posIdx !== -1) {
+              updatedPositions.splice(posIdx, 1);
+            }
+          }
+          continue;
+        }
 
         // 1a. Take Profit hit verification
         if (pos.currentTp > 0 && (isBuy ? curPrice >= pos.currentTp : curPrice <= pos.currentTp)) {
@@ -618,20 +659,38 @@ export async function POST(req: NextRequest) {
         ? Number((refPrice + userTpPips * pipVal).toFixed(profile.digits))
         : Number((refPrice - userTpPips * pipVal).toFixed(profile.digits));
 
-      log(
-        symbolSnapshot,
-        'ORDER',
-        `Placing ${activeCreds.mode} ${signalResult.side} order for ${safeVolume} lots on ${symbolSnapshot} (SL: ${userSlPips} pips, TP: ${userTpPips} pips)...`
-      );
+      const orderLockToken = tryAcquireOrderExecutionLock('api-tick');
+      if (!orderLockToken) {
+        log(symbolSnapshot, 'RISK', `[ORDER_MUTEX] Skipping ${signalResult.side} ${symbolSnapshot}: another order execution is currently in-flight.`);
+        continue;
+      }
 
-      const orderResult = await client.placeMarketOrder({
-        symbol: symbolSnapshot,
-        side: signalResult.side,
-        volume: safeVolume,
-        stopLossPrice: computedSlPrice,
-        takeProfitPrice: computedTpPrice,
-        comment: `EXN_${activeCreds.mode}_AI${aiVerdict.confidence_score}`,
-      });
+      let orderResult: any;
+      try {
+        // Live fetch directly from Exness API right before placing order (never trust cached counts)
+        const liveOpenPositions = await client.fetchOpenPositions(true);
+        if (liveOpenPositions.length >= 2) {
+          log(symbolSnapshot, 'RISK', `[POSITION_GUARD] Max 2 positions reached on Exness server (${liveOpenPositions.length}/2). Order aborted.`);
+          break;
+        }
+
+        log(
+          symbolSnapshot,
+          'ORDER',
+          `Placing ${activeCreds.mode} ${signalResult.side} order for ${safeVolume} lots on ${symbolSnapshot} (SL: ${userSlPips} pips, TP: ${userTpPips} pips)...`
+        );
+
+        orderResult = await client.placeMarketOrder({
+          symbol: symbolSnapshot,
+          side: signalResult.side,
+          volume: safeVolume,
+          stopLossPrice: computedSlPrice,
+          takeProfitPrice: computedTpPrice,
+          comment: `EXN_${activeCreds.mode}_AI${aiVerdict.confidence_score}`,
+        });
+      } finally {
+        releaseOrderExecutionLock(orderLockToken);
+      }
 
       if (orderResult.marginAutoScaleLog) {
         log(symbolSnapshot, 'ORDER', orderResult.marginAutoScaleLog);

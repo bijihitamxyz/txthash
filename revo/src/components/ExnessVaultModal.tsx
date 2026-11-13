@@ -129,17 +129,21 @@ export const ExnessVaultModal: React.FC = () => {
           },
         });
 
-        await setCredentials({
-          accountMode: mode,
-          demoAccountId: mode === 'DEMO' ? cleanAccountId : undefined,
-          demoServer: mode === 'DEMO' ? cleanServer : undefined,
-          demoApiKey: mode === 'DEMO' ? cleanApiKey : undefined,
-          demoApiSecret: mode === 'DEMO' ? cleanPrivateKey : undefined,
-          realAccountId: mode === 'REAL' ? cleanAccountId : undefined,
-          realServer: mode === 'REAL' ? cleanServer : undefined,
-          realApiKey: mode === 'REAL' ? cleanApiKey : undefined,
-          realApiSecret: mode === 'REAL' ? cleanPrivateKey : undefined,
-        });
+        try {
+          await setCredentials({
+            accountMode: mode,
+            demoAccountId: mode === 'DEMO' ? cleanAccountId : undefined,
+            demoServer: mode === 'DEMO' ? cleanServer : undefined,
+            demoApiKey: mode === 'DEMO' ? cleanApiKey : undefined,
+            demoApiSecret: mode === 'DEMO' ? cleanPrivateKey : undefined,
+            realAccountId: mode === 'REAL' ? cleanAccountId : undefined,
+            realServer: mode === 'REAL' ? cleanServer : undefined,
+            realApiKey: mode === 'REAL' ? cleanApiKey : undefined,
+            realApiSecret: mode === 'REAL' ? cleanPrivateKey : undefined,
+          });
+        } catch (vaultErr) {
+          console.warn('[ExnessVaultModal] Local vault sync warning (server vault already saved):', vaultErr);
+        }
 
         addTelemetryLog(
           'VAULT',

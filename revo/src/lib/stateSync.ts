@@ -10,7 +10,13 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { getDataDir, safeMkdirSync, getNemesisMemoryStore } from './dataStore';
+import {
+  getDataDir,
+  safeMkdirSync,
+  getNemesisMemoryStore,
+  readDataFileAsync,
+  writeDataFileAsync,
+} from './dataStore';
 import {
   encryptCredential,
   decryptCredential,
@@ -33,6 +39,7 @@ export interface StateTelemetryItem {
 export interface BotRuntimeState {
   activeRoom?: 'FOREX' | 'CRYPTO';
   isAutoTrading: boolean;
+  isRunning: boolean;
   cryptoIsAutoTrading: boolean;
   cryptoMarginUsdt?: number;
   cryptoLeverage?: number;
@@ -44,8 +51,11 @@ export interface BotRuntimeState {
   isMultiPairMode: boolean;
   scannedSymbols: string[];
   lotSize: number;
+  maxPositions: number;
   stopLossPips?: number;
   takeProfitPips?: number;
+  slPips: number;
+  tpPips: number;
   aiConfidenceThreshold: number;
   enablePartialClose: boolean;
   positions: ManagedPosition[];
@@ -60,6 +70,7 @@ export interface BotRuntimeState {
 export const DEFAULT_STATE: BotRuntimeState = {
   activeRoom: 'FOREX',
   isAutoTrading: false,
+  isRunning: false,
   cryptoIsAutoTrading: false,
   cryptoMarginUsdt: 25.0,
   cryptoLeverage: 10,
@@ -71,8 +82,11 @@ export const DEFAULT_STATE: BotRuntimeState = {
   isMultiPairMode: false,
   scannedSymbols: ['XAUUSDm', 'EURUSDm', 'GBPUSDm', 'USDJPYm'],
   lotSize: 0.10,
+  maxPositions: 2,
   stopLossPips: 25,
   takeProfitPips: 50,
+  slPips: 25,
+  tpPips: 50,
   aiConfidenceThreshold: 70,
   enablePartialClose: true,
   positions: [],
@@ -145,6 +159,36 @@ class StateSyncManager {
         : this.inMemoryState.credentials,
     };
 
+    // Synchronize isRunning <-> isAutoTrading
+    if (partial.isRunning !== undefined && partial.isAutoTrading === undefined) {
+      this.inMemoryState.isAutoTrading = Boolean(partial.isRunning);
+    }
+    this.inMemoryState.isRunning = Boolean(this.inMemoryState.isAutoTrading);
+
+    // Synchronize lotSize (lock default at 0.10 if invalid)
+    if (typeof this.inMemoryState.lotSize !== 'number' || !isFinite(this.inMemoryState.lotSize) || this.inMemoryState.lotSize <= 0) {
+      this.inMemoryState.lotSize = 0.10;
+    }
+    this.inMemoryState.maxPositions = 2;
+
+    // Synchronize slPips <-> stopLossPips & tpPips <-> takeProfitPips
+    if (partial.slPips !== undefined && partial.stopLossPips === undefined) {
+      this.inMemoryState.stopLossPips = partial.slPips;
+    }
+    if (partial.tpPips !== undefined && partial.takeProfitPips === undefined) {
+      this.inMemoryState.takeProfitPips = partial.tpPips;
+    }
+    const resolvedSl = typeof this.inMemoryState.stopLossPips === 'number' && this.inMemoryState.stopLossPips > 0
+      ? this.inMemoryState.stopLossPips
+      : 25;
+    const resolvedTp = typeof this.inMemoryState.takeProfitPips === 'number' && this.inMemoryState.takeProfitPips > 0
+      ? this.inMemoryState.takeProfitPips
+      : 50;
+    this.inMemoryState.stopLossPips = resolvedSl;
+    this.inMemoryState.slPips = resolvedSl;
+    this.inMemoryState.takeProfitPips = resolvedTp;
+    this.inMemoryState.tpPips = resolvedTp;
+
     // If targetMarket is updated, synchronize scannedSymbols and selectedSymbol (unless selectedSymbol is explicitly specified)
     if (partial.targetMarket) {
       if (partial.targetMarket === 'GOLD') {
@@ -177,8 +221,19 @@ class StateSyncManager {
     // Always keep in-memory singleton updated
     globalThis.__EXNESS_BOT_STATE__ = { ...this.inMemoryState };
 
+    const isCriticalChange =
+      partial.isAutoTrading !== undefined ||
+      partial.isRunning !== undefined ||
+      partial.lotSize !== undefined ||
+      partial.stopLossPips !== undefined ||
+      partial.slPips !== undefined ||
+      partial.takeProfitPips !== undefined ||
+      partial.tpPips !== undefined ||
+      partial.targetMarket !== undefined ||
+      partial.enablePartialClose !== undefined;
+
     try {
-      await this.persistToDisk();
+      await this.persistToDisk(isCriticalChange);
     } catch {
       // Silently fall back to in-memory globalThis.__EXNESS_BOT_STATE__ singleton without throwing any error
     }
@@ -201,6 +256,7 @@ class StateSyncManager {
   }
 
   private async loadFromDisk(): Promise<void> {
+    let parsedEnc: any = null;
     try {
       const nemesis = getNemesisMemoryStore();
       const targetFile = getStateFilePath();
@@ -212,29 +268,62 @@ class StateSyncManager {
       }
       if (encrypted && encrypted.trim().length > 0) {
         const decrypted = await decryptCredential(encrypted);
-        const parsed = JSON.parse(decrypted);
-        this.inMemoryState = {
-          ...DEFAULT_STATE,
-          ...parsed,
-          isAutoTrading: Boolean(parsed.isAutoTrading),
-          cryptoIsAutoTrading: false, // strictly default to false on server startup to prevent ghost trades
-          cryptoMarginUsdt: typeof parsed.cryptoMarginUsdt === 'number' ? parsed.cryptoMarginUsdt : 25.0,
-          cryptoLeverage: typeof parsed.cryptoLeverage === 'number' ? parsed.cryptoLeverage : 10,
-          cryptoMarginMode: parsed.cryptoMarginMode || 'ISOLATED',
-          cryptoMaxConcurrentCoins: typeof parsed.cryptoMaxConcurrentCoins === 'number' ? parsed.cryptoMaxConcurrentCoins : 5,
-          positions: Array.isArray(parsed.positions) ? parsed.positions : [],
-          credentials: {
-            ...DEFAULT_CREDENTIALS,
-            ...(parsed.credentials || {}),
-          },
-        };
-        globalThis.__EXNESS_BOT_STATE__ = { ...this.inMemoryState };
+        parsedEnc = JSON.parse(decrypted);
         nemesis['exness-bot-state.enc'] = encrypted;
-        this.isLoadedFromDisk = true;
-        return;
       }
     } catch {
-      // Silently fall back to in-memory globalThis.__EXNESS_BOT_STATE__ singleton without throwing any error
+      // Silently fall back
+    }
+
+    let parsedEngineJson: any = null;
+    try {
+      const rawEngineJson = await readDataFileAsync('engine-state.json', '');
+      if (rawEngineJson && rawEngineJson.trim().length > 0) {
+        parsedEngineJson = JSON.parse(rawEngineJson);
+      }
+    } catch {}
+
+    const parsed = parsedEnc || parsedEngineJson;
+    if (parsed) {
+      const isRun = Boolean(parsedEngineJson?.isRunning ?? parsed.isRunning ?? parsed.isAutoTrading);
+      const lot = typeof (parsedEngineJson?.lotSize ?? parsed.lotSize) === 'number' && (parsedEngineJson?.lotSize ?? parsed.lotSize) > 0
+        ? (parsedEngineJson?.lotSize ?? parsed.lotSize)
+        : 0.10;
+      const sl = typeof (parsedEngineJson?.slPips ?? parsed.slPips ?? parsed.stopLossPips) === 'number' && (parsedEngineJson?.slPips ?? parsed.slPips ?? parsed.stopLossPips) > 0
+        ? (parsedEngineJson?.slPips ?? parsed.slPips ?? parsed.stopLossPips)
+        : 25;
+      const tp = typeof (parsedEngineJson?.tpPips ?? parsed.tpPips ?? parsed.takeProfitPips) === 'number' && (parsedEngineJson?.tpPips ?? parsed.tpPips ?? parsed.takeProfitPips) > 0
+        ? (parsedEngineJson?.tpPips ?? parsed.tpPips ?? parsed.takeProfitPips)
+        : 50;
+      const positions = Array.isArray(parsedEngineJson?.positions) && parsedEngineJson.positions.length > 0
+        ? parsedEngineJson.positions
+        : (Array.isArray(parsed.positions) ? parsed.positions : []);
+
+      this.inMemoryState = {
+        ...DEFAULT_STATE,
+        ...parsed,
+        isAutoTrading: isRun,
+        isRunning: isRun,
+        lotSize: lot,
+        maxPositions: 2,
+        stopLossPips: sl,
+        slPips: sl,
+        takeProfitPips: tp,
+        tpPips: tp,
+        cryptoIsAutoTrading: false, // strictly default to false on server startup to prevent ghost trades
+        cryptoMarginUsdt: typeof parsed.cryptoMarginUsdt === 'number' ? parsed.cryptoMarginUsdt : 25.0,
+        cryptoLeverage: typeof parsed.cryptoLeverage === 'number' ? parsed.cryptoLeverage : 10,
+        cryptoMarginMode: parsed.cryptoMarginMode || 'ISOLATED',
+        cryptoMaxConcurrentCoins: typeof parsed.cryptoMaxConcurrentCoins === 'number' ? parsed.cryptoMaxConcurrentCoins : 5,
+        positions,
+        credentials: {
+          ...DEFAULT_CREDENTIALS,
+          ...(parsed.credentials || {}),
+        },
+      };
+      globalThis.__EXNESS_BOT_STATE__ = { ...this.inMemoryState };
+      this.isLoadedFromDisk = true;
+      return;
     }
 
     if (globalThis.__EXNESS_BOT_STATE__) {
@@ -252,21 +341,18 @@ class StateSyncManager {
     this.isLoadedFromDisk = true;
   }
 
-  private async persistToDisk(): Promise<void> {
+  private async persistToDisk(immediate: boolean = false): Promise<void> {
     // Keep in-memory singleton up to date
     globalThis.__EXNESS_BOT_STATE__ = { ...this.inMemoryState };
 
-    // Debounced/coalesced disk write: encrypting (PBKDF2 100k) + rewriting the whole state file on
-    // EVERY 3s tick burns CPU on small VPS instances. In-memory state is always authoritative;
-    // the disk copy is only for restart recovery, so writing at most every PERSIST_MIN_INTERVAL_MS is enough.
     const now = Date.now();
     const elapsed = now - this.lastPersistAt;
-    if (elapsed >= PERSIST_MIN_INTERVAL_MS && !this.persistInFlight) {
+    if ((immediate || elapsed >= PERSIST_MIN_INTERVAL_MS) && !this.persistInFlight) {
       await this.writeStateToDisk();
       return;
     }
     if (!this.persistTimer) {
-      const delay = Math.max(250, PERSIST_MIN_INTERVAL_MS - elapsed);
+      const delay = immediate ? 50 : Math.max(250, PERSIST_MIN_INTERVAL_MS - elapsed);
       this.persistTimer = setTimeout(() => {
         this.persistTimer = null;
         this.writeStateToDisk().catch(() => {});
@@ -290,6 +376,24 @@ class StateSyncManager {
     this.persistInFlight = true;
     this.lastPersistAt = Date.now();
     try {
+      // 1. Persist clean engine-state.json (for fast VPS restart recovery of isRunning, lotSize, maxPositions, slPips, tpPips, trailing state)
+      const engineStatePayload = {
+        isRunning: Boolean(this.inMemoryState.isAutoTrading),
+        isAutoTrading: Boolean(this.inMemoryState.isAutoTrading),
+        lotSize: this.inMemoryState.lotSize || 0.10,
+        maxPositions: 2,
+        slPips: this.inMemoryState.stopLossPips ?? 25,
+        tpPips: this.inMemoryState.takeProfitPips ?? 50,
+        targetMarket: this.inMemoryState.targetMarket,
+        selectedSymbol: this.inMemoryState.selectedSymbol,
+        scannedSymbols: this.inMemoryState.scannedSymbols,
+        enablePartialClose: this.inMemoryState.enablePartialClose,
+        positions: this.inMemoryState.positions || [],
+        updatedAt: Date.now(),
+      };
+      await writeDataFileAsync('engine-state.json', JSON.stringify(engineStatePayload, null, 2));
+
+      // 2. Persist full encrypted state
       const json = JSON.stringify(this.inMemoryState);
       const encrypted = await encryptCredential(json);
       try {

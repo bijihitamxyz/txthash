@@ -251,6 +251,132 @@ export function sanitizePositionSlTp(
   return pos;
 }
 
+declare global {
+  // eslint-disable-next-line no-var
+  var __nemesisTrailingRegistry: Map<string, ManagedPosition> | undefined;
+}
+
+export function getTrailingRegistry(): Map<string, ManagedPosition> {
+  if (!globalThis.__nemesisTrailingRegistry) {
+    globalThis.__nemesisTrailingRegistry = new Map<string, ManagedPosition>();
+  }
+  return globalThis.__nemesisTrailingRegistry;
+}
+
+/**
+ * Reconciles live Exness open positions against persisted/in-memory trailing state.
+ * Any orphan position (e.g. after VPS restart) is automatically registered based on its openPrice (entryPrice)
+ * with Hard SL (default 25 pips) and Hard TP (default 50 pips).
+ */
+export function reconcileOrphanPositions(
+  livePositions: ManagedPosition[],
+  persistedPositions: ManagedPosition[] = [],
+  slPips: number = 25,
+  tpPips: number = 50
+): ManagedPosition[] {
+  const registry = getTrailingRegistry();
+  const persistedMap = new Map<string, ManagedPosition>();
+  for (const p of persistedPositions || []) {
+    if (p?.id) persistedMap.set(normTicketId(p.id), p);
+  }
+
+  const activeIds = new Set<string>();
+  const reconciled = (livePositions || []).map((live) => {
+    const cleanId = normTicketId(live.id);
+    activeIds.add(cleanId);
+    const prev = registry.get(cleanId) || persistedMap.get(cleanId);
+    const curPx = (live.currentPrice && live.currentPrice > 0) ? live.currentPrice : (prev?.currentPrice || live.entryPrice);
+
+    const merged: ManagedPosition = {
+      ...live,
+      currentPrice: curPx,
+      highestPrice: prev?.highestPrice && prev.highestPrice > 0
+        ? Math.max(prev.highestPrice, live.entryPrice, curPx)
+        : Math.max(live.entryPrice, curPx),
+      lowestPrice: prev?.lowestPrice && prev.lowestPrice > 0
+        ? Math.min(prev.lowestPrice, live.entryPrice, curPx)
+        : Math.min(live.entryPrice, curPx),
+      partialClosed: Boolean(live.partialClosed || prev?.partialClosed),
+      trailingStatus: prev?.trailingStatus || live.trailingStatus || 'INITIAL',
+      strictRatchetLocked: Boolean(live.strictRatchetLocked || prev?.strictRatchetLocked),
+      elasticFloorLocked: Boolean(live.elasticFloorLocked || prev?.elasticFloorLocked),
+      openTime: live.openTime || prev?.openTime || Date.now(),
+    };
+
+    sanitizePositionSlTp(merged, curPx, slPips, tpPips);
+    registry.set(cleanId, merged);
+    return merged;
+  });
+
+  // Prune closed tickets from registry
+  for (const key of Array.from(registry.keys())) {
+    if (!activeIds.has(key)) {
+      registry.delete(key);
+    }
+  }
+
+  return reconciled;
+}
+
+/**
+ * Watchdog Emergency Close Sweeper:
+ * Evaluates pip distance and floating PnL on every 3s tick.
+ * If loss reaches or breaches -slPips (e.g. <= -25 pips, or <= -$25.00 for 0.10 lot on XAUUSDm),
+ * returns shouldClose: true immediately so the server executes a Market Close Position without exception.
+ */
+export function evaluateWatchdogEmergencyClose(
+  position: ManagedPosition,
+  currentPrice: number,
+  pairProfile: PairProfile,
+  slPips: number = 25
+): { shouldClose: boolean; profitPips: number; unrealizedPnl: number; hardSlLimitUsd: number; reason?: string } {
+  const effectiveSlPips = Math.max(5, slPips || 25);
+  const isBuy = position.side === 'BUY';
+  const isGold = pairProfile.category === 'METAL' || pairProfile.symbol === 'XAUUSDm';
+  const pipVal = isGold ? 0.10 : pairProfile.pipValue;
+
+  if (!currentPrice || currentPrice <= 0 || !isFinite(currentPrice) || !(position.entryPrice > 0)) {
+    return { shouldClose: false, profitPips: 0, unrealizedPnl: position.unrealizedPnl || 0, hardSlLimitUsd: 0 };
+  }
+
+  const profitDist = isBuy ? (currentPrice - position.entryPrice) : (position.entryPrice - currentPrice);
+  const profitPips = priceDiffToPips(profitDist, pipVal);
+
+  let unrealizedPnl = 0;
+  if (isGold) {
+    unrealizedPnl = profitDist * (position.volume * 100);
+  } else {
+    unrealizedPnl = calculatePnL(position.side, position.entryPrice, currentPrice, position.volume, pairProfile).pnlUsd;
+  }
+  unrealizedPnl = Number(unrealizedPnl.toFixed(2));
+  position.unrealizedPnl = unrealizedPnl;
+
+  let pipValueUsdPerLot = 10;
+  if (isGold) {
+    pipValueUsdPerLot = 100 * pipVal; // $10 per pip per 1.0 lot -> $1.00 per pip per 0.10 lot
+  } else if (pairProfile.symbol.startsWith('USDJPY')) {
+    pipValueUsdPerLot = (100000 * pipVal) / (currentPrice > 0 ? currentPrice : 157.0);
+  } else {
+    pipValueUsdPerLot = (pairProfile.contractSize || 100000) * pipVal;
+  }
+
+  const hardSlLimitUsd = -Number((position.volume * pipValueUsdPerLot * effectiveSlPips).toFixed(2));
+  const breachedPips = profitPips <= -effectiveSlPips;
+  const breachedUsd = hardSlLimitUsd < 0 && unrealizedPnl <= hardSlLimitUsd;
+
+  if (breachedPips || breachedUsd) {
+    return {
+      shouldClose: true,
+      profitPips,
+      unrealizedPnl,
+      hardSlLimitUsd,
+      reason: `[WATCHDOG EMERGENCY CLOSE] #${position.id} ${position.symbol} ${position.side} breached Hard SL (${profitPips.toFixed(1)} pips <= -${effectiveSlPips} pips | PnL $${unrealizedPnl.toFixed(2)} <= $${hardSlLimitUsd.toFixed(2)}). Executing Market Close immediately.`,
+    };
+  }
+
+  return { shouldClose: false, profitPips, unrealizedPnl, hardSlLimitUsd };
+}
+
 export interface TrailingAction {
   type: 'NONE' | 'PARTIAL_CLOSE' | 'MODIFY_SL' | 'PARTIAL_AND_MODIFY_SL' | 'HARD_SL_CLOSE';
   positionId: string;

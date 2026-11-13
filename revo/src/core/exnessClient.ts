@@ -3010,9 +3010,44 @@ export class ExnessClient {
   public async placeMarketOrder(req: OrderPlacementRequest): Promise<OrderExecutionResult> {
     const profile = getPairProfile(req.symbol);
     const accountId = String(this.credentials.accountId || '').trim();
-    const validVolume = roundLotVolume(req.volume, profile.minLot, profile.lotStep);
+    const validVolume = roundLotVolume(req.volume || 0.10, profile.minLot, profile.lotStep);
     let currentVolume = validVolume;
     const sideLower = (req.side === 'SELL' ? 'sell' : 'buy') as 'buy' | 'sell';
+
+    // HARD GATE MAX 2 POSITIONS: Always perform a live fetch directly from Exness API before placing any order
+    const liveOpenPositions = await this.fetchOpenPositions(true).catch(() => [] as ManagedPosition[]);
+    if (liveOpenPositions.length >= 2) {
+      const guardMsg = `[POSITION_GUARD] Max 2 positions reached on Exness server (${liveOpenPositions.length}/2). Order aborted.`;
+      console.warn(guardMsg);
+      return {
+        success: false,
+        orderId: '',
+        symbol: profile.symbol,
+        side: req.side,
+        fillPrice: 0,
+        volume: currentVolume,
+        stopLoss: req.stopLossPrice || 0,
+        takeProfit: req.takeProfitPrice || 0,
+        timestamp: Date.now(),
+        message: guardMsg,
+      };
+    }
+
+    // Ensure Hard SL (25 pips) and Hard TP (50 pips) are always computed and sent to Exness/MT5
+    const isGold = profile.symbol === 'XAUUSDm' || profile.symbol.startsWith('XAU');
+    const pipVal = isGold ? 0.10 : profile.pipValue;
+    const liveQuote = realTimeFeed.getLiveQuote(req.symbol);
+    const refPrice = req.side === 'BUY' ? (liveQuote.ask || liveQuote.bid) : (liveQuote.bid || liveQuote.ask);
+    const resolvedSlPrice = req.stopLossPrice && req.stopLossPrice > 0
+      ? req.stopLossPrice
+      : (refPrice > 0
+          ? Number((req.side === 'BUY' ? refPrice - 25 * pipVal : refPrice + 25 * pipVal).toFixed(profile.digits))
+          : undefined);
+    const resolvedTpPrice = req.takeProfitPrice && req.takeProfitPrice > 0
+      ? req.takeProfitPrice
+      : (refPrice > 0
+          ? Number((req.side === 'BUY' ? refPrice + 50 * pipVal : refPrice - 50 * pipVal).toFixed(profile.digits))
+          : undefined);
 
     // Base instrument name (e.g. "XAUUSD" for "XAUUSDm")
     const instName = req.symbol.endsWith('m') ? req.symbol.slice(0, -1) : req.symbol;
@@ -3023,17 +3058,17 @@ export class ExnessClient {
       volume: String(currentVolume),
     };
 
-    if (req.stopLossPrice) {
-      orderBody.stop_loss = formatPrice(req.stopLossPrice, profile.digits);
+    if (resolvedSlPrice) {
+      orderBody.stop_loss = formatPrice(resolvedSlPrice, profile.digits);
     }
-    if (req.takeProfitPrice) {
-      orderBody.take_profit = formatPrice(req.takeProfitPrice, profile.digits);
+    if (resolvedTpPrice) {
+      orderBody.take_profit = formatPrice(resolvedTpPrice, profile.digits);
     }
     if (req.comment) {
       orderBody.comment = String(req.comment).slice(0, 31);
     }
 
-    let strippedSlTp = !req.stopLossPrice && !req.takeProfitPrice && !req.comment;
+    let strippedSlTp = !resolvedSlPrice && !resolvedTpPrice && !req.comment;
     let scaledToMinLot = currentVolume <= 0.01;
     let marginAutoScaleLog: string | undefined = undefined;
 
@@ -3125,14 +3160,14 @@ export class ExnessClient {
           (req.side === 'BUY'
             ? realTimeFeed.getLiveQuote(req.symbol).ask
             : realTimeFeed.getLiveQuote(req.symbol).bid);
-        const sl = num(matchedPos?.currentSl, orderBody.stop_loss) ?? (req.stopLossPrice || 0);
-        const tp = num(matchedPos?.currentTp, orderBody.take_profit) ?? (req.takeProfitPrice || 0);
+        const sl = num(matchedPos?.currentSl, orderBody.stop_loss) ?? (resolvedSlPrice || 0);
+        const tp = num(matchedPos?.currentTp, orderBody.take_profit) ?? (resolvedTpPrice || 0);
         const filledVolume = matchedPos?.volume ?? currentVolume;
 
-        // If inline SL/TP was stripped on retry, attempt async post-fill position modification while trailingManager also tracks SL/TP
+        // If inline SL/TP was stripped on retry, enforce Hard SL/TP via awaited post-fill position modification
         const finalId = String(orderId || operationId || `LOCAL-${Date.now()}`);
-        if (strippedSlTp && (req.stopLossPrice || req.takeProfitPrice) && finalId && !finalId.startsWith('LOCAL-')) {
-          this.modifyPositionInternal(finalId, req.stopLossPrice, req.takeProfitPrice, req.symbol).catch(() => {});
+        if (strippedSlTp && (resolvedSlPrice || resolvedTpPrice) && finalId && !finalId.startsWith('LOCAL-')) {
+          await this.modifyPositionInternal(finalId, resolvedSlPrice, resolvedTpPrice, req.symbol).catch(() => {});
         }
 
         // Persist the filled order in the server-side activeForexPositions ledger keyed by accountId so the next
@@ -3640,7 +3675,7 @@ export class ExnessClient {
     });
   }
 
-  public async fetchOpenPositions(): Promise<ManagedPosition[]> {
+  public async fetchOpenPositions(forceLive: boolean = false): Promise<ManagedPosition[]> {
     if (!this.hasCredentials()) {
       return [];
     }
@@ -3651,7 +3686,8 @@ export class ExnessClient {
 
     // If WebSocket events stream is connected and account is verified:
     // Serve from realTimeFeed (maintained in real time by WebSocket events) if polled < 20s ago
-    if (coreState.liveAccount?.isVerified && (now - (coreState.lastPositionsPollTime || 0)) < POSITIONS_POLL_INTERVAL_MS) {
+    // Unless forceLive === true (e.g. pre-order Max 2 Position Guard)
+    if (!forceLive && coreState.liveAccount?.isVerified && (now - (coreState.lastPositionsPollTime || 0)) < POSITIONS_POLL_INTERVAL_MS) {
       // Merge with activeForexPositions ledger (never drop locally-filled orders) + refresh floating PnL
       return mergeRemoteWithActiveForexPositions(cleanAccountId, realTimeFeed.getPositions().filter((p) => p.source !== 'LOCAL_LEDGER' && p.seenOnBroker !== false), false);
     }

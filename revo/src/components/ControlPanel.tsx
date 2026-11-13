@@ -25,6 +25,7 @@ export const ControlPanel: React.FC = () => {
   const selectedSymbol = useTradingStore((s) => s.selectedSymbol);
   const setFocusSymbol = useTradingStore((s) => s.setFocusSymbol);
   const isAutoTrading = useTradingStore((s) => s.isAutoTrading);
+  const isServerHydrated = useTradingStore((s) => s.isServerHydrated);
   const toggleAutoTrading = useTradingStore((s) => s.toggleAutoTrading);
   const panicCloseAll = useTradingStore((s) => s.panicCloseAll);
   const openPositions = useTradingStore((s) => s.openPositions);
@@ -99,14 +100,19 @@ export const ControlPanel: React.FC = () => {
       <div>
         <button
           type="button"
+          disabled={!isServerHydrated}
           onClick={() => toggleAutoTrading()}
-          className={`w-full py-3.5 px-4 rounded-xl font-bold flex items-center justify-center gap-2 shadow-sm transition-all text-sm cursor-pointer ${
-            isAutoTrading
-              ? 'bg-rose-600 hover:bg-rose-700 text-white animate-pulse'
-              : 'bg-indigo-600 hover:bg-indigo-700 text-white'
+          className={`w-full py-3.5 px-4 rounded-xl font-bold flex items-center justify-center gap-2 shadow-sm transition-all text-sm ${
+            !isServerHydrated
+              ? 'bg-slate-400 text-white cursor-wait opacity-75'
+              : isAutoTrading
+              ? 'bg-rose-600 hover:bg-rose-700 text-white animate-pulse cursor-pointer'
+              : 'bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer'
           }`}
         >
-          {isAutoTrading ? (
+          {!isServerHydrated ? (
+            <span>SYNCING SERVER STATE...</span>
+          ) : isAutoTrading ? (
             <>
               <Square className="w-4 h-4 fill-white" />
               <span>STOP AUTO-TRADING</span>

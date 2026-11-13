@@ -33,6 +33,8 @@ import {
   ManagedPosition,
   sanitizePositionSlTp,
   canAttemptPositionClose,
+  reconcileOrphanPositions,
+  evaluateWatchdogEmergencyClose,
 } from '@/core/trailingManager';
 import {
   evaluatePreTradeRisk,
@@ -51,7 +53,12 @@ import {
 } from '@/core/cryptoSignalEngine';
 import { computeIndicatorSnapshot } from '@/core/indicatorEngine';
 import { globalSingleton, withTimeout } from './globalSingleton';
-import { tryAcquireEngineLock, releaseEngineLock } from './engineLock';
+import {
+  tryAcquireEngineLock,
+  releaseEngineLock,
+  tryAcquireOrderExecutionLock,
+  releaseOrderExecutionLock,
+} from './engineLock';
 
 // Hard upper bound for one engine cycle. Every network call already has its own timeout,
 // this is the last line of defence so a single hung await can never freeze the engine forever.
@@ -369,10 +376,16 @@ class EngineScheduler {
         stateSync.addTelemetry(symbol, category, message);
       };
 
+      const slPipsCfg = state.stopLossPips ?? state.slPips ?? 25;
+      const tpPipsCfg = state.takeProfitPips ?? state.tpPips ?? 50;
+
+      // Reconcile any orphan positions from Exness (e.g. after server restart) into trailingManager
+      updatedPositions = reconcileOrphanPositions(updatedPositions, state.positions || [], slPipsCfg, tpPipsCfg);
+
       const initialPositionCount = updatedPositions.length;
 
-      // 1. Process Trailing Stops & Partial Closes for all active positions
-      for (const pos of updatedPositions) {
+      // 1. Process Watchdog Emergency Close & Trailing Stops / Partial Closes for all active positions
+      for (const pos of [...updatedPositions]) {
         const profile = getPairProfile(pos.symbol);
         const quote = await client.getSymbolQuote(pos.symbol);
         const curPrice = pos.side === 'BUY' ? quote.bid : quote.ask;
@@ -388,7 +401,26 @@ class EngineScheduler {
           }
         }
         pos.currentPrice = curPrice;
-        sanitizePositionSlTp(pos, curPrice, state.stopLossPips ?? 25, state.takeProfitPips ?? 50);
+        sanitizePositionSlTp(pos, curPrice, slPipsCfg, tpPipsCfg);
+
+        // Backend Watchdog Emergency Close Sweeper (checks every 3s regardless of candle count)
+        const watchdog = evaluateWatchdogEmergencyClose(pos, curPrice, profile, slPipsCfg);
+        if (watchdog.shouldClose) {
+          if (canAttemptPositionClose(pos.id)) {
+            log(pos.symbol, 'RISK', watchdog.reason || `[WATCHDOG EMERGENCY CLOSE] #${pos.id} breached Hard SL (-${slPipsCfg} pips).`);
+            dualRoomProtections.recordStopLossHit(pos.symbol, 'forex', 'WATCHDOG_HARD_SL');
+            pos.isClosing = true;
+            pos.closingStartedAt = Date.now();
+            const closeRes = await client.closePosition(pos.id, undefined, pos.symbol);
+            if (closeRes.success) {
+              const posIdx = updatedPositions.findIndex((p) => p.id === pos.id);
+              if (posIdx !== -1) {
+                updatedPositions.splice(posIdx, 1);
+              }
+            }
+          }
+          continue;
+        }
 
         const candles = await client.getCandles(pos.symbol, 'M5', 100);
 
@@ -790,21 +822,41 @@ class EngineScheduler {
           ? Number((executionPriceRef + userTpPips * pipVal).toFixed(profile.digits))
           : Number((executionPriceRef - userTpPips * pipVal).toFixed(profile.digits));
 
-        // Execute Market Order strictly for symbolSnapshot
-        log(
-          symbolSnapshot,
-          'ORDER',
-          `Submitting ${vaultCreds.mode} ${signalResult.side} ${sizedLot} ${symbolSnapshot} (SL: ${userSlPips} pips, TP: ${userTpPips} pips)...`
-        );
+        // Acquire order execution mutex lock (anti double-entry between 3s scheduler & UI requests)
+        const orderLockToken = tryAcquireOrderExecutionLock('scheduler');
+        if (!orderLockToken) {
+          log(symbolSnapshot, 'RISK', `[ORDER_MUTEX] Skipping ${signalResult.side} ${symbolSnapshot}: another order execution is currently in-flight.`);
+          continue;
+        }
 
-        const orderResult = await client.placeMarketOrder({
-          symbol: symbolSnapshot,
-          side: signalResult.side,
-          volume: sizedLot,
-          stopLossPrice: computedSlPrice,
-          takeProfitPrice: computedTpPrice,
-          comment: `EXN_${vaultCreds.mode}_AI${aiVerdict.confidence_score}`,
-        });
+        let orderResult: any;
+        try {
+          // Live fetch directly from Exness API right before placing order (never trust cached counts)
+          const liveOpenPositions = await client.fetchOpenPositions(true);
+          if (liveOpenPositions.length >= 2) {
+            log(symbolSnapshot, 'RISK', `[POSITION_GUARD] Max 2 positions reached on Exness server (${liveOpenPositions.length}/2). Order aborted.`);
+            updatedPositions = reconcileOrphanPositions(liveOpenPositions, updatedPositions, userSlPips, userTpPips);
+            break;
+          }
+
+          // Execute Market Order strictly for symbolSnapshot
+          log(
+            symbolSnapshot,
+            'ORDER',
+            `Submitting ${vaultCreds.mode} ${signalResult.side} ${sizedLot} ${symbolSnapshot} (SL: ${userSlPips} pips, TP: ${userTpPips} pips)...`
+          );
+
+          orderResult = await client.placeMarketOrder({
+            symbol: symbolSnapshot,
+            side: signalResult.side,
+            volume: sizedLot,
+            stopLossPrice: computedSlPrice,
+            takeProfitPrice: computedTpPrice,
+            comment: `EXN_${vaultCreds.mode}_AI${aiVerdict.confidence_score}`,
+          });
+        } finally {
+          releaseOrderExecutionLock(orderLockToken);
+        }
 
         if (orderResult.marginAutoScaleLog) {
           log(symbolSnapshot, 'ORDER', orderResult.marginAutoScaleLog);

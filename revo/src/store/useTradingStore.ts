@@ -339,6 +339,7 @@ export interface TradingState {
 
   // 3. Engine Control
   isAutoTrading: boolean;
+  isServerHydrated: boolean;
   isTickRunning: boolean;
   isFetchingCandles: boolean;
   isSyncing: boolean;
@@ -414,6 +415,7 @@ export interface TradingState {
   panicCloseAll: () => Promise<void>;
   loadVaultOnStartup: () => Promise<void>;
   loadSavedVault: () => Promise<void>;
+  hydrateFromServer: () => Promise<void>;
   syncWithServerState: () => Promise<void>;
 }
 
@@ -431,7 +433,7 @@ const defaultSelectedSymbol = 'XAUUSDm';
 const defaultIsMultiPairMode = false;
 const defaultScannedSymbols = ['XAUUSDm'];
 const defaultTimeframe: Timeframe = 'M5';
-const defaultLotSize = 0.05;
+const defaultLotSize = 0.10;
 const defaultAiConfidence = 70;
 const defaultPartialClose = true;
 
@@ -471,6 +473,7 @@ export const useTradingStore = create<TradingState>()(
       timeframe: defaultTimeframe,
 
       isAutoTrading: defaultIsAutoTrading,
+      isServerHydrated: false,
       isTickRunning: false,
       isFetchingCandles: false,
       isSyncing: false,
@@ -2746,7 +2749,46 @@ export const useTradingStore = create<TradingState>()(
         }
       },
 
+      hydrateFromServer: async () => {
+        try {
+          const res = await fetch('/api/engine-tick', { cache: 'no-store' });
+          if (res.ok) {
+            const json = await res.json();
+            const d = json?.data;
+            if (json?.success && d) {
+              const serverRunning = Boolean(d.isRunning ?? d.isAutoTrading);
+              const serverLot = typeof d.lotSize === 'number' && d.lotSize > 0 ? d.lotSize : 0.10;
+              const serverSl = typeof d.slPips === 'number' && d.slPips > 0 ? d.slPips : (typeof d.stopLossPips === 'number' && d.stopLossPips > 0 ? d.stopLossPips : 25);
+              const serverTp = typeof d.tpPips === 'number' && d.tpPips > 0 ? d.tpPips : (typeof d.takeProfitPips === 'number' && d.takeProfitPips > 0 ? d.takeProfitPips : 50);
+              const serverPositions: ManagedPosition[] = Array.isArray(d.positions)
+                ? d.positions.filter((p: any) => p && p.id !== 'F-637' && p.id !== '#F-637')
+                : [];
+
+              set((prev) => ({
+                isAutoTrading: serverRunning,
+                lotSize: serverLot,
+                stopLossPips: serverSl,
+                takeProfitPips: serverTp,
+                targetMarket: d.targetMarket || prev.targetMarket,
+                selectedSymbol: d.selectedSymbol || prev.selectedSymbol,
+                focusSymbol: d.selectedSymbol || prev.focusSymbol,
+                scannedSymbols: Array.isArray(d.scannedSymbols) && d.scannedSymbols.length > 0 ? d.scannedSymbols : prev.scannedSymbols,
+                enablePartialClose: d.enablePartialClose !== undefined ? Boolean(d.enablePartialClose) : prev.enablePartialClose,
+                ...(serverPositions.length > 0 ? { positions: serverPositions, openPositions: serverPositions } : {}),
+                isServerHydrated: true,
+              }));
+              return;
+            }
+          }
+        } catch {}
+        set({ isServerHydrated: true });
+      },
+
       syncWithServerState: async () => {
+        if (!get().isServerHydrated) {
+          await get().hydrateFromServer();
+          return;
+        }
         const now = Date.now();
         if (isSyncingLock || (now - lastSyncTime < 500)) {
           return;
@@ -2812,6 +2854,9 @@ export const useTradingStore = create<TradingState>()(
         if (typeof useTradingStore?.persist?.rehydrate === 'function') {
           await useTradingStore.persist.rehydrate();
         }
+
+        // Hydrate authoritative bot state (isRunning, lotSize, slPips, tpPips, active positions) from VPS backend FIRST
+        await get().hydrateFromServer();
 
         let saved = await loadVaultFromLocalStorage();
         if (!saved || !isVaultConfigured(saved)) {
@@ -2916,7 +2961,7 @@ export const useTradingStore = create<TradingState>()(
           lastAccountFetchTime = 0;
           isFetchingAccountLock = false;
 
-          // Sync with backend server (passing resolved balance and positions)
+          // Sync credentials ONLY with backend server (never overwrite authoritative server isAutoTrading or positions on browser mount)
           fetch('/api/exness', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2925,10 +2970,6 @@ export const useTradingStore = create<TradingState>()(
               payload: {
                 credentials: saved,
                 accountMode: saved.accountMode || get().accountMode,
-                isAutoTrading: get().isAutoTrading,
-                positions: isConn ? curPositions : [],
-                currentBalance: resolvedBal,
-                dailyPnl: resolvedDailyPnl,
               },
             }),
           }).catch(() => {});

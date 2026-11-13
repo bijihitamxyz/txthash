@@ -137,9 +137,10 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
     setIsMounted(true);
   }, []);
 
-  // Initial load on mount - load real Exness vault, account, and real-time GET /api/kronos health & prediction
+  // Initial load on mount - hydrate authoritative server state FIRST, then load Exness vault, account, and Kronos
   useEffect(() => {
     const initTerminal = async () => {
+      await useTradingStore.getState().hydrateFromServer();
       if (!isActiveRoom && !useTradingStore.getState().isAutoTrading && (!useTradingStore.getState().openPositions || useTradingStore.getState().openPositions.length === 0)) {
         return;
       }

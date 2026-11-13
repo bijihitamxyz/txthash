@@ -56,3 +56,56 @@ export function getEngineLockInfo(): { holder: string | null; heldForMs: number 
     heldForMs: lockState.holder ? Date.now() - lockState.since : 0,
   };
 }
+
+// =========================================================================
+// ORDER EXECUTION MUTEX LOCK (isExecutingOrder)
+// Prevents 3s scheduler and UI/API requests from firing concurrent orders
+// =========================================================================
+interface OrderExecutionLockState {
+  isExecutingOrder: boolean;
+  holder: string | null;
+  since: number;
+  token: number;
+}
+
+const orderLockState = globalSingleton<OrderExecutionLockState>('forexOrderExecutionLock', () => ({
+  isExecutingOrder: false,
+  holder: null,
+  since: 0,
+  token: 0,
+}));
+
+export const ORDER_LOCK_MAX_HOLD_MS = Number(process.env.ORDER_LOCK_MAX_HOLD_MS || 30_000);
+
+export function isExecutingOrder(): boolean {
+  if (!orderLockState.isExecutingOrder) return false;
+  if (Date.now() - orderLockState.since >= ORDER_LOCK_MAX_HOLD_MS) {
+    return false;
+  }
+  return true;
+}
+
+export function tryAcquireOrderExecutionLock(holder: string): number {
+  const now = Date.now();
+  if (orderLockState.isExecutingOrder && now - orderLockState.since < ORDER_LOCK_MAX_HOLD_MS) {
+    return 0;
+  }
+  if (orderLockState.isExecutingOrder) {
+    console.warn(
+      `[OrderLock] Taking over stale isExecutingOrder lock held by "${orderLockState.holder}" for ${now - orderLockState.since}ms.`
+    );
+  }
+  orderLockState.token += 1;
+  orderLockState.isExecutingOrder = true;
+  orderLockState.holder = holder;
+  orderLockState.since = now;
+  return orderLockState.token;
+}
+
+export function releaseOrderExecutionLock(token: number): void {
+  if (token > 0 && orderLockState.token === token) {
+    orderLockState.isExecutingOrder = false;
+    orderLockState.holder = null;
+    orderLockState.since = 0;
+  }
+}

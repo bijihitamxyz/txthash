@@ -164,12 +164,25 @@ export function isVaultConfigured(creds?: StoredCredentials): boolean {
   return hasId && hasToken;
 }
 
+const nodeCrypto = typeof window === 'undefined' ? eval('require')('crypto') : null;
+
+function hasWebCryptoSubtle(): boolean {
+  try {
+    return (
+      typeof globalThis !== 'undefined' &&
+      Boolean(globalThis.crypto && globalThis.crypto.subtle && typeof globalThis.crypto.subtle.importKey === 'function')
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Derives a 256-bit CryptoKey using PBKDF2 from a passphrase string
+ * Derives a 256-bit CryptoKey using PBKDF2 from a passphrase string (Web Crypto)
  */
 async function deriveKey(passphrase: string, salt: Uint8Array): Promise<CryptoKey> {
   const enc = new TextEncoder();
-  const keyMaterial = await crypto.subtle.importKey(
+  const keyMaterial = await globalThis.crypto.subtle.importKey(
     'raw',
     enc.encode(passphrase),
     { name: 'PBKDF2' },
@@ -177,7 +190,7 @@ async function deriveKey(passphrase: string, salt: Uint8Array): Promise<CryptoKe
     ['deriveKey']
   );
 
-  return crypto.subtle.deriveKey(
+  return globalThis.crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
       salt: salt as any,
@@ -193,19 +206,47 @@ async function deriveKey(passphrase: string, salt: Uint8Array): Promise<CryptoKe
 
 /**
  * Encrypts a plaintext string into a base64 encoded payload: salt(16) + iv(12) + ciphertext_with_tag
+ * Automatically uses Node.js crypto on server, Web Crypto on HTTPS/localhost,
+ * or server-side /api/exness/vault fallback on HTTP non-localhost.
  */
 export async function encryptCredential(plaintext: string, masterKey?: string): Promise<string> {
   if (!plaintext) return '';
   const keyString = masterKey || (typeof process !== 'undefined' ? process.env?.APP_ENCRYPTION_KEY : undefined) || DEFAULT_SALT;
 
+  // 1. Server-side Node.js crypto (fast, works everywhere)
+  if (typeof window === 'undefined' && nodeCrypto) {
+    const salt = nodeCrypto.randomBytes(16);
+    const iv = nodeCrypto.randomBytes(12);
+    const key = nodeCrypto.pbkdf2Sync(keyString, salt, 100000, 32, 'sha256');
+    const cipher = nodeCrypto.createCipheriv('aes-256-gcm', key, iv);
+    const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return Buffer.concat([salt, iv, encrypted, tag]).toString('base64');
+  }
+
+  // 2. Browser HTTP non-localhost fallback: delegate AES-256 encryption to server
+  if (typeof window !== 'undefined' && !hasWebCryptoSubtle()) {
+    const res = await fetch('/api/exness/vault', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'encrypt', plaintext }),
+    });
+    const data = await res.json();
+    if (res.ok && data?.success && typeof data.encrypted === 'string') {
+      return data.encrypted;
+    }
+    throw new Error(data?.error || 'Server-side AES-256 encryption fallback failed');
+  }
+
+  // 3. Browser Web Crypto API (HTTPS / localhost)
   const enc = new TextEncoder();
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV for AES-GCM
+  const salt = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  const iv = globalThis.crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV for AES-GCM
 
   const key = await deriveKey(keyString, salt);
   const encodedPlaintext = enc.encode(plaintext);
 
-  const encryptedBuffer = await crypto.subtle.encrypt(
+  const encryptedBuffer = await globalThis.crypto.subtle.encrypt(
     {
       name: 'AES-GCM',
       iv: iv,
@@ -233,11 +274,45 @@ export async function encryptCredential(plaintext: string, masterKey?: string): 
 
 /**
  * Decrypts a base64 encoded payload back into the plaintext string
+ * Automatically uses Node.js crypto on server, Web Crypto on HTTPS/localhost,
+ * or server-side /api/exness/vault fallback on HTTP non-localhost.
  */
 export async function decryptCredential(encryptedBase64: string, masterKey?: string): Promise<string> {
   if (!encryptedBase64) return '';
   const keyString = masterKey || (typeof process !== 'undefined' ? process.env?.APP_ENCRYPTION_KEY : undefined) || DEFAULT_SALT;
 
+  // 1. Server-side Node.js crypto
+  if (typeof window === 'undefined' && nodeCrypto) {
+    const buf = Buffer.from(encryptedBase64, 'base64');
+    if (buf.length < 44) {
+      throw new Error('Invalid encrypted payload length for AES-GCM');
+    }
+    const salt = buf.subarray(0, 16);
+    const iv = buf.subarray(16, 28);
+    const tag = buf.subarray(buf.length - 16);
+    const ciphertext = buf.subarray(28, buf.length - 16);
+    const key = nodeCrypto.pbkdf2Sync(keyString, salt, 100000, 32, 'sha256');
+    const decipher = nodeCrypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return decrypted.toString('utf8');
+  }
+
+  // 2. Browser HTTP non-localhost fallback: delegate AES-256 decryption to server
+  if (typeof window !== 'undefined' && !hasWebCryptoSubtle()) {
+    const res = await fetch('/api/exness/vault', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'decrypt', encryptedBase64 }),
+    });
+    const data = await res.json();
+    if (res.ok && data?.success && typeof data.plaintext === 'string') {
+      return data.plaintext;
+    }
+    throw new Error(data?.error || 'Server-side AES-256 decryption fallback failed');
+  }
+
+  // 3. Browser Web Crypto API (HTTPS / localhost)
   const binary = typeof atob === 'function' ? atob(encryptedBase64) : Buffer.from(encryptedBase64, 'base64').toString('binary');
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
@@ -254,7 +329,7 @@ export async function decryptCredential(encryptedBase64: string, masterKey?: str
 
   const key = await deriveKey(keyString, salt);
 
-  const decryptedBuffer = await crypto.subtle.decrypt(
+  const decryptedBuffer = await globalThis.crypto.subtle.decrypt(
     {
       name: 'AES-GCM',
       iv: iv,
@@ -275,9 +350,13 @@ const VAULT_STORAGE_KEY = 'EXNESS_AI_TRADER_ENCRYPTED_VAULT';
 
 export async function saveVaultToLocalStorage(creds: StoredCredentials): Promise<void> {
   if (typeof window === 'undefined') return;
-  const jsonStr = JSON.stringify(creds);
-  const encrypted = await encryptCredential(jsonStr);
-  localStorage.setItem(VAULT_STORAGE_KEY, encrypted);
+  try {
+    const jsonStr = JSON.stringify(creds);
+    const encrypted = await encryptCredential(jsonStr);
+    localStorage.setItem(VAULT_STORAGE_KEY, encrypted);
+  } catch (err) {
+    console.warn('[cryptoVault] saveVaultToLocalStorage warning:', err);
+  }
 }
 
 export async function loadVaultFromLocalStorage(): Promise<StoredCredentials | null> {
