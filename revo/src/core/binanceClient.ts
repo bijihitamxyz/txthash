@@ -417,17 +417,29 @@ export class BinanceFuturesClient {
     // Extract active open positions (positionAmt !== 0)
     const activePositions: BinancePosition[] = (data.positions || [])
       .filter((p: any) => parseFloat(p.positionAmt || '0') !== 0)
-      .map((p: any) => ({
-        symbol: p.symbol,
-        positionAmt: parseFloat(p.positionAmt),
-        entryPrice: parseFloat(p.entryPrice),
-        markPrice: parseFloat(p.markPrice || '0'),
-        unRealizedProfit: parseFloat(p.unrealizedProfit || '0'),
-        liquidationPrice: parseFloat(p.liquidationPrice || '0'),
-        leverage: parseInt(p.leverage, 10) || 10,
-        marginType: p.isolated ? 'isolated' : 'cross',
-        isolatedMargin: parseFloat(p.isolatedMargin || '0'),
-      }));
+      .map((p: any) => {
+        const positionAmt = parseFloat(p.positionAmt);
+        const entryPrice = parseFloat(p.entryPrice);
+        const leverage = parseInt(p.leverage, 10) || 10;
+        const rawMargin = parseFloat(p.isolatedMargin || p.positionInitialMargin || p.initialMargin || '0');
+        const computedMargin =
+          rawMargin > 0
+            ? rawMargin
+            : entryPrice > 0 && leverage > 0
+              ? (Math.abs(positionAmt) * entryPrice) / leverage
+              : 0;
+        return {
+          symbol: p.symbol,
+          positionAmt,
+          entryPrice,
+          markPrice: parseFloat(p.markPrice || '0'),
+          unRealizedProfit: parseFloat(p.unrealizedProfit || '0'),
+          liquidationPrice: parseFloat(p.liquidationPrice || '0'),
+          leverage,
+          marginType: p.isolated ? 'isolated' : 'cross',
+          isolatedMargin: computedMargin,
+        };
+      });
 
     return {
       totalWalletBalance: walletBalance,

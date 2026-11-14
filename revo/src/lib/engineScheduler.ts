@@ -6,6 +6,7 @@
  */
 
 import { stateSync } from './stateSync';
+import { withCryptoOrderLock } from './cryptoOrderLock';
 import {
   getActiveExnessCredentials,
   loadServerCryptoVault,
@@ -1163,7 +1164,8 @@ class EngineScheduler {
       const userMargin = typeof state.cryptoMarginUsdt === 'number' && state.cryptoMarginUsdt > 0 ? state.cryptoMarginUsdt : this.cryptoMarginUsdt;
       const userLeverage = typeof state.cryptoLeverage === 'number' && state.cryptoLeverage > 0 ? state.cryptoLeverage : this.cryptoLeverage;
       const userMarginMode = state.cryptoMarginMode || this.cryptoMarginMode || 'ISOLATED';
-      const maxConcurrentCoins = typeof state.cryptoMaxConcurrentCoins === 'number' && state.cryptoMaxConcurrentCoins > 0 ? state.cryptoMaxConcurrentCoins : this.cryptoMaxConcurrentCoins;
+      const rawMaxConcurrent = typeof state.cryptoMaxConcurrentCoins === 'number' && state.cryptoMaxConcurrentCoins > 0 ? state.cryptoMaxConcurrentCoins : this.cryptoMaxConcurrentCoins;
+      const maxConcurrentCoins = Math.max(1, Math.min(5, rawMaxConcurrent || 5));
       const userNotional = userMargin * userLeverage;
 
       if (activeExchange === 'BITGET') {
@@ -1330,22 +1332,36 @@ class EngineScheduler {
                   : Number(rawQty.toFixed(3)).toString();
 
                 if (parseFloat(qty) > 0) {
-                  await bitget.placeMarketOrder({
-                    symbol: sym,
-                    side: orderSide,
-                    size: qty,
-                    price: verdict.entryPrice,
-                    margin: userMargin,
-                    leverage: userLeverage,
-                    marginMode: userMarginMode.toLowerCase() === 'cross' ? 'crossed' : 'isolated',
-                    stopLossPrice: verdict.stopLossPrice,
-                    takeProfitPrice: verdict.takeProfit1Price,
+                  await withCryptoOrderLock(async () => {
+                    const currentOpenPositions = await bitget.getOpenPositions();
+                    positionsCount = currentOpenPositions.length;
+                    this.cryptoPositionsCount = positionsCount;
+                    if (
+                      !this.cryptoAutoTradingEnabled ||
+                      this.isPanicClosingActive() ||
+                      currentOpenPositions.length >= maxConcurrentCoins ||
+                      currentOpenPositions.some((p) => p.symbol === sym)
+                    ) {
+                      return;
+                    }
+                    await bitget.placeMarketOrder({
+                      symbol: sym,
+                      side: orderSide,
+                      size: qty,
+                      price: verdict.entryPrice,
+                      margin: userMargin,
+                      leverage: userLeverage,
+                      marginMode: userMarginMode.toLowerCase() === 'cross' ? 'crossed' : 'isolated',
+                      stopLossPrice: verdict.stopLossPrice,
+                      takeProfitPrice: verdict.takeProfit1Price,
+                    });
+                    if (c0Ts > 0) {
+                      idempotencyLocks.recordExecutedCandle(lockSym, 'M5', c0Ts, orderSide);
+                    }
+                    positionsCount = currentOpenPositions.length + 1;
+                    this.cryptoPositionsCount = positionsCount;
+                    stateSync.addTelemetry(sym, 'ORDER', `⚡ [BITGET AUTO-TRADE] Dispatched ${orderSide} on ${sym} (${qty} coins | Margin $${userMargin.toFixed(2)} @ ${userLeverage}x | Confidence ${effectiveConfidence}% >= ${cryptoDynamicThreshold}%)`);
                   });
-                  if (c0Ts > 0) {
-                    idempotencyLocks.recordExecutedCandle(lockSym, 'M5', c0Ts, orderSide);
-                  }
-                  positionsCount++;
-                  stateSync.addTelemetry(sym, 'ORDER', `⚡ [BITGET AUTO-TRADE] Dispatched ${orderSide} on ${sym} (${qty} coins | Margin $${userMargin.toFixed(2)} @ ${userLeverage}x | Confidence ${effectiveConfidence}% >= ${cryptoDynamicThreshold}%)`);
                 }
               }
             } catch (err: any) {
@@ -1514,20 +1530,35 @@ class EngineScheduler {
                   : Number(rawQty.toFixed(3)).toString();
 
                 if (parseFloat(qty) > 0) {
-                  await binance.placeMarketOrderWithProtection({
-                    symbol: sym,
-                    side: orderSide,
-                    quantity: qty,
-                    leverage: userLeverage,
-                    marginMode: userMarginMode.toLowerCase() === 'cross' ? 'CROSSED' : 'ISOLATED',
-                    stopLossPrice: verdict.stopLossPrice,
-                    takeProfitPrice: verdict.takeProfit1Price,
+                  await withCryptoOrderLock(async () => {
+                    const freshAcct = await binance.getAccountInfo();
+                    const currentOpenPositions = freshAcct.positions;
+                    positionsCount = currentOpenPositions.length;
+                    this.cryptoPositionsCount = positionsCount;
+                    if (
+                      !this.cryptoAutoTradingEnabled ||
+                      this.isPanicClosingActive() ||
+                      currentOpenPositions.length >= maxConcurrentCoins ||
+                      currentOpenPositions.some((p) => p.symbol === sym)
+                    ) {
+                      return;
+                    }
+                    await binance.placeMarketOrderWithProtection({
+                      symbol: sym,
+                      side: orderSide,
+                      quantity: qty,
+                      leverage: userLeverage,
+                      marginMode: userMarginMode.toLowerCase() === 'cross' ? 'CROSSED' : 'ISOLATED',
+                      stopLossPrice: verdict.stopLossPrice,
+                      takeProfitPrice: verdict.takeProfit1Price,
+                    });
+                    if (c0Ts > 0) {
+                      idempotencyLocks.recordExecutedCandle(lockSym, 'M5', c0Ts, orderSide);
+                    }
+                    positionsCount = currentOpenPositions.length + 1;
+                    this.cryptoPositionsCount = positionsCount;
+                    stateSync.addTelemetry(sym, 'ORDER', `⚡ [BINANCE AUTO-TRADE] Dispatched ${orderSide} on ${sym} (${qty} coins | Margin $${userMargin.toFixed(2)} @ ${userLeverage}x | Confidence ${effectiveConfidence}% >= ${cryptoDynamicThreshold}%)`);
                   });
-                  if (c0Ts > 0) {
-                    idempotencyLocks.recordExecutedCandle(lockSym, 'M5', c0Ts, orderSide);
-                  }
-                  positionsCount++;
-                  stateSync.addTelemetry(sym, 'ORDER', `⚡ [BINANCE AUTO-TRADE] Dispatched ${orderSide} on ${sym} (${qty} coins | Margin $${userMargin.toFixed(2)} @ ${userLeverage}x | Confidence ${effectiveConfidence}% >= ${cryptoDynamicThreshold}%)`);
                 }
               }
             } catch (err: any) {

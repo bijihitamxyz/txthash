@@ -1263,6 +1263,13 @@ export const useBinanceStore = create<BinanceStoreState>()(
 
               if (qtyNum <= 0) continue;
 
+              const maxPos = Math.max(1, Math.min(5, state.maxConcurrentCoins || 5));
+              const latestPositions = get().positions;
+              if (latestPositions.length >= maxPos || latestPositions.some((p) => p.symbol === sym)) {
+                if (latestPositions.length >= maxPos) break;
+                continue;
+              }
+
               try {
                 const orderRes = await fetch('/api/binance', {
                   method: 'POST',

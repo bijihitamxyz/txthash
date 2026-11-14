@@ -839,17 +839,26 @@ export class BitgetFuturesService {
         const isLong = holdSide === 'long';
         const sl = parseFloat(p.stopLoss || '0');
         const tp = parseFloat(p.takeProfit || '0');
+        const entryPrice = BitgetFuturesService.parseNum(p.openPriceAvg, p.averageOpenPrice);
+        const leverage = parseInt(p.leverage, 10) || 1;
+        const rawMargin = BitgetFuturesService.parseNum(p.marginSize, p.margin);
+        const computedMargin =
+          rawMargin > 0
+            ? rawMargin
+            : entryPrice > 0 && leverage > 0
+              ? (total * entryPrice) / leverage
+              : 0;
         return {
           symbol: fromBitgetSymbol(p.symbol),
           rawSymbol: p.symbol,
           positionAmt: isLong ? total : -total,
-          entryPrice: BitgetFuturesService.parseNum(p.openPriceAvg, p.averageOpenPrice),
+          entryPrice,
           markPrice: BitgetFuturesService.parseNum(p.markPrice),
           unRealizedProfit: BitgetFuturesService.parseNum(p.unrealizedPL),
           liquidationPrice: BitgetFuturesService.parseNum(p.liquidationPrice),
-          leverage: parseInt(p.leverage, 10) || 1,
+          leverage,
           marginType: String(p.marginMode || 'isolated').toLowerCase() === 'crossed' ? 'cross' : 'isolated',
-          isolatedMargin: BitgetFuturesService.parseNum(p.marginSize, p.margin),
+          isolatedMargin: computedMargin,
           holdSide,
           total,
           available: BitgetFuturesService.parseNum(p.available),

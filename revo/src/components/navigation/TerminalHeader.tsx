@@ -135,7 +135,7 @@ export const TerminalHeader: React.FC = () => {
                   ? 'opacity-50 cursor-not-allowed text-slate-400 dark:text-zinc-500 select-none'
                   : activeMarket === 'FOREX'
                   ? 'bg-[#0F172A] dark:bg-emerald-600 text-white shadow-2xs cursor-pointer'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer'
+                  : 'text-slate-700 dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer'
               }`}
             >
               {maintenance.forex ? (
@@ -143,7 +143,7 @@ export const TerminalHeader: React.FC = () => {
               ) : (
                 <CandlestickChart
                   className={`w-3.5 h-3.5 ${
-                    activeMarket === 'FOREX' ? 'text-emerald-400 dark:text-white' : 'text-slate-400'
+                    activeMarket === 'FOREX' ? 'text-emerald-400 dark:text-white' : 'text-slate-600 dark:text-slate-400'
                   }`}
                 />
               )}
@@ -163,7 +163,7 @@ export const TerminalHeader: React.FC = () => {
                   ? 'opacity-50 cursor-not-allowed text-slate-400 dark:text-zinc-500 select-none'
                   : activeMarket === 'CRYPTO'
                   ? 'bg-[#0F172A] dark:bg-emerald-600 text-white shadow-2xs cursor-pointer'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer'
+                  : 'text-slate-700 dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer'
               }`}
             >
               {maintenance.crypto ? (
@@ -171,7 +171,7 @@ export const TerminalHeader: React.FC = () => {
               ) : (
                 <Coins
                   className={`w-3.5 h-3.5 ${
-                    activeMarket === 'CRYPTO' ? 'text-emerald-400 dark:text-white' : 'text-slate-400'
+                    activeMarket === 'CRYPTO' ? 'text-emerald-400 dark:text-white' : 'text-slate-600 dark:text-slate-400'
                   }`}
                 />
               )}

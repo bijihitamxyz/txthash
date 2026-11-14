@@ -393,6 +393,40 @@ export async function POST(req: NextRequest) {
 
       if (exchange === 'BITGET') {
         const bitget = new BitgetFuturesService(apiKey, effectiveSecret, passphrase, accountType);
+        if (!reduceOnly) {
+          const { withCryptoOrderLock } = await import('@/lib/cryptoOrderLock');
+          const { stateSync } = await import('@/lib/stateSync');
+          const { engineScheduler } = await import('@/lib/engineScheduler');
+          return await withCryptoOrderLock(async () => {
+            const runtimeState = await stateSync.getRuntimeState();
+            const rawMax = runtimeState.cryptoMaxConcurrentCoins ?? engineScheduler.cryptoMaxConcurrentCoins ?? 5;
+            const maxPositions = Math.max(1, Math.min(5, Number(rawMax) || 5));
+            const currentOpenPositions = await bitget.getOpenPositions();
+            if (currentOpenPositions.length >= maxPositions) {
+              return NextResponse.json(
+                {
+                  success: false,
+                  error: `Max open positions reached (${currentOpenPositions.length}/${maxPositions}). Order blocked.`,
+                },
+                { status: 409 }
+              );
+            }
+            const order = await bitget.placeMarketOrder({
+              symbol,
+              side: side === 'BUY' || side === 'LONG' ? 'BUY' : 'SELL',
+              size: String(quantity),
+              price: price ? parseFloat(price) : undefined,
+              margin: typeof margin === 'number' ? margin : (margin ? parseFloat(margin) : undefined),
+              leverage: typeof leverage === 'number' ? leverage : (leverage ? parseInt(leverage, 10) : undefined),
+              marginMode: String(marginMode || '').toLowerCase().startsWith('cross') ? 'crossed' : 'isolated',
+              reduceOnly: false,
+              stopLossPrice: stopPrice ? parseFloat(stopPrice) : undefined,
+              takeProfitPrice: takeProfitPrice ? parseFloat(takeProfitPrice) : undefined,
+            });
+            return NextResponse.json({ success: true, exchange: 'BITGET', data: order });
+          });
+        }
+
         const order = await bitget.placeMarketOrder({
           symbol,
           side: side === 'BUY' || side === 'LONG' ? 'BUY' : 'SELL',
@@ -411,25 +445,56 @@ export async function POST(req: NextRequest) {
       const client = new BinanceFuturesClient(apiKey, effectiveSecret, accountType === 'DEMO');
       const orderType = String(type || 'MARKET').toUpperCase();
       const normalizedSide: 'BUY' | 'SELL' = side === 'BUY' || side === 'LONG' ? 'BUY' : 'SELL';
-      const order = orderType === 'MARKET' && !reduceOnly
-        ? await client.placeMarketOrderWithProtection({
-            symbol,
-            side: normalizedSide,
-            quantity: String(quantity),
-            leverage: typeof leverage === 'number' ? leverage : (leverage ? parseInt(leverage, 10) : undefined),
-            marginMode: String(marginMode || '').toLowerCase().startsWith('cross') ? 'CROSSED' : 'ISOLATED',
-            stopLossPrice: stopPrice ? parseFloat(stopPrice) : undefined,
-            takeProfitPrice: takeProfitPrice ? parseFloat(takeProfitPrice) : undefined,
-          })
-        : await client.placeOrder({
-            symbol,
-            side: normalizedSide,
-            type: orderType as any,
-            quantity,
-            price,
-            stopPrice,
-            reduceOnly,
-          });
+      if (!reduceOnly) {
+        const { withCryptoOrderLock } = await import('@/lib/cryptoOrderLock');
+        const { stateSync } = await import('@/lib/stateSync');
+        const { engineScheduler } = await import('@/lib/engineScheduler');
+        return await withCryptoOrderLock(async () => {
+          const runtimeState = await stateSync.getRuntimeState();
+          const rawMax = runtimeState.cryptoMaxConcurrentCoins ?? engineScheduler.cryptoMaxConcurrentCoins ?? 5;
+          const maxPositions = Math.max(1, Math.min(5, Number(rawMax) || 5));
+          const acct = await client.getAccountInfo();
+          if (acct.positions.length >= maxPositions) {
+            return NextResponse.json(
+              {
+                success: false,
+                error: `Max open positions reached (${acct.positions.length}/${maxPositions}). Order blocked.`,
+              },
+              { status: 409 }
+            );
+          }
+          const order = orderType === 'MARKET'
+            ? await client.placeMarketOrderWithProtection({
+                symbol,
+                side: normalizedSide,
+                quantity: String(quantity),
+                leverage: typeof leverage === 'number' ? leverage : (leverage ? parseInt(leverage, 10) : undefined),
+                marginMode: String(marginMode || '').toLowerCase().startsWith('cross') ? 'CROSSED' : 'ISOLATED',
+                stopLossPrice: stopPrice ? parseFloat(stopPrice) : undefined,
+                takeProfitPrice: takeProfitPrice ? parseFloat(takeProfitPrice) : undefined,
+              })
+            : await client.placeOrder({
+                symbol,
+                side: normalizedSide,
+                type: orderType as any,
+                quantity,
+                price,
+                stopPrice,
+                reduceOnly,
+              });
+          return NextResponse.json({ success: true, exchange: 'BINANCE', data: order });
+        });
+      }
+
+      const order = await client.placeOrder({
+        symbol,
+        side: normalizedSide,
+        type: orderType as any,
+        quantity,
+        price,
+        stopPrice,
+        reduceOnly,
+      });
       return NextResponse.json({ success: true, exchange: 'BINANCE', data: order });
     }
 

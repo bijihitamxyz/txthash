@@ -30,7 +30,6 @@ import {
   BrainCircuit,
   RefreshCw,
   CalendarDays,
-  KeyRound,
   ArrowUpRight,
   ArrowDownRight,
 } from 'lucide-react';
@@ -107,7 +106,6 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   const walletBalance = useBinanceStore((s) => s.walletBalance);
   const isTestnet = useBinanceStore((s) => s.isTestnet);
   const isVaultConfigured = useBinanceStore((s) => s.isVaultConfigured);
-  const openVaultModal = useBinanceStore((s) => s.openVaultModal);
   const openPnlCalendar = useBinanceStore((s) => s.openPnlCalendar);
   const fetchAccountInfo = useBinanceStore((s) => s.fetchAccountInfo);
 
@@ -1159,14 +1157,9 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
             </div>
             <div className="flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-slate-400 pt-1.5 border-t border-slate-100 dark:border-zinc-800/80">
               <span>Vault: AES-256</span>
-              <button
-                type="button"
-                onClick={openVaultModal}
-                className="text-[#0F172A] dark:text-slate-100 hover:text-emerald-700 dark:hover:text-emerald-400 font-semibold inline-flex items-center gap-1 cursor-pointer"
-              >
-                <KeyRound className="w-3 h-3" />
-                <span>API KEY</span>
-              </button>
+              <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
+                {isTestnet ? 'Testnet / Demo' : 'Mainnet'}
+              </span>
             </div>
           </div>
         </section>
@@ -1385,14 +1378,14 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                   <table className="w-full text-left font-mono text-xs">
                     <thead className="bg-slate-50/90 dark:bg-zinc-950/80 text-[11px] uppercase tracking-wider text-slate-500 dark:text-slate-400 border-b border-slate-200/80 dark:border-zinc-800">
                       <tr>
-                        <th className="px-4 py-2.5">SYMBOL</th>
-                        <th className="px-4 py-2.5">SIDE &amp; LEV</th>
-                        <th className="px-4 py-2.5">SIZE</th>
-                        <th className="px-4 py-2.5">ENTRY -&gt; MARK</th>
-                        <th className="px-4 py-2.5">MARGIN</th>
-                        <th className="px-4 py-2.5">PNL (USDT)</th>
-                        <th className="px-4 py-2.5">ASYMMETRIC LOCK</th>
-                        <th className="px-4 py-2.5 text-right">ACTION</th>
+                        <th className="px-3 sm:px-4 py-2.5 whitespace-nowrap">SYMBOL</th>
+                        <th className="px-2.5 sm:px-4 py-2.5 whitespace-nowrap">SIDE &amp; LEV</th>
+                        <th className="px-2.5 sm:px-4 py-2.5 whitespace-nowrap">SIZE</th>
+                        <th className="px-2.5 sm:px-4 py-2.5 whitespace-nowrap">ENTRY -&gt; MARK</th>
+                        <th className="px-2.5 sm:px-4 py-2.5 whitespace-nowrap">MARGIN</th>
+                        <th className="px-2.5 sm:px-4 py-2.5 whitespace-nowrap">PNL (USDT)</th>
+                        <th className="px-2.5 sm:px-4 py-2.5 whitespace-nowrap">ASYMMETRIC LOCK</th>
+                        <th className="px-3 sm:px-4 py-2.5 text-right whitespace-nowrap">ACTION</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100 dark:divide-zinc-800">
@@ -1404,16 +1397,23 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                         const pnl = isLong
                           ? (mark - pos.entryPrice) * size
                           : (pos.entryPrice - mark) * size;
-                        const pnlPct =
-                          pos.isolatedMargin > 0 ? (pnl / pos.isolatedMargin) * 100 : 0;
+                        const margin =
+                          pos.isolatedMargin > 0
+                            ? pos.isolatedMargin
+                            : pos.entryPrice > 0 && pos.leverage > 0
+                              ? (size * pos.entryPrice) / pos.leverage
+                              : 0;
+                        const pnlPct = margin > 0 ? (pnl / margin) * 100 : 0;
                         const isProfit = pnl >= 0;
 
                         return (
                           <tr key={pos.symbol} className="hover:bg-slate-50/80 dark:hover:bg-zinc-800/50 transition-colors">
-                            <td className="px-4 py-3 font-bold text-[#0F172A] dark:text-slate-100">{pos.symbol}</td>
-                            <td className="px-4 py-3">
+                            <td className="px-3 sm:px-4 py-3 font-bold text-[#0F172A] dark:text-slate-100 whitespace-nowrap min-w-[96px]">
+                              {pos.symbol}
+                            </td>
+                            <td className="px-2.5 sm:px-4 py-3 whitespace-nowrap">
                               <span
-                                className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                                className={`inline-flex items-center whitespace-nowrap px-2 py-0.5 rounded text-[10px] font-bold border ${
                                   isLong
                                     ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60'
                                     : 'bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-800/60'
@@ -1422,17 +1422,17 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                                 {isLong ? 'LONG' : 'SHORT'} {pos.leverage}x
                               </span>
                             </td>
-                            <td className="px-4 py-3 font-semibold text-[#0F172A] dark:text-slate-100">{size}</td>
-                            <td className="px-4 py-3 text-slate-700 dark:text-slate-300">
+                            <td className="px-2.5 sm:px-4 py-3 font-semibold text-[#0F172A] dark:text-slate-100 whitespace-nowrap">{size}</td>
+                            <td className="px-2.5 sm:px-4 py-3 text-slate-700 dark:text-slate-300 whitespace-nowrap">
                               ${pos.entryPrice.toFixed(pos.entryPrice < 10 ? 4 : 2)} -&gt;{' '}
                               <strong className="text-[#0F172A] dark:text-slate-100">
                                 ${mark.toFixed(mark < 10 ? 4 : 2)}
                               </strong>
                             </td>
-                            <td className="px-4 py-3 text-slate-600 dark:text-slate-400">
-                              ${pos.isolatedMargin.toFixed(2)}
+                            <td className="px-2.5 sm:px-4 py-3 text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                              ${margin.toFixed(2)}
                             </td>
-                            <td className="px-4 py-3">
+                            <td className="px-2.5 sm:px-4 py-3 whitespace-nowrap">
                               <div
                                 className={`font-bold ${
                                   isProfit ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'
@@ -1442,22 +1442,24 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                                 {pnlPct.toFixed(1)}%)
                               </div>
                             </td>
-                            <td className="px-4 py-3">
+                            <td className="px-2.5 sm:px-4 py-3 whitespace-nowrap">
                               {pos.partialClosed ? (
-                                <span className="px-2 py-0.5 rounded-full text-[10px] bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800/60 text-emerald-700 dark:text-emerald-400 font-semibold inline-flex items-center gap-1">
-                                  <CheckCircle2 className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
-                                  50% Banked (BE+ Locked)
+                                <span className="px-2.5 py-0.5 rounded-full text-[10px] bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800/60 text-emerald-700 dark:text-emerald-400 font-semibold inline-flex items-center gap-1 whitespace-nowrap">
+                                  <CheckCircle2 className="w-3 h-3 shrink-0 text-emerald-600 dark:text-emerald-400" />
+                                  <span>50% Banked (BE+ Locked)</span>
                                 </span>
                               ) : (
-                                <span className="px-2 py-0.5 rounded-full text-[10px] bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800/60 text-amber-800 dark:text-amber-300 font-semibold inline-flex items-center gap-1">
-                                  <Lock className="w-3 h-3 text-amber-600 dark:text-amber-400" />
-                                  TP1: $
-                                  {pos.takeProfit1Price?.toFixed(pos.entryPrice < 10 ? 4 : 2) ||
-                                    '---'}
+                                <span className="px-2.5 py-0.5 rounded-full text-[10px] bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800/60 text-amber-800 dark:text-amber-300 font-semibold inline-flex items-center gap-1 whitespace-nowrap">
+                                  <Lock className="w-3 h-3 shrink-0 text-amber-600 dark:text-amber-400" />
+                                  <span>
+                                    TP1: $
+                                    {pos.takeProfit1Price?.toFixed(pos.entryPrice < 10 ? 4 : 2) ||
+                                      '---'}
+                                  </span>
                                 </span>
                               )}
                             </td>
-                            <td className="px-4 py-3 text-right">
+                            <td className="px-3 sm:px-4 py-3 text-right whitespace-nowrap">
                               <button
                                 type="button"
                                 onClick={() => closePosition(pos.symbol)}
