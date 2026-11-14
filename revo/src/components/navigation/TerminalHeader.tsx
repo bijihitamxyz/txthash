@@ -7,11 +7,14 @@ import { useBinanceStore } from '@/store/useBinanceStore';
 import { useLicense } from '@/components/LicenseGate';
 import { ThemeToggle } from '@/components/InstitutionalChrome';
 import {
+  Bot,
   CandlestickChart,
   Coins,
+  Cpu,
   KeyRound,
   Lock,
   LogOut,
+  Server,
 } from 'lucide-react';
 
 export const TerminalHeader: React.FC = () => {
@@ -45,9 +48,62 @@ export const TerminalHeader: React.FC = () => {
     kronosHealth === null ? 'CHECKING' : kronosHealth.aiReady ? 'READY' : 'STANDBY';
   const activeAiCount = kronosHealth?.activeAiCount ?? 0;
 
+  const kronosTooltip =
+    kronosReadyState === 'READY'
+      ? 'Kronos Ready'
+      : kronosReadyState === 'CHECKING'
+      ? 'Kronos Syncing...'
+      : 'Kronos Offline';
+  const vpsTooltip =
+    vpsReadyState === 'READY'
+      ? `VPS Ready (${kronosHealth?.latencyMs ?? 12}ms)`
+      : vpsReadyState === 'CHECKING'
+      ? 'VPS Syncing...'
+      : 'VPS Offline';
+  const aiTooltip =
+    aiReadyState === 'READY'
+      ? `AI Ready${activeAiCount > 0 ? ` (${activeAiCount} Active)` : ''}`
+      : aiReadyState === 'CHECKING'
+      ? 'AI Syncing...'
+      : 'AI Standby';
+  const vaultTooltip =
+    activeMarket === 'FOREX'
+      ? 'Exness Vault Credentials'
+      : `${activeCryptoExchange === 'BITGET' ? 'Bitget' : 'Binance'} API Key`;
+
+  const statusItems = [
+    {
+      id: 'kronos',
+      state: kronosReadyState,
+      tooltip: kronosTooltip,
+      Icon: Cpu,
+      offlineDot: 'bg-rose-500',
+      readyColor: 'text-emerald-600 dark:text-emerald-400',
+      offlineColor: 'text-rose-500 dark:text-rose-400',
+    },
+    {
+      id: 'vps',
+      state: vpsReadyState,
+      tooltip: vpsTooltip,
+      Icon: Server,
+      offlineDot: 'bg-rose-500',
+      readyColor: 'text-emerald-600 dark:text-emerald-400',
+      offlineColor: 'text-rose-500 dark:text-rose-400',
+    },
+    {
+      id: 'ai',
+      state: aiReadyState,
+      tooltip: aiTooltip,
+      Icon: Bot,
+      offlineDot: 'bg-amber-500',
+      readyColor: 'text-emerald-600 dark:text-emerald-400',
+      offlineColor: 'text-amber-500 dark:text-amber-400',
+    },
+  ] as const;
+
   return (
     <header className="bg-white/95 dark:bg-slate-950/95 backdrop-blur-md border-b border-slate-200/90 dark:border-zinc-800 sticky top-0 z-40">
-      <div className="max-w-[1920px] mx-auto px-3 sm:px-6 py-2.5 flex flex-wrap items-center justify-between gap-2.5">
+      <div className="max-w-[1920px] mx-auto px-3 sm:px-6 py-2 flex items-center justify-between gap-2">
         {/* Left: Brand + Market Switcher */}
         <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2">
@@ -124,111 +180,75 @@ export const TerminalHeader: React.FC = () => {
           </div>
         </div>
 
-        {/* Right: Status Indicators + Theme Toggle + Vault Modal Button + Logout */}
-        <div className="flex flex-wrap items-center gap-2">
-          {/* Status Indicators driven by GET /api/kronos */}
+        {/* Right: Compact Status Icons + Theme Toggle + Single API Key Icon + Session + Logout */}
+        <div className="flex items-center gap-1.5">
+          {/* Grouped Minimalist Status Icons (Kronos, VPS, AI) */}
           <div
             onClick={() => checkKronosHealth()}
-            title="Real-time live state polled from GET /api/kronos (Click to refresh)"
-            className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-slate-50 dark:bg-zinc-900 border border-slate-200/90 dark:border-zinc-800 font-mono text-[11px] cursor-pointer hover:bg-slate-100 dark:hover:bg-zinc-800/80 transition-colors"
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                checkKronosHealth();
+              }
+            }}
+            aria-label="Refresh Kronos, VPS, and AI status"
+            className="flex items-center gap-0.5 px-1.5 py-1 rounded-xl bg-slate-100/80 dark:bg-zinc-900/90 border border-slate-200/90 dark:border-zinc-800 cursor-pointer hover:border-slate-300 dark:hover:border-zinc-700 transition-colors"
           >
-            {/* 1. Kronos Ready */}
-            <span
-              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md font-semibold border ${
-                kronosReadyState === 'READY'
-                  ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200/80 dark:border-emerald-500/30'
-                  : kronosReadyState === 'CHECKING'
-                  ? 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
-                  : 'bg-rose-50 dark:bg-rose-500/15 text-rose-700 dark:text-rose-400 border-rose-200/80 dark:border-rose-500/30'
-              }`}
-            >
-              <span
-                className={`w-1.5 h-1.5 rounded-full ${
-                  kronosReadyState === 'READY'
-                    ? 'bg-[#10B981] animate-pulse'
-                    : kronosReadyState === 'CHECKING'
-                    ? 'bg-slate-400 animate-pulse'
-                    : 'bg-rose-500'
-                }`}
-              />
-              <span>
-                {kronosReadyState === 'READY'
-                  ? 'Kronos Ready'
-                  : kronosReadyState === 'CHECKING'
-                  ? 'Kronos Sync...'
-                  : 'Kronos Offline'}
-              </span>
-            </span>
-
-            {/* 2. VPS Ready */}
-            <span
-              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md font-semibold border ${
-                vpsReadyState === 'READY'
-                  ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200/80 dark:border-emerald-500/30'
-                  : vpsReadyState === 'CHECKING'
-                  ? 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
-                  : 'bg-rose-50 dark:bg-rose-500/15 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/30'
-              }`}
-            >
-              <span
-                className={`w-1.5 h-1.5 rounded-full ${
-                  vpsReadyState === 'READY'
-                    ? 'bg-[#10B981] animate-pulse'
-                    : vpsReadyState === 'CHECKING'
-                    ? 'bg-slate-400 animate-pulse'
-                    : 'bg-rose-500'
-                }`}
-              />
-              <span>
-                {vpsReadyState === 'READY'
-                  ? `VPS Ready (${kronosHealth?.latencyMs ?? 12}ms)`
-                  : vpsReadyState === 'CHECKING'
-                  ? 'VPS Sync...'
-                  : 'VPS Offline'}
-              </span>
-            </span>
-
-            {/* 3. AI Ready */}
-            <span
-              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md font-semibold border ${
-                aiReadyState === 'READY'
-                  ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200/80 dark:border-emerald-500/30'
-                  : aiReadyState === 'CHECKING'
-                  ? 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
-                  : 'bg-amber-50 dark:bg-amber-500/15 text-amber-800 dark:text-amber-300 border-amber-200/80 dark:border-amber-500/30'
-              }`}
-            >
-              <span
-                className={`w-1.5 h-1.5 rounded-full ${
-                  aiReadyState === 'READY'
-                    ? 'bg-[#10B981] animate-pulse'
-                    : aiReadyState === 'CHECKING'
-                    ? 'bg-slate-400 animate-pulse'
-                    : 'bg-amber-500'
-                }`}
-              />
-              <span>
-                {aiReadyState === 'READY'
-                  ? `AI Ready${activeAiCount > 1 ? ` (${activeAiCount})` : ''}`
-                  : aiReadyState === 'CHECKING'
-                  ? 'AI Sync...'
-                  : 'AI Standby'}
-              </span>
-            </span>
+            {statusItems.map(({ id, state, tooltip, Icon, offlineDot, readyColor, offlineColor }) => {
+              const isReady = state === 'READY';
+              const isChecking = state === 'CHECKING';
+              return (
+                <div
+                  key={id}
+                  title={`${tooltip} (Click to refresh)`}
+                  className="group relative flex items-center justify-center w-7 h-7 rounded-lg hover:bg-white dark:hover:bg-zinc-800 transition-colors"
+                >
+                  <Icon
+                    className={`w-3.5 h-3.5 transition-colors ${
+                      isReady
+                        ? readyColor
+                        : isChecking
+                        ? 'text-slate-400 dark:text-zinc-500'
+                        : offlineColor
+                    }`}
+                  />
+                  {/* Corner Status Dot */}
+                  <span
+                    className={`absolute top-1 right-1 w-1.5 h-1.5 rounded-full ring-2 ring-slate-100 dark:ring-zinc-900 ${
+                      isReady
+                        ? 'bg-emerald-500 animate-pulse'
+                        : isChecking
+                        ? 'bg-slate-400 animate-pulse'
+                        : offlineDot
+                    }`}
+                  />
+                  {/* Hover Tooltip */}
+                  <span className="pointer-events-none absolute top-full left-1/2 -translate-x-1/2 mt-2 px-2 py-1 rounded-md bg-slate-900 dark:bg-zinc-800 text-white dark:text-slate-100 border border-slate-700/60 dark:border-zinc-700 font-mono text-[10px] font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-lg z-50">
+                    {tooltip}
+                  </span>
+                </div>
+              );
+            })}
           </div>
 
+          {/* Theme Toggle & Single Compact API Key Action */}
           <ThemeToggle />
 
-          {/* Client Exchange Credentials Button */}
           <button
             type="button"
             onClick={() =>
               activeMarket === 'FOREX' ? openExnessVaultModal() : openBinanceVaultModal()
             }
-            className="bg-[#0F172A] dark:bg-zinc-900 dark:border dark:border-zinc-700 hover:bg-[#1E293B] dark:hover:bg-zinc-800 text-white rounded-xl px-3.5 py-1.5 text-xs font-mono font-semibold transition-all flex items-center gap-1.5 shrink-0 cursor-pointer shadow-2xs"
+            title={vaultTooltip}
+            aria-label={vaultTooltip}
+            className="group relative p-2 rounded-xl bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 text-slate-600 dark:text-emerald-400 hover:text-emerald-600 dark:hover:text-emerald-300 hover:border-emerald-300 dark:hover:border-emerald-500/40 hover:bg-emerald-50/70 dark:hover:bg-emerald-500/10 transition-all cursor-pointer shrink-0"
           >
-            <KeyRound className="w-3.5 h-3.5 text-emerald-400" />
-            <span>{activeMarket === 'FOREX' ? 'EXNESS VAULT' : 'API KEY'}</span>
+            <KeyRound className="w-3.5 h-3.5" />
+            <span className="pointer-events-none absolute top-full right-0 mt-2 px-2 py-1 rounded-md bg-slate-900 dark:bg-zinc-800 text-white dark:text-slate-100 border border-slate-700/60 dark:border-zinc-700 font-mono text-[10px] font-medium whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity shadow-lg z-50">
+              {vaultTooltip}
+            </span>
           </button>
 
           {/* Active License Session Pill */}
@@ -247,63 +267,12 @@ export const TerminalHeader: React.FC = () => {
             type="button"
             onClick={logout}
             title="Lock Terminal / Logout Key"
-            className="p-2 rounded-xl bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 text-slate-600 dark:text-slate-300 hover:text-rose-600 dark:hover:text-rose-400 hover:border-rose-200 dark:hover:border-rose-500/40 hover:bg-rose-50 dark:hover:bg-rose-500/10 transition-colors cursor-pointer"
+            aria-label="Lock Terminal / Logout Key"
+            className="p-2 rounded-xl bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 text-slate-600 dark:text-slate-300 hover:text-rose-600 dark:hover:text-rose-400 hover:border-rose-200 dark:hover:border-rose-500/40 hover:bg-rose-50 dark:hover:bg-rose-500/10 transition-colors cursor-pointer shrink-0"
           >
             <LogOut className="w-3.5 h-3.5" />
           </button>
         </div>
-      </div>
-
-      {/* Mobile Status Strip */}
-      <div
-        onClick={() => checkKronosHealth()}
-        className="md:hidden px-3 pb-2 flex items-center justify-between gap-1.5 font-mono text-[10px] cursor-pointer"
-      >
-        <span
-          className={`flex-1 text-center py-1 rounded-lg border font-semibold ${
-            kronosReadyState === 'READY'
-              ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/30'
-              : kronosReadyState === 'CHECKING'
-              ? 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
-              : 'bg-rose-50 dark:bg-rose-500/15 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/30'
-          }`}
-        >
-          {kronosReadyState === 'READY'
-            ? '● Kronos Ready'
-            : kronosReadyState === 'CHECKING'
-            ? '○ Checking...'
-            : '○ Kronos Offline'}
-        </span>
-        <span
-          className={`flex-1 text-center py-1 rounded-lg border font-semibold ${
-            vpsReadyState === 'READY'
-              ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/30'
-              : vpsReadyState === 'CHECKING'
-              ? 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
-              : 'bg-rose-50 dark:bg-rose-500/15 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/30'
-          }`}
-        >
-          {vpsReadyState === 'READY'
-            ? '● VPS Ready'
-            : vpsReadyState === 'CHECKING'
-            ? '○ Checking...'
-            : '○ VPS Offline'}
-        </span>
-        <span
-          className={`flex-1 text-center py-1 rounded-lg border font-semibold ${
-            aiReadyState === 'READY'
-              ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/30'
-              : aiReadyState === 'CHECKING'
-              ? 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
-              : 'bg-amber-50 dark:bg-amber-500/15 text-amber-800 dark:text-amber-300 border-amber-200 dark:border-amber-500/30'
-          }`}
-        >
-          {aiReadyState === 'READY'
-            ? '● AI Ready'
-            : aiReadyState === 'CHECKING'
-            ? '○ Checking...'
-            : '○ AI Standby'}
-        </span>
       </div>
     </header>
   );
