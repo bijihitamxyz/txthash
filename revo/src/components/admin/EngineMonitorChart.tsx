@@ -41,6 +41,8 @@ interface EngineMetricsResponse {
     endpoint?: string;
     label?: string;
     error?: string;
+    cpu?: number | null;
+    ram?: number | null;
   };
   multiAi: {
     online: boolean;
@@ -50,6 +52,8 @@ interface EngineMetricsResponse {
     endpoint?: string;
     label?: string;
     error?: string;
+    cpu?: number | null;
+    ram?: number | null;
   };
 }
 
@@ -124,6 +128,18 @@ export default function EngineMonitorChart() {
     return () => clearInterval(timer);
   }, [fetchMetrics]);
 
+  const hasKronosMetrics =
+    latest?.kronos.cpu !== null &&
+    latest?.kronos.cpu !== undefined &&
+    latest?.kronos.ram !== null &&
+    latest?.kronos.ram !== undefined;
+
+  const hasMultiAiMetrics =
+    latest?.multiAi.cpu !== null &&
+    latest?.multiAi.cpu !== undefined &&
+    latest?.multiAi.ram !== null &&
+    latest?.multiAi.ram !== undefined;
+
   const cards = [
     {
       id: 'server',
@@ -149,7 +165,9 @@ export default function EngineMonitorChart() {
       online: latest ? latest.kronos.online : false,
       latencyMs: latest?.kronos.latencyMs ?? 0,
       subtitle: latest?.kronos.online
-        ? latest.kronos.label || latest.kronos.endpoint || 'VPS Healthy'
+        ? hasKronosMetrics
+          ? `CPU ${latest.kronos.cpu}% • RAM ${latest.kronos.ram}%`
+          : 'Kronos VPS'
         : latest?.kronos.error || 'Offline',
     },
     {
@@ -157,7 +175,10 @@ export default function EngineMonitorChart() {
       title: 'Multi-AI Agent',
       online: latest ? latest.multiAi.online : false,
       latencyMs: latest?.multiAi.latencyMs ?? 0,
-      subtitle: latest?.multiAi.label || latest?.multiAi.error || 'Menunggu config',
+      subtitle:
+        latest?.multiAi.online && hasMultiAiMetrics
+          ? `CPU ${latest.multiAi.cpu}% • RAM ${latest.multiAi.ram}%`
+          : latest?.multiAi.label || latest?.multiAi.error || 'Menunggu config',
     },
   ];
 
