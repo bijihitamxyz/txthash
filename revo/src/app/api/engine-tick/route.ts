@@ -223,13 +223,16 @@ export async function POST(req: NextRequest) {
     const activeAiSummaryLabel = formatActiveAiSummaryLabel(centralAi);
     const effectiveAiThreshold = centralAi.confidenceThreshold ?? runtimeState.aiConfidenceThreshold ?? 70;
 
-    if (centralAi.engineSwitches?.emergencyKillSwitch) {
-      log('SYSTEM', 'RISK', '[ADMIN KILL-SWITCH] Emergency Halt is active in Admin Dashboard. Skipping execution cycle.');
+    if (centralAi.engineSwitches?.emergencyKillSwitch || centralAi.engineSwitches?.forexMaintenance) {
+      const reason = centralAi.engineSwitches?.forexMaintenance
+        ? 'Forex Room Maintenance Mode active via Admin Governance.'
+        : 'Emergency Kill-Switch active via Admin Governance.';
+      log('SYSTEM', 'RISK', `[ADMIN GOVERNANCE] ${reason} Skipping execution cycle.`);
       return NextResponse.json({
         ok: false,
         success: false,
         circuitBreakerTriggered: true,
-        error: 'Emergency Kill-Switch active via Admin Governance.',
+        error: reason,
         telemetry: telemetryLogs,
         positions: runtimeState.positions || [],
         orders: [],

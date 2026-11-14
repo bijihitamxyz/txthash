@@ -10,6 +10,7 @@ import {
   CandlestickChart,
   Coins,
   KeyRound,
+  Lock,
   LogOut,
 } from 'lucide-react';
 
@@ -18,6 +19,7 @@ export const TerminalHeader: React.FC = () => {
 
   const activeRoom = useRoomStore((s) => s.activeRoom);
   const setActiveRoom = useRoomStore((s) => s.setActiveRoom);
+  const maintenance = useRoomStore((s) => s.maintenance);
   const activeMarket: 'FOREX' | 'CRYPTO' =
     activeRoom === 'CRYPTO' || activeRoom === 'ROOM_2_BINANCE' ? 'CRYPTO' : 'FOREX';
 
@@ -60,35 +62,57 @@ export const TerminalHeader: React.FC = () => {
           <div className="inline-flex items-center p-1 rounded-xl bg-slate-100 dark:bg-zinc-900 border border-slate-200/90 dark:border-zinc-800 font-mono text-xs">
             <button
               type="button"
-              onClick={() => setActiveRoom('FOREX')}
-              className={`px-3 py-1.5 rounded-lg font-semibold transition-all flex items-center gap-1.5 cursor-pointer ${
-                activeMarket === 'FOREX'
-                  ? 'bg-[#0F172A] dark:bg-emerald-600 text-white shadow-2xs'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100'
+              disabled={maintenance.forex}
+              aria-disabled={maintenance.forex}
+              title={maintenance.forex ? 'Forex Room sedang dalam mode Maintenance (Terkunci)' : undefined}
+              onClick={() => {
+                if (!maintenance.forex) setActiveRoom('FOREX');
+              }}
+              className={`px-3 py-1.5 rounded-lg font-semibold transition-all flex items-center gap-1.5 ${
+                maintenance.forex
+                  ? 'opacity-50 cursor-not-allowed text-slate-400 dark:text-zinc-500 select-none'
+                  : activeMarket === 'FOREX'
+                  ? 'bg-[#0F172A] dark:bg-emerald-600 text-white shadow-2xs cursor-pointer'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer'
               }`}
             >
-              <CandlestickChart
-                className={`w-3.5 h-3.5 ${
-                  activeMarket === 'FOREX' ? 'text-emerald-400 dark:text-white' : 'text-slate-400'
-                }`}
-              />
+              {maintenance.forex ? (
+                <Lock className="w-3.5 h-3.5 text-amber-500" />
+              ) : (
+                <CandlestickChart
+                  className={`w-3.5 h-3.5 ${
+                    activeMarket === 'FOREX' ? 'text-emerald-400 dark:text-white' : 'text-slate-400'
+                  }`}
+                />
+              )}
               <span>Forex · Exness</span>
             </button>
 
             <button
               type="button"
-              onClick={() => setActiveRoom('CRYPTO')}
-              className={`px-3 py-1.5 rounded-lg font-semibold transition-all flex items-center gap-1.5 cursor-pointer ${
-                activeMarket === 'CRYPTO'
-                  ? 'bg-[#0F172A] dark:bg-emerald-600 text-white shadow-2xs'
-                  : 'text-slate-600 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100'
+              disabled={maintenance.crypto}
+              aria-disabled={maintenance.crypto}
+              title={maintenance.crypto ? 'Crypto Room sedang dalam mode Maintenance (Terkunci)' : undefined}
+              onClick={() => {
+                if (!maintenance.crypto) setActiveRoom('CRYPTO');
+              }}
+              className={`px-3 py-1.5 rounded-lg font-semibold transition-all flex items-center gap-1.5 ${
+                maintenance.crypto
+                  ? 'opacity-50 cursor-not-allowed text-slate-400 dark:text-zinc-500 select-none'
+                  : activeMarket === 'CRYPTO'
+                  ? 'bg-[#0F172A] dark:bg-emerald-600 text-white shadow-2xs cursor-pointer'
+                  : 'text-slate-600 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer'
               }`}
             >
-              <Coins
-                className={`w-3.5 h-3.5 ${
-                  activeMarket === 'CRYPTO' ? 'text-emerald-400 dark:text-white' : 'text-slate-400'
-                }`}
-              />
+              {maintenance.crypto ? (
+                <Lock className="w-3.5 h-3.5 text-amber-500" />
+              ) : (
+                <Coins
+                  className={`w-3.5 h-3.5 ${
+                    activeMarket === 'CRYPTO' ? 'text-emerald-400 dark:text-white' : 'text-slate-400'
+                  }`}
+                />
+              )}
               <span>Crypto · {activeCryptoExchange === 'BITGET' ? 'Bitget' : 'Binance'}</span>
             </button>
           </div>

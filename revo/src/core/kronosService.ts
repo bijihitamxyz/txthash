@@ -168,12 +168,21 @@ export function computeRealTimeKronosForecast(params: {
 }): KronosForecastResult {
   const profile = getPairProfile(params.symbol || 'XAUUSDm');
   const symbol = profile.symbol;
+  const upperSym = symbol.toUpperCase();
+  const isCrypto =
+    upperSym.endsWith('USDT') ||
+    upperSym.endsWith('USDC') ||
+    upperSym.endsWith('BUSD');
   const timeframe: Timeframe = params.timeframe || 'M5';
   const candles = Array.isArray(params.candles) ? params.candles : [];
   const modelUsed = params.aiModel || 'Multi-AI Consensus / Risk Governance';
+  const lastPriceGuess = candles.length > 0 ? candles[candles.length - 1].close : 0;
+  const effectiveDigits = isCrypto && lastPriceGuess > 0
+    ? (lastPriceGuess < 0.01 ? 7 : lastPriceGuess < 1 ? 5 : lastPriceGuess < 10 ? 4 : lastPriceGuess < 100 ? 3 : 2)
+    : profile.digits;
 
-  let bullishPct = 56;
-  let rsiVal = 51.5;
+  let bullishPct = 50;
+  let rsiVal = 50.0;
   let pocPrice = candles.length > 0 ? candles[candles.length - 1].close : (symbol === 'XAUUSDm' ? 4108.90 : 1.1159);
   let vahPrice = pocPrice;
   let valPrice = pocPrice;
@@ -190,16 +199,18 @@ export function computeRealTimeKronosForecast(params: {
         candles,
         profile.preset.rsiPeriod,
         profile.preset.bbPeriod,
-        profile.preset.bbStdDev
+        isCrypto ? 2.2 : profile.preset.bbStdDev
       );
       const lastC = candles[candles.length - 1];
       const prevC = candles[candles.length - 2] || lastC;
       rsiVal = Number((snap.c0.rsi || 50).toFixed(1));
       const middleBB = snap.c0.middleBB || lastC.close;
-      const atr14 = snap.c0.atr14 || Math.abs(lastC.high - lastC.low) || profile.pipValue * 10;
-      atrPips = Number((atr14 / profile.pipValue).toFixed(1));
+      const atr14 = snap.c0.atr14 || Math.abs(lastC.high - lastC.low) || (isCrypto ? lastC.close * 0.008 : profile.pipValue * 10);
+      atrPips = isCrypto
+        ? Number(((atr14 / Math.max(1e-9, lastC.close)) * 100).toFixed(2)) // ATR% for crypto
+        : Number((atr14 / profile.pipValue).toFixed(1));
 
-      const vp = computeVolumeProfileMetrics(candles, middleBB, profile.digits);
+      const vp = computeVolumeProfileMetrics(candles, middleBB, effectiveDigits);
       pocPrice = vp.poc;
       vahPrice = vp.vah;
       valPrice = vp.val;
@@ -215,61 +226,127 @@ export function computeRealTimeKronosForecast(params: {
 
       const lastEma21 = snap.ema21?.[snap.ema21.length - 1] ?? middleBB;
       const lastEma50 = snap.ema50?.[snap.ema50.length - 1] ?? middleBB;
-      const emaDiffPips = (lastEma21 - lastEma50) / (profile.pipValue || 0.01);
-      const pocDiffPips = (lastC.close - pocPrice) / (profile.pipValue || 0.01);
-      const candleMomentum = (lastC.close - prevC.close) / (atr14 || profile.pipValue);
+      const candleMomentum = (lastC.close - prevC.close) / Math.max(1e-9, atr14);
 
-      // Classify quantitative market regime
-      if (snap.bbwExpansionPct && snap.bbwExpansionPct > 22 && Math.abs(zScore) >= 1.4) {
-        regime = 'VOLATILE_EXPANSION';
-      } else if (emaDiffPips > 3 && rsiVal >= 54) {
-        regime = 'TRENDING_BULL';
-      } else if (emaDiffPips < -3 && rsiVal <= 46) {
-        regime = 'TRENDING_BEAR';
+      if (isCrypto) {
+        // Crypto-Native ATR-Normalized Quantitative Forecast (immune to Forex pip distortion)
+        const emaDiffAtr = (lastEma21 - lastEma50) / Math.max(1e-9, atr14);
+        const priceVsEma50Atr = (lastC.close - lastEma50) / Math.max(1e-9, atr14);
+        const pocDiffAtr = (lastC.close - pocPrice) / Math.max(1e-9, atr14);
+
+        // Kaufman Efficiency Ratio (ER-10)
+        const erLook = candles.slice(-11);
+        let er10 = 0.5;
+        if (erLook.length >= 2) {
+          const netChg = Math.abs(erLook[erLook.length - 1].close - erLook[0].close);
+          let sumAbs = 0;
+          for (let i = 1; i < erLook.length; i++) {
+            sumAbs += Math.abs(erLook[i].close - erLook[i - 1].close);
+          }
+          if (sumAbs > 0) er10 = netChg / sumAbs;
+        }
+
+        // Regime classification
+        if (snap.bbwExpansionPct && snap.bbwExpansionPct > 22 && Math.abs(zScore) >= 1.5) {
+          regime = 'VOLATILE_EXPANSION';
+        } else if (emaDiffAtr > 0.35 && lastC.close >= lastEma50 && rsiVal >= 52) {
+          regime = 'TRENDING_BULL';
+        } else if (emaDiffAtr < -0.35 && lastC.close <= lastEma50 && rsiVal <= 48) {
+          regime = 'TRENDING_BEAR';
+        } else {
+          regime = 'MEAN_REVERTING';
+        }
+
+        // Mean-reversion vs trend scoring:
+        // - Trend component: EMA21 vs EMA50 + price vs EMA50
+        // - Exhaustion/Reversion component: if |zScore| >= 1.6 and RSI extreme, penalize chasing!
+        const trendScore =
+          Math.max(-16, Math.min(16, emaDiffAtr * 7)) +
+          Math.max(-8, Math.min(8, priceVsEma50Atr * 4));
+        const rsiScore = Math.max(-12, Math.min(12, (rsiVal - 50) * 0.45));
+        // Mean-reversion pull toward POC when overextended
+        const reversionBias = Math.abs(zScore) >= 1.5 ? -Math.sign(zScore) * Math.min(12, (Math.abs(zScore) - 1.2) * 8) : 0;
+        const pocMagnetScore =
+          regime === 'MEAN_REVERTING'
+            ? Math.max(-8, Math.min(8, -pocDiffAtr * 3.5))
+            : Math.max(-6, Math.min(6, pocDiffAtr * 2.5));
+        const momScore = Math.max(-6, Math.min(6, candleMomentum * 4));
+
+        const rawBullish = 50 + trendScore + rsiScore + pocMagnetScore + reversionBias + momScore;
+        bullishPct = Math.max(15, Math.min(86, Math.round(rawBullish)));
+
+        // Horizon projection: bounded by 0.8x - 1.8x ATR14 in predicted direction
+        const isBullHorizon = bullishPct >= 50;
+        const horizonMultiplier = 0.8 + Math.abs(bullishPct - 50) / 36;
+        const rawHorizon = isBullHorizon
+          ? lastC.close + atr14 * horizonMultiplier
+          : lastC.close - atr14 * horizonMultiplier;
+        horizonPrice = Number(rawHorizon.toFixed(effectiveDigits));
+
+        // Signal only when edge is clear (>= 62% or <= 38%) and not chasing extreme overbought/oversold in chop
+        if (bullishPct >= 62 && !(regime === 'MEAN_REVERTING' && rsiVal > 68)) {
+          signal = 'BUY';
+          gateSummary = `CRYPTO_QUANT (${regime}, ER=${er10.toFixed(2)}, Z=${zScore.toFixed(2)})`;
+        } else if (bullishPct <= 38 && !(regime === 'MEAN_REVERTING' && rsiVal < 32)) {
+          signal = 'SELL';
+          gateSummary = `CRYPTO_QUANT (${regime}, ER=${er10.toFixed(2)}, Z=${zScore.toFixed(2)})`;
+        }
       } else {
-        regime = 'MEAN_REVERTING';
-      }
+        const emaDiffPips = (lastEma21 - lastEma50) / (profile.pipValue || 0.01);
+        const pocDiffPips = (lastC.close - pocPrice) / (profile.pipValue || 0.01);
 
-      // Timeframe sensitivity multiplier
-      const tfFactor = timeframe === 'M1' ? 1.15 : timeframe === 'M5' ? 1.0 : timeframe === 'M15' ? 0.92 : 0.85;
+        // Classify quantitative market regime
+        if (snap.bbwExpansionPct && snap.bbwExpansionPct > 22 && Math.abs(zScore) >= 1.4) {
+          regime = 'VOLATILE_EXPANSION';
+        } else if (emaDiffPips > 3 && rsiVal >= 54) {
+          regime = 'TRENDING_BULL';
+        } else if (emaDiffPips < -3 && rsiVal <= 46) {
+          regime = 'TRENDING_BEAR';
+        } else {
+          regime = 'MEAN_REVERTING';
+        }
 
-      const rsiScore = (rsiVal - 50) * 0.55;
-      const emaScore = Math.max(-18, Math.min(18, emaDiffPips * 0.35 * tfFactor));
-      const pocScore = Math.max(-10, Math.min(10, pocDiffPips * 0.25));
-      const momScore = Math.max(-8, Math.min(8, candleMomentum * 6));
+        // Timeframe sensitivity multiplier
+        const tfFactor = timeframe === 'M1' ? 1.15 : timeframe === 'M5' ? 1.0 : timeframe === 'M15' ? 0.92 : 0.85;
 
-      const rawBullish = 50 + rsiScore + emaScore + pocScore + momScore;
-      bullishPct = Math.max(14, Math.min(89, Math.round(rawBullish)));
+        const rsiScore = (rsiVal - 50) * 0.55;
+        const emaScore = Math.max(-18, Math.min(18, emaDiffPips * 0.35 * tfFactor));
+        const pocScore = Math.max(-10, Math.min(10, pocDiffPips * 0.25));
+        const momScore = Math.max(-8, Math.min(8, candleMomentum * 6));
 
-      const isBullHorizon = bullishPct >= 50;
-      const horizonMultiplier = 1.2 + Math.abs(bullishPct - 50) / 40;
-      const rawHorizon = isBullHorizon
-        ? lastC.close + atr14 * horizonMultiplier
-        : lastC.close - atr14 * horizonMultiplier;
-      horizonPrice = Number(rawHorizon.toFixed(profile.digits));
+        const rawBullish = 50 + rsiScore + emaScore + pocScore + momScore;
+        bullishPct = Math.max(14, Math.min(89, Math.round(rawBullish)));
 
-      if (candles.length >= 25) {
-        const gate = evaluateSignalGates(candles, { pairProfile: profile, timeframe });
-        if (gate.isValid && (gate.side === 'BUY' || gate.side === 'SELL')) {
-          // Strictly prevent counter-regime Setup A: if TRENDING_BEAR, Setup A must not force BUY
-          const isBearishRegime = regime === 'TRENDING_BEAR' || bullishPct <= 45;
-          const isBullishRegime = regime === 'TRENDING_BULL' || bullishPct >= 55;
-          if (isBearishRegime && gate.side === 'BUY' && gate.setupName === 'SETUP_A_TREND_PULLBACK') {
-            // Skip counter-regime Setup A buy in trending bear
-          } else if (isBullishRegime && gate.side === 'SELL' && gate.setupName === 'SETUP_A_TREND_PULLBACK') {
-            // Skip counter-regime Setup A sell in trending bull
-          } else {
-            signal = gate.side;
-            gateSummary = `${gate.setupName || gate.signalType} (${gate.confluenceScore || 75}/100)`;
-            if (signal === 'BUY' && bullishPct < 60) bullishPct = Math.min(88, bullishPct + 12);
-            if (signal === 'SELL' && bullishPct > 40) bullishPct = Math.max(14, bullishPct - 12);
+        const isBullHorizon = bullishPct >= 50;
+        const horizonMultiplier = 1.2 + Math.abs(bullishPct - 50) / 40;
+        const rawHorizon = isBullHorizon
+          ? lastC.close + atr14 * horizonMultiplier
+          : lastC.close - atr14 * horizonMultiplier;
+        horizonPrice = Number(rawHorizon.toFixed(effectiveDigits));
+
+        if (candles.length >= 25) {
+          const gate = evaluateSignalGates(candles, { pairProfile: profile, timeframe });
+          if (gate.isValid && (gate.side === 'BUY' || gate.side === 'SELL')) {
+            // Strictly prevent counter-regime Setup A: if TRENDING_BEAR, Setup A must not force BUY
+            const isBearishRegime = regime === 'TRENDING_BEAR' || bullishPct <= 45;
+            const isBullishRegime = regime === 'TRENDING_BULL' || bullishPct >= 55;
+            if (isBearishRegime && gate.side === 'BUY' && gate.setupName === 'SETUP_A_TREND_PULLBACK') {
+              // Skip counter-regime Setup A buy in trending bear
+            } else if (isBullishRegime && gate.side === 'SELL' && gate.setupName === 'SETUP_A_TREND_PULLBACK') {
+              // Skip counter-regime Setup A sell in trending bull
+            } else {
+              signal = gate.side;
+              gateSummary = `${gate.setupName || gate.signalType} (${gate.confluenceScore || 75}/100)`;
+              if (signal === 'BUY' && bullishPct < 60) bullishPct = Math.min(88, bullishPct + 12);
+              if (signal === 'SELL' && bullishPct > 40) bullishPct = Math.max(14, bullishPct - 12);
+            }
           }
         }
-      }
 
-      if (signal === 'NEUTRAL') {
-        if (bullishPct >= 62) signal = 'BUY';
-        else if (bullishPct <= 38) signal = 'SELL';
+        if (signal === 'NEUTRAL') {
+          if (bullishPct >= 62) signal = 'BUY';
+          else if (bullishPct <= 38) signal = 'SELL';
+        }
       }
     } catch {}
   }
@@ -285,17 +362,17 @@ export function computeRealTimeKronosForecast(params: {
   const multiAiSummary = gateSummary
     ? `[${modelUsed}] Signal ${signal} verified via ${gateSummary} on ${symbol} (${timeframe}). POC=${formatPrice(
         pocPrice,
-        profile.digits
-      )}, VAH=${formatPrice(vahPrice, profile.digits)}, VAL=${formatPrice(
+        effectiveDigits
+      )}, VAH=${formatPrice(vahPrice, effectiveDigits)}, VAL=${formatPrice(
         valPrice,
-        profile.digits
+        effectiveDigits
       )}, RSI=${rsiVal.toFixed(1)}, Z=${zScore >= 0 ? '+' : ''}${zScore.toFixed(2)} (${regime}).`
     : `[${modelUsed}] Multi-AI Consensus / Risk Governance active on ${symbol} (${timeframe}). POC=${formatPrice(
         pocPrice,
-        profile.digits
-      )}, VAH=${formatPrice(vahPrice, profile.digits)}, VAL=${formatPrice(
+        effectiveDigits
+      )}, VAH=${formatPrice(vahPrice, effectiveDigits)}, VAL=${formatPrice(
         valPrice,
-        profile.digits
+        effectiveDigits
       )}, RSI=${rsiVal.toFixed(1)}, Z=${zScore >= 0 ? '+' : ''}${zScore.toFixed(2)} (${regime}).`;
 
   return {

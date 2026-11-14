@@ -9,6 +9,8 @@ export interface EngineSwitches {
   exnessWebSocket: boolean;
   restMutexQueue: boolean;
   emergencyKillSwitch: boolean;
+  forexMaintenance: boolean;
+  cryptoMaintenance: boolean;
 }
 
 export interface AiProviderSlot {
@@ -103,6 +105,8 @@ export const DEFAULT_ENGINE_SWITCHES: EngineSwitches = {
   exnessWebSocket: true,
   restMutexQueue: true,
   emergencyKillSwitch: false,
+  forexMaintenance: false,
+  cryptoMaintenance: false,
 };
 
 export const DEFAULT_CENTRAL_AI_CONFIG: CentralAiConfig = {
@@ -136,6 +140,8 @@ function normalizeEngineSwitches(raw: any): EngineSwitches {
     exnessWebSocket: typeof raw.exnessWebSocket === 'boolean' ? raw.exnessWebSocket : DEFAULT_ENGINE_SWITCHES.exnessWebSocket,
     restMutexQueue: typeof raw.restMutexQueue === 'boolean' ? raw.restMutexQueue : DEFAULT_ENGINE_SWITCHES.restMutexQueue,
     emergencyKillSwitch: typeof raw.emergencyKillSwitch === 'boolean' ? raw.emergencyKillSwitch : DEFAULT_ENGINE_SWITCHES.emergencyKillSwitch,
+    forexMaintenance: typeof raw.forexMaintenance === 'boolean' ? raw.forexMaintenance : DEFAULT_ENGINE_SWITCHES.forexMaintenance,
+    cryptoMaintenance: typeof raw.cryptoMaintenance === 'boolean' ? raw.cryptoMaintenance : DEFAULT_ENGINE_SWITCHES.cryptoMaintenance,
   };
 }
 

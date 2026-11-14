@@ -780,6 +780,12 @@ export default function SystemAdminPage() {
         }
         useBinanceStore.getState().setIsAutoTrading(false);
       }
+      if (key === 'forexMaintenance' && nextVal && isAutoTrading) {
+        await toggleAutoTrading(false);
+      }
+      if (key === 'cryptoMaintenance' && nextVal) {
+        useBinanceStore.getState().setIsAutoTrading(false);
+      }
       if (key === 'localEaExecutor' && !nextVal && isAutoTrading) {
         await toggleAutoTrading(false);
       }
@@ -2284,6 +2290,66 @@ export default function SystemAdminPage() {
                   <span className="font-mono text-[10px] text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-500/15 border border-emerald-200 dark:border-emerald-500/30 px-2 py-0.5 rounded-full font-semibold">
                     PERSISTENT
                   </span>
+                </div>
+
+                {/* Room Maintenance & Upgrade Toggles */}
+                <div className="p-3.5 rounded-xl bg-amber-50/70 dark:bg-amber-500/10 border border-amber-200/90 dark:border-amber-500/30 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="font-mono text-[11px] font-bold uppercase tracking-wider text-amber-800 dark:text-amber-300">
+                      Room Maintenance &amp; Upgrade Mode
+                    </span>
+                    <span className="font-mono text-[10px] px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-300 border border-amber-300/70 dark:border-amber-500/30 font-semibold">
+                      {switches.forexMaintenance || switches.cryptoMaintenance ? 'ACTIVE' : 'NORMAL'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    {[
+                      {
+                        key: 'forexMaintenance' as keyof EngineSwitches,
+                        label: 'Forex Maintenance',
+                        sub: 'Halt Forex auto-trade & lock room',
+                      },
+                      {
+                        key: 'cryptoMaintenance' as keyof EngineSwitches,
+                        label: 'Crypto Maintenance',
+                        sub: 'Halt Crypto auto-trade & lock room',
+                      },
+                    ].map((mItem) => {
+                      const isMaint = Boolean(switches[mItem.key]);
+                      const isSavingThis = savingSwitchKey === mItem.key;
+                      return (
+                        <div
+                          key={mItem.key}
+                          className={`p-2.5 rounded-xl border flex items-center justify-between gap-2 transition-all ${
+                            isMaint
+                              ? 'bg-amber-100/80 dark:bg-amber-500/20 border-amber-400 dark:border-amber-500/50'
+                              : 'bg-white/90 dark:bg-zinc-900/80 border-amber-200/70 dark:border-zinc-800'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <div className="font-sans font-bold text-xs text-[#0F172A] dark:text-slate-100 truncate">
+                              {mItem.label}
+                            </div>
+                            <div className="text-[10px] text-slate-500 dark:text-slate-400 leading-tight">
+                              {mItem.sub}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={isSavingThis}
+                            onClick={() => handleToggleSwitch(mItem.key)}
+                            className={`px-2.5 py-1 rounded-full font-mono text-[11px] font-bold border transition-all shrink-0 cursor-pointer ${
+                              isMaint
+                                ? 'bg-amber-600 text-white border-amber-600 shadow-xs'
+                                : 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-zinc-300 border-slate-200 dark:border-zinc-700 hover:bg-slate-200'
+                            }`}
+                          >
+                            {isSavingThis ? '...' : isMaint ? 'MAINT' : 'LIVE'}
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
 
                 <div className="space-y-2.5">

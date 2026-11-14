@@ -71,12 +71,20 @@ export const BINANCE_TESTNET_REST_BASE = 'https://testnet.binancefuture.com';
 export const BINANCE_WS_BASE = 'wss://fstream.binance.com/ws';
 export const BINANCE_TESTNET_WS_BASE = 'wss://stream.binancefuture.com/ws';
 
-// In-memory cache for exchange info & tickers to prevent rate limits
-let cachedExchangeInfo: { timestamp: number; symbols: BinanceSymbolFilter[] } | null = null;
+// In-memory cache for exchange info & tickers keyed by environment (REAL vs DEMO)
+const cachedExchangeInfo = new Map<'REAL' | 'DEMO', { timestamp: number; symbols: BinanceSymbolFilter[] }>();
 const CACHE_EXCHANGE_INFO_TTL = 30 * 60 * 1000; // 30 minutes
 
-let cachedTickers: { timestamp: number; data: Record<string, Binance24hTicker> } | null = null;
+const cachedTickers = new Map<'REAL' | 'DEMO', { timestamp: number; data: Record<string, Binance24hTicker> }>();
 const CACHE_TICKERS_TTL = 3 * 1000; // 3 seconds
+
+// Server time offset cache per baseUrl to prevent -1021 timestamp errors on drifting clocks
+const serverTimeOffsetCache = new Map<string, { offsetMs: number; syncedAt: number }>();
+const SERVER_TIME_TTL_MS = 5 * 60 * 1000;
+
+// Hedge mode cache per apiKey + env
+const hedgeModeCache = new Map<string, { isHedge: boolean; syncedAt: number }>();
+const HEDGE_MODE_TTL_MS = 60 * 1000;
 
 // Fallback high-liquid L2 & Altcoin specs in case Binance API is temporarily unreachable
 export const FALLBACK_SYMBOLS: BinanceSymbolFilter[] = [
@@ -145,13 +153,76 @@ export class BinanceFuturesClient {
     this.baseUrl = isTestnet ? BINANCE_TESTNET_REST_BASE : BINANCE_REST_BASE;
   }
 
+  private get envKey(): 'REAL' | 'DEMO' {
+    return this.isTestnet ? 'DEMO' : 'REAL';
+  }
+
+  private async syncServerTime(force: boolean = false): Promise<number> {
+    const cached = serverTimeOffsetCache.get(this.baseUrl);
+    if (!force && cached && Date.now() - cached.syncedAt < SERVER_TIME_TTL_MS) {
+      return cached.offsetMs;
+    }
+    try {
+      const t0 = Date.now();
+      const res = await fetch(`${this.baseUrl}/fapi/v1/time`, { signal: AbortSignal.timeout(4000) });
+      if (res.ok) {
+        const data = await res.json();
+        const t1 = Date.now();
+        if (typeof data.serverTime === 'number') {
+          const offsetMs = data.serverTime - Math.round((t0 + t1) / 2);
+          serverTimeOffsetCache.set(this.baseUrl, { offsetMs, syncedAt: t1 });
+          return offsetMs;
+        }
+      }
+    } catch {}
+    return cached?.offsetMs ?? 0;
+  }
+
+  private async signedFetch(
+    method: 'GET' | 'POST' | 'DELETE',
+    path: string,
+    params: Record<string, any> = {},
+    timeoutMs: number = 7000
+  ): Promise<{ ok: boolean; status: number; json: any }> {
+    let offsetMs = await this.syncServerTime(false);
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const timestamp = Date.now() + offsetMs;
+      const fullParams = { ...params, timestamp, recvWindow: 10000 };
+      const signedQuery = signBinanceRequest(fullParams, this.apiSecret);
+      const url = method === 'GET' || method === 'DELETE'
+        ? `${this.baseUrl}${path}?${signedQuery}`
+        : `${this.baseUrl}${path}`;
+
+      const res = await fetch(url, {
+        method,
+        headers: {
+          'X-MBX-APIKEY': this.apiKey,
+          'Content-Type': method === 'POST' ? 'application/x-www-form-urlencoded' : 'application/json',
+        },
+        body: method === 'POST' ? signedQuery : undefined,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok && json?.code === -1021 && attempt === 0) {
+        offsetMs = await this.syncServerTime(true);
+        continue;
+      }
+      return { ok: res.ok, status: res.status, json };
+    }
+
+    throw new Error('Binance signed request failed after timestamp resync');
+  }
+
   /**
    * Fetches all active USDT Perpetual contracts and parses their precision & step filters.
    */
   async getExchangeInfo(): Promise<BinanceSymbolFilter[]> {
     const now = Date.now();
-    if (cachedExchangeInfo && now - cachedExchangeInfo.timestamp < CACHE_EXCHANGE_INFO_TTL) {
-      return cachedExchangeInfo.symbols;
+    const cached = cachedExchangeInfo.get(this.envKey);
+    if (cached && now - cached.timestamp < CACHE_EXCHANGE_INFO_TTL) {
+      return cached.symbols;
     }
 
     try {
@@ -191,14 +262,14 @@ export class BinanceFuturesClient {
         });
 
       if (usdtPerps.length > 0) {
-        cachedExchangeInfo = { timestamp: now, symbols: usdtPerps };
+        cachedExchangeInfo.set(this.envKey, { timestamp: now, symbols: usdtPerps });
         return usdtPerps;
       }
     } catch (err) {
-      console.warn('[BinanceClient.getExchangeInfo] Failed to fetch live exchange info, using fallback list:', err);
+      console.warn(`[BinanceClient.getExchangeInfo:${this.envKey}] Failed to fetch live exchange info, using fallback list:`, err);
     }
 
-    return FALLBACK_SYMBOLS;
+    return cached?.symbols || FALLBACK_SYMBOLS;
   }
 
   /**
@@ -206,8 +277,9 @@ export class BinanceFuturesClient {
    */
   async get24hrTickers(): Promise<Record<string, Binance24hTicker>> {
     const now = Date.now();
-    if (cachedTickers && now - cachedTickers.timestamp < CACHE_TICKERS_TTL) {
-      return cachedTickers.data;
+    const cached = cachedTickers.get(this.envKey);
+    if (cached && now - cached.timestamp < CACHE_TICKERS_TTL) {
+      return cached.data;
     }
 
     try {
@@ -234,11 +306,11 @@ export class BinanceFuturesClient {
         }
       }
 
-      cachedTickers = { timestamp: now, data: map };
+      cachedTickers.set(this.envKey, { timestamp: now, data: map });
       return map;
     } catch (err) {
-      console.warn('[BinanceClient.get24hrTickers] Failed, returning empty map:', err);
-      return cachedTickers?.data || {};
+      console.warn(`[BinanceClient.get24hrTickers:${this.envKey}] Failed, returning cached/empty map:`, err);
+      return cached?.data || {};
     }
   }
 
@@ -290,6 +362,26 @@ export class BinanceFuturesClient {
   }
 
   /**
+   * Checks whether account uses Hedge Mode (dualSidePosition=true) vs One-Way Mode.
+   */
+  async isHedgeMode(): Promise<boolean> {
+    if (!this.apiKey || !this.apiSecret) return false;
+    const key = `${this.apiKey}:${this.envKey}`;
+    const cached = hedgeModeCache.get(key);
+    if (cached && Date.now() - cached.syncedAt < HEDGE_MODE_TTL_MS) {
+      return cached.isHedge;
+    }
+    try {
+      const { ok, json } = await this.signedFetch('GET', '/fapi/v1/positionSide/dual', {}, 5000);
+      if (ok && typeof json?.dualSidePosition === 'boolean') {
+        hedgeModeCache.set(key, { isHedge: json.dualSidePosition, syncedAt: Date.now() });
+        return json.dualSidePosition;
+      }
+    } catch {}
+    return cached?.isHedge ?? false;
+  }
+
+  /**
    * Fetches authenticated account info: USDT balance, margin, open positions
    */
   async getAccountInfo(): Promise<BinanceAccountInfo> {
@@ -305,26 +397,11 @@ export class BinanceFuturesClient {
       };
     }
 
-    const timestamp = Date.now();
-    const params = { timestamp, recvWindow: 5000 };
-    const signedQuery = signBinanceRequest(params, this.apiSecret);
-    const url = `${this.baseUrl}/fapi/v2/account?${signedQuery}`;
+    const { ok, status, json: data } = await this.signedFetch('GET', '/fapi/v2/account', {}, 6000);
 
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: {
-        'X-MBX-APIKEY': this.apiKey,
-        'Content-Type': 'application/json',
-      },
-      signal: AbortSignal.timeout(6000),
-    });
-
-    if (!res.ok) {
-      const errJson = await res.json().catch(() => ({}));
-      throw new Error(errJson.msg || `Binance account error HTTP ${res.status}`);
+    if (!ok) {
+      throw new Error(data?.msg || `Binance account error HTTP ${status}`);
     }
-
-    const data = await res.json();
 
     const usdtAsset = (data.assets || []).find((a: any) => a.asset === 'USDT') || {};
     const walletBalance = parseFloat(usdtAsset.walletBalance || data.totalWalletBalance || '0');
@@ -362,27 +439,17 @@ export class BinanceFuturesClient {
    * Sets leverage for a given symbol
    */
   async setLeverage(symbol: string, leverage: number): Promise<{ symbol: string; leverage: number }> {
-    const timestamp = Date.now();
-    const params = { symbol, leverage, timestamp, recvWindow: 5000 };
-    const signedQuery = signBinanceRequest(params, this.apiSecret);
-    const url = `${this.baseUrl}/fapi/v1/leverage`;
+    const { ok, status, json } = await this.signedFetch(
+      'POST',
+      '/fapi/v1/leverage',
+      { symbol, leverage: Math.max(1, Math.round(leverage)) },
+      6000
+    );
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'X-MBX-APIKEY': this.apiKey,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: signedQuery,
-      signal: AbortSignal.timeout(6000),
-    });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.msg || `Set leverage failed HTTP ${res.status}`);
+    if (!ok) {
+      throw new Error(json?.msg || `Set leverage failed HTTP ${status}`);
     }
 
-    const json = await res.json();
     return { symbol: json.symbol, leverage: json.leverage };
   }
 
@@ -390,84 +457,145 @@ export class BinanceFuturesClient {
    * Sets margin type (ISOLATED vs CROSSED)
    */
   async setMarginType(symbol: string, marginType: 'ISOLATED' | 'CROSSED'): Promise<boolean> {
-    const timestamp = Date.now();
-    const params = { symbol, marginType, timestamp, recvWindow: 5000 };
-    const signedQuery = signBinanceRequest(params, this.apiSecret);
-    const url = `${this.baseUrl}/fapi/v1/marginType`;
+    const { ok, status, json: err } = await this.signedFetch(
+      'POST',
+      '/fapi/v1/marginType',
+      { symbol, marginType },
+      6000
+    );
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'X-MBX-APIKEY': this.apiKey,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: signedQuery,
-      signal: AbortSignal.timeout(6000),
-    });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      // Code -4046 means margin type is already set to that type, ignore safely
-      if (err.code === -4046) return true;
-      throw new Error(err.msg || `Set margin type failed HTTP ${res.status}`);
+    if (!ok) {
+      // -4046: No need to change margin type; -4048: Margin type cannot be changed if there exists position
+      if (err?.code === -4046 || err?.code === -4048) return true;
+      throw new Error(err?.msg || `Set margin type failed HTTP ${status}`);
     }
 
     return true;
   }
 
   /**
-   * Places an order (MARKET / LIMIT / STOP_MARKET)
+   * Places an order (MARKET / LIMIT / STOP_MARKET / TAKE_PROFIT_MARKET)
    */
   async placeOrder(params: {
     symbol: string;
     side: 'BUY' | 'SELL';
-    type?: 'MARKET' | 'LIMIT' | 'STOP_MARKET';
-    quantity: string;
+    type?: 'MARKET' | 'LIMIT' | 'STOP_MARKET' | 'TAKE_PROFIT_MARKET';
+    quantity?: string;
     reduceOnly?: boolean;
+    closePosition?: boolean;
     price?: string;
     stopPrice?: string;
+    positionSide?: 'BOTH' | 'LONG' | 'SHORT';
   }): Promise<any> {
-    const timestamp = Date.now();
+    const orderType = (params.type || 'MARKET').toUpperCase();
+    const hedge = await this.isHedgeMode();
+
     const orderPayload: Record<string, any> = {
       symbol: params.symbol,
       side: params.side,
-      type: params.type || 'MARKET',
-      quantity: params.quantity,
-      timestamp,
-      recvWindow: 5000,
+      type: orderType,
     };
 
-    if (params.reduceOnly) {
+    if (params.quantity) {
+      orderPayload.quantity = params.quantity;
+    }
+
+    if (hedge) {
+      orderPayload.positionSide = params.positionSide || (
+        params.reduceOnly || params.closePosition
+          ? (params.side === 'SELL' ? 'LONG' : 'SHORT')
+          : (params.side === 'BUY' ? 'LONG' : 'SHORT')
+      );
+    } else if (params.reduceOnly && !params.closePosition) {
       orderPayload.reduceOnly = 'true';
     }
-    const orderType = (params.type || 'MARKET').toUpperCase();
+
+    if (params.closePosition) {
+      orderPayload.closePosition = 'true';
+    }
+
     if (params.price && orderType === 'LIMIT') {
       orderPayload.price = params.price;
       orderPayload.timeInForce = 'GTC';
     }
     if (params.stopPrice && orderType !== 'MARKET' && orderType !== 'LIMIT') {
       orderPayload.stopPrice = params.stopPrice;
+      orderPayload.workingType = 'MARK_PRICE';
     }
 
-    const signedQuery = signBinanceRequest(orderPayload, this.apiSecret);
-    const url = `${this.baseUrl}/fapi/v1/order`;
+    const { ok, status, json } = await this.signedFetch('POST', '/fapi/v1/order', orderPayload, 7000);
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'X-MBX-APIKEY': this.apiKey,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: signedQuery,
-      signal: AbortSignal.timeout(7000),
+    if (!ok) {
+      throw new Error(json?.msg || `Order failed HTTP ${status}`);
+    }
+
+    return json;
+  }
+
+  /**
+   * Sets margin mode + leverage, places MARKET entry, and attaches best-effort SL/TP orders.
+   */
+  async placeMarketOrderWithProtection(params: {
+    symbol: string;
+    side: 'BUY' | 'SELL';
+    quantity: string;
+    leverage?: number;
+    marginMode?: 'ISOLATED' | 'CROSSED';
+    stopLossPrice?: number;
+    takeProfitPrice?: number;
+  }): Promise<any> {
+    if (params.marginMode) {
+      await this.setMarginType(params.symbol, params.marginMode).catch(() => {});
+    }
+    if (params.leverage && params.leverage > 0) {
+      await this.setLeverage(params.symbol, params.leverage).catch(() => {});
+    }
+
+    const entryOrder = await this.placeOrder({
+      symbol: params.symbol,
+      side: params.side,
+      type: 'MARKET',
+      quantity: params.quantity,
     });
 
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.msg || `Order failed HTTP ${res.status}`);
+    const filters = await this.getExchangeInfo().catch(() => FALLBACK_SYMBOLS);
+    const filter = filters.find((f) => f.symbol === params.symbol) || FALLBACK_SYMBOLS.find((f) => f.symbol === params.symbol);
+    const closeSide: 'BUY' | 'SELL' = params.side === 'BUY' ? 'SELL' : 'BUY';
+    const positionSide: 'LONG' | 'SHORT' = params.side === 'BUY' ? 'LONG' : 'SHORT';
+
+    if (params.stopLossPrice && params.stopLossPrice > 0) {
+      const slStr = filter
+        ? formatPriceByTickSize(params.stopLossPrice, filter.tickSize, filter.pricePrecision)
+        : String(params.stopLossPrice);
+      await this.placeOrder({
+        symbol: params.symbol,
+        side: closeSide,
+        type: 'STOP_MARKET',
+        stopPrice: slStr,
+        closePosition: true,
+        positionSide,
+      }).catch((e) => {
+        console.warn(`[BinanceClient] Non-fatal SL order warning on ${params.symbol}:`, e?.message);
+      });
     }
 
-    return await res.json();
+    if (params.takeProfitPrice && params.takeProfitPrice > 0) {
+      const tpStr = filter
+        ? formatPriceByTickSize(params.takeProfitPrice, filter.tickSize, filter.pricePrecision)
+        : String(params.takeProfitPrice);
+      await this.placeOrder({
+        symbol: params.symbol,
+        side: closeSide,
+        type: 'TAKE_PROFIT_MARKET',
+        stopPrice: tpStr,
+        closePosition: true,
+        positionSide,
+      }).catch((e) => {
+        console.warn(`[BinanceClient] Non-fatal TP order warning on ${params.symbol}:`, e?.message);
+      });
+    }
+
+    return entryOrder;
   }
 
   /**
@@ -502,6 +630,7 @@ export class BinanceFuturesClient {
       type: 'MARKET',
       quantity: formattedQty,
       reduceOnly: true,
+      positionSide: isLong ? 'LONG' : 'SHORT',
     });
   }
 }

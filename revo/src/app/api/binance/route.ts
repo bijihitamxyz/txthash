@@ -25,9 +25,30 @@ export async function GET(req: NextRequest) {
       });
     }
 
-    const exchange = (searchParams.get('exchange') || 'BINANCE').toUpperCase();
-    const isTestnet = searchParams.get('isTestnet') === 'true' || searchParams.get('accountType') === 'DEMO';
-    const accountType: 'REAL' | 'DEMO' = isTestnet ? 'DEMO' : 'REAL';
+    const rawExchange = searchParams.get('exchange');
+    const rawIsTestnet = searchParams.get('isTestnet');
+    const rawAccountType = searchParams.get('accountType');
+
+    let exchange = rawExchange ? rawExchange.toUpperCase() : '';
+    let accountType: 'REAL' | 'DEMO' | null =
+      rawAccountType === 'DEMO' || rawIsTestnet === 'true'
+        ? 'DEMO'
+        : rawAccountType === 'REAL' || rawIsTestnet === 'false'
+        ? 'REAL'
+        : null;
+
+    if (!exchange || !accountType) {
+      const vault = await loadServerCryptoVault().catch(() => null);
+      if (!exchange) {
+        exchange = (vault?.activeCryptoExchange || 'BINANCE').toUpperCase();
+      }
+      if (!accountType) {
+        const vaultCreds = exchange === 'BITGET' ? vault?.bitget : vault?.binance;
+        accountType = vaultCreds?.accountType || (exchange === 'BITGET' ? 'REAL' : 'DEMO');
+      }
+    }
+
+    const isTestnet = accountType === 'DEMO';
 
     if (exchange === 'BITGET') {
       const bitget = new BitgetFuturesService('', '', '', accountType);
@@ -107,7 +128,24 @@ export async function POST(req: NextRequest) {
     }
 
     if (action === 'SYNC_STATE' || action === 'TOGGLE_AUTO_TRADING') {
-      const isAuto = typeof body.isAutoTrading === 'boolean' ? body.isAutoTrading : false;
+      const requestedAuto = typeof body.isAutoTrading === 'boolean' ? body.isAutoTrading : false;
+      if (requestedAuto) {
+        const { readCentralAiConfig } = await import('@/core/centralAiConfig');
+        const centralCfg = await readCentralAiConfig();
+        if (centralCfg.engineSwitches?.cryptoMaintenance || centralCfg.engineSwitches?.emergencyKillSwitch) {
+          return NextResponse.json(
+            {
+              success: false,
+              maintenance: true,
+              error: centralCfg.engineSwitches?.cryptoMaintenance
+                ? 'Crypto Room sedang dalam mode Maintenance / Upgrade oleh Admin.'
+                : 'Emergency Kill-Switch sedang aktif oleh Admin.',
+            },
+            { status: 503 }
+          );
+        }
+      }
+      const isAuto = requestedAuto;
       const { engineScheduler } = await import('@/lib/engineScheduler');
       engineScheduler.setCryptoAutoTrading(isAuto);
 
@@ -171,28 +209,58 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: 'Missing vault payload' }, { status: 400 });
     }
 
-    const exchange: 'BINANCE' | 'BITGET' = (
+    const serverVault = action !== 'TEST_CONNECTION'
+      ? await loadServerCryptoVault().catch(() => null)
+      : null;
+
+    const rawExchange =
       body.exchange ||
       body.credentials?.exchange ||
-      (body.credentials?.passphrase ? 'BITGET' : 'BINANCE')
-    ).toUpperCase() as 'BINANCE' | 'BITGET';
+      (body.credentials?.passphrase ? 'BITGET' : undefined) ||
+      serverVault?.activeCryptoExchange ||
+      'BINANCE';
 
-    const {
-      apiKey = '',
-      apiSecret = '',
-      secretKey = '',
-      passphrase = '',
-      isTestnet = false,
-      accountType: rawAccountType,
-    } = body.credentials || {};
+    const exchange: 'BINANCE' | 'BITGET' = String(rawExchange).toUpperCase() === 'BITGET' ? 'BITGET' : 'BINANCE';
+    const vaultCreds = exchange === 'BITGET' ? serverVault?.bitget : serverVault?.binance;
 
-    const effectiveSecret = secretKey || apiSecret;
-    const accountType: 'REAL' | 'DEMO' = rawAccountType || (isTestnet ? 'DEMO' : 'REAL');
+    const reqCreds = body.credentials || {};
+    const apiKey = String(reqCreds.apiKey || (action !== 'TEST_CONNECTION' ? vaultCreds?.apiKey : '') || '').trim();
+    const effectiveSecret = String(
+      reqCreds.secretKey ||
+      reqCreds.apiSecret ||
+      (action !== 'TEST_CONNECTION' ? vaultCreds?.secretKey : '') ||
+      ''
+    ).trim();
+    const passphrase = String(
+      reqCreds.passphrase ||
+      (action !== 'TEST_CONNECTION' && exchange === 'BITGET' ? (vaultCreds as any)?.passphrase : '') ||
+      ''
+    ).trim();
 
-    const BITGET_PRIVATE_ACTIONS = ['ACCOUNT', 'ORDER', 'PLACE_ORDER', 'CLOSE_POSITION', 'PANIC_CLOSE', 'UPDATE_TRAILING_STOP', 'SET_LEVERAGE', 'SET_MARGIN_TYPE'];
-    if (exchange === 'BITGET' && BITGET_PRIVATE_ACTIONS.includes(action) && (!apiKey.trim() || !effectiveSecret.trim() || !passphrase.trim())) {
+    const rawAccountType = reqCreds.accountType || body.accountType;
+    const explicitIsTestnet = typeof reqCreds.isTestnet === 'boolean'
+      ? reqCreds.isTestnet
+      : typeof body.isTestnet === 'boolean'
+      ? body.isTestnet
+      : undefined;
+
+    const accountType: 'REAL' | 'DEMO' =
+      rawAccountType === 'DEMO' || rawAccountType === 'REAL'
+        ? rawAccountType
+        : typeof explicitIsTestnet === 'boolean'
+        ? (explicitIsTestnet ? 'DEMO' : 'REAL')
+        : vaultCreds?.accountType || (exchange === 'BITGET' ? 'REAL' : 'DEMO');
+
+    const PRIVATE_ACTIONS = ['ACCOUNT', 'ORDER', 'PLACE_ORDER', 'CLOSE_POSITION', 'PANIC_CLOSE', 'UPDATE_TRAILING_STOP', 'SET_LEVERAGE', 'SET_MARGIN_TYPE'];
+    if (exchange === 'BITGET' && PRIVATE_ACTIONS.includes(action) && (!apiKey || !effectiveSecret || !passphrase)) {
       return NextResponse.json(
         { success: false, exchange: 'BITGET', error: 'Bitget API Key, Secret Key, dan Passphrase wajib diisi di Vault.' },
+        { status: 400 }
+      );
+    }
+    if (exchange === 'BINANCE' && PRIVATE_ACTIONS.includes(action) && (!apiKey || !effectiveSecret)) {
+      return NextResponse.json(
+        { success: false, exchange: 'BINANCE', error: 'Binance API Key dan Secret Key wajib diisi di Vault.' },
         { status: 400 }
       );
     }
@@ -306,6 +374,22 @@ export async function POST(req: NextRequest) {
     // 5. PLACE ORDER (Binance or Bitget)
     if (action === 'ORDER' || action === 'PLACE_ORDER') {
       const { symbol, side, type, quantity, price, stopPrice, takeProfitPrice, reduceOnly, margin, leverage, marginMode } = body.payload || {};
+      if (!reduceOnly) {
+        const { readCentralAiConfig } = await import('@/core/centralAiConfig');
+        const centralCfg = await readCentralAiConfig();
+        if (centralCfg.engineSwitches?.cryptoMaintenance || centralCfg.engineSwitches?.emergencyKillSwitch) {
+          return NextResponse.json(
+            {
+              success: false,
+              maintenance: true,
+              error: centralCfg.engineSwitches?.cryptoMaintenance
+                ? 'Crypto Room sedang dalam mode Maintenance / Upgrade oleh Admin.'
+                : 'Emergency Kill-Switch sedang aktif oleh Admin.',
+            },
+            { status: 503 }
+          );
+        }
+      }
 
       if (exchange === 'BITGET') {
         const bitget = new BitgetFuturesService(apiKey, effectiveSecret, passphrase, accountType);
@@ -325,15 +409,27 @@ export async function POST(req: NextRequest) {
       }
 
       const client = new BinanceFuturesClient(apiKey, effectiveSecret, accountType === 'DEMO');
-      const order = await client.placeOrder({
-        symbol,
-        side,
-        type,
-        quantity,
-        price,
-        stopPrice,
-        reduceOnly,
-      });
+      const orderType = String(type || 'MARKET').toUpperCase();
+      const normalizedSide: 'BUY' | 'SELL' = side === 'BUY' || side === 'LONG' ? 'BUY' : 'SELL';
+      const order = orderType === 'MARKET' && !reduceOnly
+        ? await client.placeMarketOrderWithProtection({
+            symbol,
+            side: normalizedSide,
+            quantity: String(quantity),
+            leverage: typeof leverage === 'number' ? leverage : (leverage ? parseInt(leverage, 10) : undefined),
+            marginMode: String(marginMode || '').toLowerCase().startsWith('cross') ? 'CROSSED' : 'ISOLATED',
+            stopLossPrice: stopPrice ? parseFloat(stopPrice) : undefined,
+            takeProfitPrice: takeProfitPrice ? parseFloat(takeProfitPrice) : undefined,
+          })
+        : await client.placeOrder({
+            symbol,
+            side: normalizedSide,
+            type: orderType as any,
+            quantity,
+            price,
+            stopPrice,
+            reduceOnly,
+          });
       return NextResponse.json({ success: true, exchange: 'BINANCE', data: order });
     }
 

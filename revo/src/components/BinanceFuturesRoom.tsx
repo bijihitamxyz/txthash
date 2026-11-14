@@ -3,9 +3,10 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   useBinanceStore,
-  L2_MODULAR_SYMBOLS,
-  L1_DEFI_SYMBOLS,
-  AI_MEME_SYMBOLS,
+  getTodayDateString,
+  getCoinCategory,
+  CoinCategory,
+  TargetCategory,
 } from '@/store/useBinanceStore';
 import { BinanceVaultModal } from './BinanceVaultModal';
 import { BinancePnlCalendarModal } from './BinancePnlCalendarModal';
@@ -37,8 +38,11 @@ import {
   calculateBollingerBands,
   calculateVWAP,
   calculateEMA,
+  evaluateCryptoSignal,
+  CryptoSignalVerdict,
 } from '@/core/cryptoSignalEngine';
 import { useTheme } from '@/components/InstitutionalChrome';
+import { useRoomStore } from '@/store/useRoomStore';
 
 interface BinanceFuturesRoomProps {
   onSwitchToForex?: () => void;
@@ -47,8 +51,16 @@ interface BinanceFuturesRoomProps {
 
 const QUICK_MAJORS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT'] as const;
 
+const CATEGORY_BADGE_STYLE: Record<CoinCategory, string> = {
+  MEME: 'bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800/60',
+  L1: 'bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800/60',
+  L2: 'bg-violet-50 dark:bg-violet-950/60 text-violet-700 dark:text-violet-400 border-violet-200 dark:border-violet-800/60',
+  ALT: 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700',
+};
+
 export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitchToForex, isActiveRoom = true }) => {
   const { isDark } = useTheme();
+  const isForexMaintenance = useRoomStore((s) => s.maintenance.forex);
   const [isMounted, setIsMounted] = useState(false);
   const [isCoinSelectorOpen, setIsCoinSelectorOpen] = useState(false);
   const [kronosCrypto, setKronosCrypto] = useState<{
@@ -74,6 +86,8 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   const setSelectedSymbol = useBinanceStore((s) => s.setSelectedSymbol);
   const selectedCategory = useBinanceStore((s) => s.selectedCategory);
   const setSelectedCategory = useBinanceStore((s) => s.setSelectedCategory);
+  const targetCategory = useBinanceStore((s) => s.targetCategory);
+  const setTargetCategory = useBinanceStore((s) => s.setTargetCategory);
   const searchQuery = useBinanceStore((s) => s.searchQuery);
   const setSearchQuery = useBinanceStore((s) => s.setSearchQuery);
   const customWatchlist = useBinanceStore((s) => s.customWatchlist);
@@ -107,18 +121,23 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   const toggleAutoTrading = useBinanceStore((s) => s.toggleAutoTrading);
   const isScanning = useBinanceStore((s) => s.isScanning);
 
-  // Positions & Telemetry
+  // Positions & Telemetry & Trade History
   const positions = useBinanceStore((s) => s.positions);
   const lastVerdict = useBinanceStore((s) => s.lastVerdict);
   const telemetryLogs = useBinanceStore((s) => s.telemetryLogs);
   const clearTelemetry = useBinanceStore((s) => s.clearTelemetry);
+  const tradeHistory = useBinanceStore((s) => s.tradeHistory);
+  const clearTradeHistory = useBinanceStore((s) => s.clearTradeHistory);
+  const dailyPnl = useBinanceStore((s) => s.dailyPnl);
+  const dailyPnlHistory = useBinanceStore((s) => s.dailyPnlHistory);
   const closePosition = useBinanceStore((s) => s.closePosition);
   const panicCloseAll = useBinanceStore((s) => s.panicCloseAll);
   const executeManualTrade = useBinanceStore((s) => s.executeManualTrade);
 
-  // BTC Guard
-  const btcDumpBlocked = useBinanceStore((s) => s.btcDumpBlocked);
-  const btcGuardStatus = useBinanceStore((s) => s.btcGuardStatus);
+  const [bottomTab, setBottomTab] = useState<'HISTORY' | 'TELEMETRY'>('HISTORY');
+  const [historyScope, setHistoryScope] = useState<'TODAY' | 'ALL'>('TODAY');
+
+  const [localVerdict, setLocalVerdict] = useState<CryptoSignalVerdict | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [canvasWidthTick, setCanvasWidthTick] = useState(0);
@@ -274,6 +293,24 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
     };
   }, [isActiveRoom, isAutoTrading, positions, selectedSymbol, timeframe, lastKlineClose]);
 
+  // Compute live local Crypto Quant Verdict preview (no external AI cost) for selected symbol
+  useEffect(() => {
+    if (!isActiveRoom || klines.length < 50) return;
+    let cancelled = false;
+    evaluateCryptoSignal({
+      symbol: selectedSymbol,
+      klines,
+      enableAiJudge: false,
+    })
+      .then((v) => {
+        if (!cancelled) setLocalVerdict(v);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isActiveRoom, selectedSymbol, klines]);
+
   // Background auto-scanner loop
   useEffect(() => {
     if (!isMounted || !isAutoTrading) return;
@@ -330,12 +367,13 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   const filteredSymbols = useMemo(() => {
     let list = allSymbols;
 
-    if (selectedCategory === 'L2') {
-      list = list.filter((s) => L2_MODULAR_SYMBOLS.includes(s.symbol));
-    } else if (selectedCategory === 'L1_DEFI') {
-      list = list.filter((s) => L1_DEFI_SYMBOLS.includes(s.symbol));
-    } else if (selectedCategory === 'AI_MEME') {
-      list = list.filter((s) => AI_MEME_SYMBOLS.includes(s.symbol));
+    if (
+      selectedCategory === 'MEME' ||
+      selectedCategory === 'L1' ||
+      selectedCategory === 'L2' ||
+      selectedCategory === 'ALT'
+    ) {
+      list = list.filter((s) => getCoinCategory(s.symbol) === selectedCategory);
     } else if (selectedCategory === 'TOP_MOVERS') {
       list = [...list]
         .sort((a, b) => {
@@ -354,6 +392,17 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
     return list;
   }, [allSymbols, selectedCategory, searchQuery, tickers]);
 
+  // Quick-pick coins for the active targetCategory above the chart
+  const quickPairPills = useMemo(() => {
+    if (targetCategory === 'ALL') return [...QUICK_MAJORS];
+    const catCoins = allSymbols
+      .filter((s) => getCoinCategory(s.symbol) === targetCategory)
+      .sort((a, b) => (tickers[b.symbol]?.quoteVolume || 0) - (tickers[a.symbol]?.quoteVolume || 0))
+      .slice(0, 5)
+      .map((s) => s.symbol);
+    return catCoins.length > 0 ? catCoins : [...QUICK_MAJORS];
+  }, [allSymbols, targetCategory, tickers]);
+
   // Unified ALL Telemetry stream
   const unifiedTelemetry = useMemo(() => {
     return telemetryLogs.slice(0, 100);
@@ -366,15 +415,17 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
     (notionalUsdt / currentPrice).toFixed(currentPrice >= 1000 ? 4 : currentPrice >= 10 ? 3 : 2)
   );
 
-  const aiBullish = kronosCrypto?.symbol === selectedSymbol ? kronosCrypto.bullishPct : 60;
+  const activeVerdict = lastVerdict[selectedSymbol] || (localVerdict?.symbol === selectedSymbol ? localVerdict : undefined);
+  const aiBullish = kronosCrypto?.symbol === selectedSymbol ? kronosCrypto.bullishPct : 50;
   const aiBearish = 100 - aiBullish;
   const aiVerdict =
-    kronosCrypto?.symbol === selectedSymbol ? kronosCrypto.verdict : 'BULLISH ACCUMULATION';
+    kronosCrypto?.symbol === selectedSymbol ? kronosCrypto.verdict : 'NEUTRAL CONSOLIDATION';
   const aiSummary =
     kronosCrypto?.symbol === selectedSymbol
       ? kronosCrypto.multiAiSummary
-      : `Multi-AI Consensus / Risk Governance active on ${selectedSymbol} (${timeframe}). Confluence & BTC velocity guards verified.`;
+      : `Multi-AI Consensus / Risk Governance active on ${selectedSymbol} (${timeframe}).`;
   const aiSignal = kronosCrypto?.symbol === selectedSymbol ? kronosCrypto.signal : 'NEUTRAL';
+  const priceDigits = currentPrice < 0.01 ? 7 : currentPrice < 1 ? 5 : currentPrice < 10 ? 4 : currentPrice < 100 ? 3 : 2;
 
   // Institutional Dark / Light Adaptive HTML5 Canvas Candlestick Renderer
   useEffect(() => {
@@ -613,9 +664,10 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                 [
                   { id: 'ALL', label: 'All Pairs' },
                   { id: 'TOP_MOVERS', label: 'Top 25 Vol' },
-                  { id: 'L2', label: 'Layer-2' },
-                  { id: 'L1_DEFI', label: 'L1 & DeFi' },
-                  { id: 'AI_MEME', label: 'AI & Momentum' },
+                  { id: 'MEME', label: 'MEME' },
+                  { id: 'L1', label: 'L1' },
+                  { id: 'L2', label: 'L2' },
+                  { id: 'ALT', label: 'ALT' },
                 ] as const
               ).map((cat) => (
                 <button
@@ -639,6 +691,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                 const change = t?.priceChangePercent ?? 0;
                 const price = t?.lastPrice ?? 0;
                 const isStarred = customWatchlist.includes(item.symbol);
+                const coinCat = getCoinCategory(item.symbol);
 
                 return (
                   <div
@@ -670,7 +723,12 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                         />
                       </button>
                       <div>
-                        <div className="font-bold text-[#0F172A] dark:text-slate-100">{item.symbol}</div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-bold text-[#0F172A] dark:text-slate-100">{item.symbol}</span>
+                          <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold border ${CATEGORY_BADGE_STYLE[coinCat]}`}>
+                            {coinCat}
+                          </span>
+                        </div>
                         <span className="text-[10px] text-slate-400">
                           Vol: ${(t ? (t.quoteVolume / 1000000).toFixed(1) : '0')}M
                         </span>
@@ -716,11 +774,24 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
               {onSwitchToForex && (
                 <button
                   type="button"
-                  onClick={onSwitchToForex}
-                  className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-zinc-950 hover:bg-slate-100 dark:hover:bg-zinc-800 border border-slate-200/80 dark:border-zinc-800 text-slate-600 dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-slate-100 text-xs font-mono font-medium flex items-center justify-between transition-colors cursor-pointer"
+                  disabled={isForexMaintenance}
+                  aria-disabled={isForexMaintenance}
+                  title={isForexMaintenance ? 'Forex Room sedang dalam mode Maintenance (Terkunci)' : undefined}
+                  onClick={() => {
+                    if (!isForexMaintenance) onSwitchToForex();
+                  }}
+                  className={`w-full px-3 py-2 rounded-xl border text-xs font-mono font-medium flex items-center justify-between transition-colors ${
+                    isForexMaintenance
+                      ? 'bg-slate-50 dark:bg-zinc-950/50 border-slate-200/60 dark:border-zinc-800/60 text-slate-400 dark:text-zinc-500 opacity-50 cursor-not-allowed select-none'
+                      : 'bg-slate-50 dark:bg-zinc-950 hover:bg-slate-100 dark:hover:bg-zinc-800 border-slate-200/80 dark:border-zinc-800 text-slate-600 dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer'
+                  }`}
                 >
-                  <span>Switch to Exness Forex</span>
-                  <ArrowUpRight className="w-3.5 h-3.5 text-slate-400" />
+                  <span>{isForexMaintenance ? 'Forex Maintenance' : 'Switch to Exness Forex'}</span>
+                  {isForexMaintenance ? (
+                    <Lock className="w-3.5 h-3.5 text-amber-500" />
+                  ) : (
+                    <ArrowUpRight className="w-3.5 h-3.5 text-slate-400" />
+                  )}
                 </button>
               )}
             </div>
@@ -810,74 +881,68 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
       {/* Main Crypto Terminal Content */}
       <main className="flex-1 p-3 sm:p-5 space-y-4 min-w-0">
         {/* TOP STATUS & KPI STRIP */}
-        <section className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          {/* 1. USDT WALLET BALANCE */}
+        <section className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {/* 1. CONSOLIDATED USDT BALANCE & EQUITY */}
           <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] p-4 flex flex-col justify-between transition-colors">
-            <div className="flex items-center justify-between gap-1">
-              <span className="font-mono text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400 font-semibold">
-                USDT BALANCE
-              </span>
-              <span className="bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border border-emerald-200/80 dark:border-emerald-800/60 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold">
-                {activeExchange === 'BITGET'
-                  ? isTestnet ? 'DEMO V2' : 'MAINNET'
-                  : isTestnet ? 'TESTNET' : 'MAINNET'}
-              </span>
-            </div>
-            <div className="my-2">
-              <div className="font-bold text-[#0F172A] dark:text-slate-100 tracking-tight text-xl sm:text-2xl font-mono">
-                ${Number(walletBalance).toFixed(2)}
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400 font-semibold">
+                  USDT BALANCE &amp; EQUITY
+                </span>
+                <span className="bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border border-emerald-200/80 dark:border-emerald-800/60 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold">
+                  {activeExchange === 'BITGET'
+                    ? isTestnet ? 'DEMO V2' : 'MAINNET'
+                    : isTestnet ? 'TESTNET' : 'MAINNET'}
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                  Active: <strong className="text-[#0F172A] dark:text-slate-100">{positions.length}/{maxConcurrentCoins}</strong>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => fetchAccountInfo()}
+                  className="text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer p-0.5"
+                  title={`Sync ${activeExchange === 'BITGET' ? 'Bitget' : 'Binance'} Wallet`}
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                </button>
               </div>
             </div>
-            <div className="flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-slate-400">
-              <button
-                type="button"
-                onClick={openPnlCalendar}
-                className="inline-flex items-center gap-1 text-slate-500 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer"
-              >
-                <CalendarDays className="w-3 h-3" />
-                <span>PnL Calendar</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => fetchAccountInfo()}
-                className="text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer"
-                title={`Sync ${activeExchange === 'BITGET' ? 'Bitget' : 'Binance'} Wallet`}
-              >
-                <RefreshCw className="w-3 h-3" />
-              </button>
-            </div>
-          </div>
 
-          {/* 2. EQUITY & FLOATING PNL */}
-          <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] p-4 flex flex-col justify-between transition-colors">
-            <div className="flex items-center justify-between gap-1">
-              <span className="font-mono text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400 font-semibold">
-                EQUITY &amp; FLOATING PNL
-              </span>
-              <span
-                className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border ${
-                  totalFloatingPnl >= 0
-                    ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200/80 dark:border-emerald-800/60'
-                    : 'bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-800/60'
-                }`}
-              >
-                {totalFloatingPnl >= 0 ? '+' : ''}${totalFloatingPnl.toFixed(2)}
-              </span>
-            </div>
-            <div className="my-2">
-              <div className="font-bold text-[#0F172A] dark:text-slate-100 tracking-tight text-xl sm:text-2xl font-mono">
-                ${liveEquity.toFixed(2)}
+            <div className="my-2 flex items-baseline justify-between gap-3">
+              <div>
+                <div className="text-[10px] font-mono uppercase text-slate-400 dark:text-zinc-500">Wallet Balance</div>
+                <div className="font-bold text-[#0F172A] dark:text-slate-100 tracking-tight text-xl sm:text-2xl font-mono">
+                  ${Number(walletBalance).toFixed(2)}
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-[10px] font-mono uppercase text-slate-400 dark:text-zinc-500">Live Equity</div>
+                <div className="font-bold text-[#0F172A] dark:text-slate-100 tracking-tight text-lg sm:text-xl font-mono">
+                  ${liveEquity.toFixed(2)}
+                </div>
               </div>
             </div>
-            <div className="flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-slate-400">
-              <span>
-                Active: {positions.length}/{maxConcurrentCoins}
-              </span>
+
+            <div className="flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-slate-400 pt-1.5 border-t border-slate-100 dark:border-zinc-800/80">
+              <div className="flex items-center gap-1.5">
+                <span>Floating PnL:</span>
+                <strong
+                  className={
+                    totalFloatingPnl >= 0
+                      ? 'text-emerald-700 dark:text-emerald-400'
+                      : 'text-rose-600 dark:text-rose-400'
+                  }
+                >
+                  {totalFloatingPnl >= 0 ? '+' : ''}${totalFloatingPnl.toFixed(2)}
+                </strong>
+              </div>
               <span className="text-emerald-700 dark:text-emerald-400 font-semibold">24/7 Perpetual</span>
             </div>
           </div>
 
-          {/* 3. BINANCE USDⓈ-M GATEWAY */}
+          {/* 2. BINANCE / BITGET USDⓈ-M GATEWAY */}
           <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] p-4 flex flex-col justify-between transition-colors">
             <div className="flex items-center justify-between gap-1">
               <span className="font-mono text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400 font-semibold">
@@ -910,7 +975,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                 </strong>
               </div>
             </div>
-            <div className="flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-slate-400">
+            <div className="flex items-center justify-between text-[11px] font-mono text-slate-500 dark:text-slate-400 pt-1.5 border-t border-slate-100 dark:border-zinc-800/80">
               <span>Vault: AES-256</span>
               <button
                 type="button"
@@ -922,49 +987,6 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
               </button>
             </div>
           </div>
-
-          {/* 4. MULTI-AI CONSENSUS / RISK GOVERNANCE */}
-          <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] p-4 flex flex-col justify-between transition-colors">
-            <div className="flex items-center justify-between gap-1">
-              <span className="font-mono text-xs uppercase tracking-wider text-slate-500 dark:text-slate-400 font-semibold">
-                MULTI-AI + KRONOS
-              </span>
-              <span
-                className={`px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border ${
-                  isAutoTrading
-                    ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200/80 dark:border-emerald-800/60'
-                    : 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
-                }`}
-              >
-                {isAutoTrading ? 'SCANNER ACTIVE' : 'IDLE'}
-              </span>
-            </div>
-            <div className="my-1.5 space-y-1 font-mono text-[11px]">
-              <div className="flex items-center justify-between">
-                <span className="text-slate-500 dark:text-slate-400">Kronos Horizon:</span>
-                <span className="font-bold text-emerald-700 dark:text-emerald-400">
-                  {aiBullish}% Bull / {aiBearish}% Bear
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span className="text-slate-500 dark:text-slate-400">Risk Consensus:</span>
-                <span className="font-bold text-[#0F172A] dark:text-slate-100 truncate max-w-[130px]">
-                  {aiVerdict}
-                </span>
-              </div>
-            </div>
-            <div className="text-[10px] font-mono text-slate-400 dark:text-zinc-500 flex items-center justify-between">
-              <span>
-                Dynamic AI Gate: AUTO{' '}
-                {lastVerdict[selectedSymbol]?.dynamicThreshold
-                  ? `(${lastVerdict[selectedSymbol].dynamicThreshold}%)`
-                  : '(58–82%)'}
-              </span>
-              <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
-                {isScanning ? 'SCANNING' : 'READY'}
-              </span>
-            </div>
-          </div>
         </section>
 
         {/* MAIN CONTENT GRID */}
@@ -973,10 +995,36 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
           <div className="lg:col-span-8 space-y-4 min-w-0">
             {/* LIVE CRYPTO CHART CARD */}
             <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] p-3 sm:p-4 space-y-3 transition-colors">
-              {/* Quick Pair Selector Pills + Timeframe Pills */}
+              {/* Category Target Filter + Quick Pair Selector Pills + Timeframe Pills */}
               <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-100 dark:border-zinc-800">
                 <div className="flex flex-wrap items-center gap-1.5">
-                  {QUICK_MAJORS.map((sym) => {
+                  <div className="flex items-center gap-1 bg-slate-100 dark:bg-zinc-950 p-1 rounded-xl border border-slate-200/80 dark:border-zinc-800 font-mono text-[10px] mr-1">
+                    {(['ALL', 'MEME', 'L1', 'L2', 'ALT'] as const).map((cat) => (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => {
+                          setTargetCategory(cat);
+                          if (cat !== 'ALL') {
+                            const topCatCoin = allSymbols
+                              .filter((s) => getCoinCategory(s.symbol) === cat)
+                              .sort((a, b) => (tickers[b.symbol]?.quoteVolume || 0) - (tickers[a.symbol]?.quoteVolume || 0))[0];
+                            if (topCatCoin) setSelectedSymbol(topCatCoin.symbol);
+                          }
+                        }}
+                        className={`px-2 py-1 rounded-lg font-bold transition-all cursor-pointer ${
+                          targetCategory === cat
+                            ? 'bg-[#0F172A] dark:bg-indigo-600 text-white shadow-2xs'
+                            : 'text-slate-500 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100'
+                        }`}
+                        title={`Filter & Target ${cat === 'ALL' ? 'All Categories' : `${cat} Coins`}`}
+                      >
+                        {cat}
+                      </button>
+                    ))}
+                  </div>
+
+                  {quickPairPills.map((sym) => {
                     const isActive = selectedSymbol === sym;
                     return (
                       <button
@@ -996,11 +1044,14 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
 
                   <button
                     type="button"
-                    onClick={() => setIsCoinSelectorOpen(true)}
+                    onClick={() => {
+                      if (targetCategory !== 'ALL') setSelectedCategory(targetCategory);
+                      setIsCoinSelectorOpen(true);
+                    }}
                     className="px-3 py-1.5 rounded-xl font-mono text-xs font-semibold bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-400 border border-emerald-200/80 dark:border-emerald-800/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/40 transition-all flex items-center gap-1 cursor-pointer"
                   >
                     <span>
-                      {QUICK_MAJORS.includes(selectedSymbol as any)
+                      {quickPairPills.includes(selectedSymbol)
                         ? '300+ Pairs'
                         : selectedSymbol}
                     </span>
@@ -1029,11 +1080,16 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
               {/* Live Price / 24h Change / Indicators / Kronos Strip */}
               <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-xs">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-zinc-800 border border-slate-200 dark:border-zinc-700 text-[#0F172A] dark:text-slate-100 font-bold">
-                    {selectedSymbol}: $
-                    {activeTicker.lastPrice > 0
-                      ? activeTicker.lastPrice.toFixed(activeTicker.lastPrice < 1 ? 4 : 2)
-                      : '---'}
+                  <span className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-zinc-800 border border-slate-200 dark:border-zinc-700 text-[#0F172A] dark:text-slate-100 font-bold inline-flex items-center gap-1.5">
+                    <span>
+                      {selectedSymbol}: $
+                      {activeTicker.lastPrice > 0
+                        ? activeTicker.lastPrice.toFixed(activeTicker.lastPrice < 1 ? 4 : 2)
+                        : '---'}
+                    </span>
+                    <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold border ${CATEGORY_BADGE_STYLE[getCoinCategory(selectedSymbol)]}`}>
+                      {getCoinCategory(selectedSymbol)}
+                    </span>
                   </span>
                   <span
                     className={`px-2.5 py-1 rounded-lg font-semibold border inline-flex items-center gap-1 ${
@@ -1057,15 +1113,26 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                   </span>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-500 dark:text-slate-400">
-                  <span className="px-2 py-0.5 rounded bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border border-amber-200/80 dark:border-amber-800/60 font-semibold">
+                <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
+                  <span className="px-2 py-0.5 rounded-md bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border border-amber-200/80 dark:border-amber-800/60 font-semibold inline-flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
                     VWAP
                   </span>
-                  <span className="px-2 py-0.5 rounded bg-slate-100 dark:bg-zinc-800 text-[#0F172A] dark:text-slate-200 font-semibold">
+                  <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-zinc-800 text-[#0F172A] dark:text-slate-200 font-semibold inline-flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />
                     EMA50
                   </span>
+                  <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 font-semibold inline-flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                    BB 2.2
+                  </span>
+                  {kronosCrypto && kronosCrypto.symbol === selectedSymbol && kronosCrypto.horizonPrice > 0 && (
+                    <span className="px-2 py-0.5 rounded-md bg-indigo-50 dark:bg-indigo-950/50 text-indigo-700 dark:text-indigo-300 border border-indigo-200/80 dark:border-indigo-800/60 font-semibold">
+                      Target: ${kronosCrypto.horizonPrice.toFixed(priceDigits)}
+                    </span>
+                  )}
                   <span
-                    className={`px-2 py-0.5 rounded font-semibold border ${
+                    className={`px-2 py-0.5 rounded-md font-semibold border ${
                       aiSignal === 'BUY'
                         ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60'
                         : aiSignal === 'SELL'
@@ -1073,7 +1140,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                         : 'bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
                     }`}
                   >
-                    Signal: {aiSignal}
+                    Kronos: {aiSignal}
                   </span>
                 </div>
               </div>
@@ -1082,39 +1149,6 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
               <div className="w-full relative h-[410px] sm:h-[450px] rounded-xl border border-slate-200/80 dark:border-zinc-800 overflow-hidden bg-white dark:bg-zinc-950">
                 <canvas ref={canvasRef} className="w-full h-full block" />
               </div>
-            </div>
-
-            {/* BTC VELOCITY RADAR BANNER */}
-            <div
-              className={`p-3.5 rounded-2xl border font-mono text-xs flex flex-wrap items-center justify-between gap-2 shadow-[0_2px_12px_rgba(15,23,42,0.03)] transition-colors ${
-                btcDumpBlocked
-                  ? 'bg-rose-50 dark:bg-rose-950/50 border-rose-200 dark:border-rose-800/80 text-rose-700 dark:text-rose-300'
-                  : 'bg-white dark:bg-zinc-900 border-slate-200/90 dark:border-zinc-800 text-slate-700 dark:text-slate-300'
-              }`}
-            >
-              <div className="flex items-center gap-2.5">
-                <AlertTriangle
-                  className={`w-4 h-4 shrink-0 ${
-                    btcDumpBlocked ? 'text-rose-600 dark:text-rose-400 animate-pulse' : 'text-emerald-600 dark:text-emerald-400'
-                  }`}
-                />
-                <div>
-                  <span className="font-bold text-[#0F172A] dark:text-slate-100 mr-2">BTC Velocity Radar:</span>
-                  <span className={btcDumpBlocked ? 'text-rose-700 dark:text-rose-400 font-semibold' : 'text-slate-600 dark:text-slate-400'}>
-                    {btcGuardStatus}
-                  </span>
-                </div>
-              </div>
-
-              <span
-                className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase border ${
-                  btcDumpBlocked
-                    ? 'bg-rose-100 dark:bg-rose-900/60 text-rose-700 dark:text-rose-300 border-rose-300 dark:border-rose-700'
-                    : 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200/80 dark:border-emerald-800/60'
-                }`}
-              >
-                {btcDumpBlocked ? 'LONGS BLOCKED' : 'RADAR CLEAR'}
-              </span>
             </div>
 
             {/* ACTIVE FUTURES POSITIONS TABLE */}
@@ -1297,6 +1331,34 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                 </div>
               </div>
 
+              {/* Target Coin Category Selector (MEME, L1, L2, ALT) */}
+              <div className="p-3.5 rounded-xl bg-[#F8FAFC] dark:bg-zinc-950 border border-slate-200/90 dark:border-zinc-800 space-y-2 font-mono text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-sans font-semibold text-slate-600 dark:text-slate-300">
+                    Target Coin Category
+                  </span>
+                  <span className="text-[10px] text-emerald-700 dark:text-emerald-400 font-semibold">
+                    {targetCategory === 'ALL' ? 'Watchlist / Majors' : `${targetCategory} Focus`}
+                  </span>
+                </div>
+                <div className="grid grid-cols-5 gap-1">
+                  {(['ALL', 'MEME', 'L1', 'L2', 'ALT'] as TargetCategory[]).map((cat) => (
+                    <button
+                      key={cat}
+                      type="button"
+                      onClick={() => setTargetCategory(cat)}
+                      className={`py-1.5 rounded-lg text-[10px] font-bold border transition-all cursor-pointer ${
+                        targetCategory === cat
+                          ? 'bg-[#0F172A] dark:bg-indigo-600 text-white border-[#0F172A] dark:border-indigo-500'
+                          : 'bg-white dark:bg-zinc-900 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700 hover:bg-slate-50 dark:hover:bg-zinc-800'
+                      }`}
+                    >
+                      {cat}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               {/* Position Sizing & Leverage */}
               <div className="p-4 rounded-xl bg-[#F8FAFC] dark:bg-zinc-950 border border-slate-200/90 dark:border-zinc-800 space-y-4 font-mono text-xs">
                 <div className="space-y-1.5">
@@ -1431,113 +1493,412 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                   </button>
                 </div>
               </div>
+            </div>
 
-              {/* Multi-AI + Kronos Pipeline Telemetry */}
-              <div className="p-4 rounded-xl bg-[#F8FAFC] dark:bg-zinc-950 border border-slate-200/90 dark:border-zinc-800 space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="font-mono text-xs uppercase tracking-wider font-semibold text-[#0F172A] dark:text-slate-100 flex items-center gap-1.5">
-                    <BrainCircuit className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                    MULTI-AI + KRONOS CONSENSUS
-                  </span>
-                  <span className="bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border border-emerald-200/80 dark:border-emerald-800/60 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold">
-                    SYNCED
-                  </span>
-                </div>
-
-                <div className="space-y-1.5">
-                  <div className="flex items-center justify-between font-mono text-[11px]">
-                    <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
-                      Kronos Bullish: {aiBullish}%
-                    </span>
-                    <span className="text-rose-600 dark:text-rose-400 font-semibold">Bearish: {aiBearish}%</span>
-                  </div>
-                  <div className="w-full h-2.5 rounded-full bg-rose-100 dark:bg-rose-950/60 overflow-hidden flex">
-                    <div
-                      className="h-full bg-[#10B981] transition-all duration-300"
-                      style={{ width: `${aiBullish}%` }}
-                    />
-                  </div>
-                </div>
-
-                <div className="p-3 rounded-xl bg-white dark:bg-zinc-900 border border-slate-200/80 dark:border-zinc-800 space-y-1">
-                  <div className="font-mono text-[10px] uppercase tracking-wider text-slate-400 dark:text-zinc-500 font-semibold flex items-center gap-1">
-                    <ShieldCheck className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
-                    <span>MULTI-AI RISK GOVERNANCE</span>
-                  </div>
-                  <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed font-mono">{aiSummary}</p>
-                </div>
+            {/* KRONOS & QUANT PREDICTION CARD */}
+            <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] p-4 sm:p-5 space-y-3.5 transition-colors">
+              <div className="flex items-center justify-between border-b border-slate-100 dark:border-zinc-800 pb-3">
+                <span className="font-mono text-xs uppercase tracking-wider font-bold text-[#0F172A] dark:text-slate-100 flex items-center gap-1.5">
+                  <BrainCircuit className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                  KRONOS &amp; QUANT PREDICTION
+                </span>
+                <span className="bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border border-emerald-200/80 dark:border-emerald-800/60 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold">
+                  {kronosCrypto?.regime || 'MEAN_REVERTING'}
+                </span>
               </div>
-            </div>
-          </div>
-        </section>
 
-        {/* BOTTOM CARD: LIVE EXECUTION TELEMETRY (Strictly ONLY ALL tab + Clear button) */}
-        <section className="bg-white dark:bg-zinc-900 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] overflow-hidden transition-colors">
-          <div className="px-4 py-3 border-b border-slate-200/80 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <Terminal className="w-4 h-4 text-[#0F172A] dark:text-emerald-400" />
-              <h2 className="font-sans font-bold text-[#0F172A] dark:text-slate-100 tracking-tight text-xs sm:text-sm uppercase">
-                LIVE EXECUTION TELEMETRY
-              </h2>
-              <span className="font-mono text-xs text-slate-400 dark:text-zinc-500">({unifiedTelemetry.length})</span>
-            </div>
-
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                className="px-2.5 py-1 rounded-lg font-mono text-[11px] uppercase tracking-wider bg-[#0F172A] dark:bg-emerald-600 text-white font-semibold cursor-default"
-              >
-                ALL
-              </button>
-              <button
-                type="button"
-                onClick={clearTelemetry}
-                className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-slate-50 dark:hover:bg-zinc-800 transition-colors cursor-pointer"
-                title="Clear Telemetry Logs"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </div>
-
-          <div className="max-h-72 overflow-y-auto divide-y divide-slate-100 dark:divide-zinc-800 font-mono text-xs">
-            {unifiedTelemetry.length === 0 ? (
-              <div className="p-6 text-center text-slate-400 dark:text-zinc-500">
-                [SYSTEM] {activeExchange === 'BITGET' ? 'Bitget' : 'Binance'} Futures Execution Telemetry active for {selectedSymbol}. Waiting for scanner or manual execution event...
-              </div>
-            ) : (
-              unifiedTelemetry.map((log) => {
-                const timeStr = isMounted ? new Date(log.timestamp).toLocaleTimeString() : '';
-                const badgeStyle =
-                  log.category === 'LOCK' || log.category === 'ORDER'
-                    ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60'
-                    : log.category === 'SIGNAL'
-                    ? 'bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800/60'
-                    : log.category === 'AI'
-                    ? 'bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-400 border-indigo-200 dark:border-indigo-800/60'
-                    : log.category === 'GUARD'
-                    ? 'bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-800/60'
-                    : 'bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-zinc-700';
-
-                return (
+              {/* Bull / Bear Probability Bar */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between font-mono text-[11px]">
+                  <span className="text-emerald-700 dark:text-emerald-400 font-semibold">
+                    Bullish: {aiBullish}%
+                  </span>
+                  <span className="text-[10px] text-slate-500 dark:text-slate-400 font-semibold">
+                    {aiVerdict}
+                  </span>
+                  <span className="text-rose-600 dark:text-rose-400 font-semibold">
+                    Bearish: {aiBearish}%
+                  </span>
+                </div>
+                <div className="w-full h-2.5 rounded-full bg-rose-100 dark:bg-rose-950/60 overflow-hidden flex">
                   <div
-                    key={log.id}
-                    className="px-4 py-2 hover:bg-slate-50/80 dark:hover:bg-zinc-800/50 flex items-start gap-2.5 leading-relaxed transition-colors"
-                  >
-                    <span className="text-slate-400 dark:text-zinc-500 shrink-0">[{timeStr}]</span>
-                    <span
-                      className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border shrink-0 ${badgeStyle}`}
-                    >
-                      [{log.category}]
-                    </span>
-                    <span className="font-semibold text-[#0F172A] dark:text-slate-100 shrink-0">[{log.symbol}]</span>
-                    <span className="text-slate-600 dark:text-slate-300 break-all">{log.message}</span>
+                    className="h-full bg-[#10B981] transition-all duration-300"
+                    style={{ width: `${aiBullish}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Key Quantitative Metrics Grid */}
+              <div className="grid grid-cols-3 gap-2 font-mono text-[11px]">
+                <div className="p-2 rounded-xl bg-[#F8FAFC] dark:bg-zinc-950 border border-slate-200/80 dark:border-zinc-800">
+                  <div className="text-[10px] text-slate-400 dark:text-zinc-500">POC</div>
+                  <div className="font-bold text-[#0F172A] dark:text-slate-100 truncate">
+                    ${kronosCrypto?.symbol === selectedSymbol ? kronosCrypto.pocPrice.toFixed(priceDigits) : '---'}
                   </div>
-                );
-              })
-            )}
+                </div>
+                <div className="p-2 rounded-xl bg-[#F8FAFC] dark:bg-zinc-950 border border-slate-200/80 dark:border-zinc-800">
+                  <div className="text-[10px] text-slate-400 dark:text-zinc-500">RSI / Z-Score</div>
+                  <div className="font-bold text-[#0F172A] dark:text-slate-100 truncate">
+                    {kronosCrypto?.symbol === selectedSymbol
+                      ? `${kronosCrypto.rsi.toFixed(1)} / ${kronosCrypto.zScore >= 0 ? '+' : ''}${kronosCrypto.zScore.toFixed(2)}`
+                      : '---'}
+                  </div>
+                </div>
+                <div className="p-2 rounded-xl bg-[#F8FAFC] dark:bg-zinc-950 border border-slate-200/80 dark:border-zinc-800">
+                  <div className="text-[10px] text-slate-400 dark:text-zinc-500">QUANT GATE</div>
+                  <div
+                    className={`font-bold truncate ${
+                      activeVerdict?.approved
+                        ? 'text-emerald-700 dark:text-emerald-400'
+                        : 'text-slate-600 dark:text-slate-300'
+                    }`}
+                  >
+                    {activeVerdict
+                      ? `${activeVerdict.score}/${activeVerdict.dynamicThreshold || 65}%`
+                      : '---'}
+                  </div>
+                </div>
+              </div>
+
+              {/* Active Setup & Risk Levels */}
+              {activeVerdict && (
+                <div className="p-2.5 rounded-xl bg-[#F8FAFC] dark:bg-zinc-950 border border-slate-200/80 dark:border-zinc-800 font-mono text-[11px] space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-500 dark:text-slate-400">Setup Status:</span>
+                    <span
+                      className={`font-bold ${
+                        activeVerdict.approved
+                          ? 'text-emerald-700 dark:text-emerald-400'
+                          : 'text-amber-700 dark:text-amber-400'
+                      }`}
+                    >
+                      {activeVerdict.approved
+                        ? `${activeVerdict.side} (${activeVerdict.setupName?.replace('SETUP_', '')})`
+                        : 'WAIT / NO SETUP'}
+                    </span>
+                  </div>
+                  {activeVerdict.stopLossPrice > 0 && (
+                    <div className="flex items-center justify-between text-[10px] text-slate-500 dark:text-slate-400">
+                      <span>SL: ${activeVerdict.stopLossPrice.toFixed(priceDigits)}</span>
+                      <span>TP1 (1R): ${activeVerdict.takeProfit1Price.toFixed(priceDigits)}</span>
+                      <span>TP2: ${activeVerdict.takeProfit2Price.toFixed(priceDigits)}</span>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="p-3 rounded-xl bg-[#F8FAFC] dark:bg-zinc-950 border border-slate-200/80 dark:border-zinc-800 space-y-1">
+                <div className="font-mono text-[10px] uppercase tracking-wider text-slate-400 dark:text-zinc-500 font-semibold flex items-center gap-1">
+                  <ShieldCheck className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
+                  <span>MULTI-AI RISK GOVERNANCE</span>
+                </div>
+                <p className="text-[11px] text-slate-600 dark:text-slate-300 leading-relaxed font-mono line-clamp-3">
+                  {aiSummary}
+                </p>
+              </div>
+            </div>
           </div>
         </section>
+
+        {/* BOTTOM CARD: UNIFIED PNL & ENTRY HISTORY + LIVE EXECUTION TELEMETRY */}
+        {(() => {
+          const todayStr = getTodayDateString();
+          const todayRecord = dailyPnlHistory[todayStr];
+          const todayRealizedPnl = todayRecord?.pnl ?? dailyPnl ?? 0;
+          const todayTradesCount = todayRecord?.trades ?? 0;
+          const allDays = Object.values(dailyPnlHistory || {});
+          const totalRealizedPnl = allDays.reduce((sum, d) => sum + (d?.pnl ?? 0), 0);
+          const totalWins = allDays.reduce((sum, d) => sum + (d?.wins ?? 0), 0);
+          const totalLosses = allDays.reduce((sum, d) => sum + (d?.losses ?? 0), 0);
+          const totalClosed = totalWins + totalLosses;
+          const winRate = totalClosed > 0 ? ((totalWins / totalClosed) * 100).toFixed(1) : '0.0';
+          const filteredHistory =
+            historyScope === 'TODAY'
+              ? tradeHistory.filter((h) => h.date === todayStr)
+              : tradeHistory;
+
+          return (
+            <section className="bg-white dark:bg-zinc-900 rounded-2xl border border-slate-200/90 dark:border-zinc-800 shadow-[0_2px_12px_rgba(15,23,42,0.03)] overflow-hidden transition-colors">
+              <div className="px-4 py-3 border-b border-slate-200/80 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <div className="flex items-center gap-1 bg-slate-100 dark:bg-zinc-950 p-1 rounded-xl border border-slate-200/80 dark:border-zinc-800 font-mono text-[11px]">
+                    <button
+                      type="button"
+                      onClick={() => setBottomTab('HISTORY')}
+                      className={`px-2.5 py-1 rounded-lg font-semibold transition-all cursor-pointer ${
+                        bottomTab === 'HISTORY'
+                          ? 'bg-[#0F172A] dark:bg-emerald-600 text-white shadow-2xs'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100'
+                      }`}
+                    >
+                      PNL &amp; ENTRY HISTORY ({filteredHistory.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setBottomTab('TELEMETRY')}
+                      className={`px-2.5 py-1 rounded-lg font-semibold transition-all cursor-pointer ${
+                        bottomTab === 'TELEMETRY'
+                          ? 'bg-[#0F172A] dark:bg-emerald-600 text-white shadow-2xs'
+                          : 'text-slate-600 dark:text-slate-400 hover:text-[#0F172A] dark:hover:text-slate-100'
+                      }`}
+                    >
+                      TELEMETRY ({unifiedTelemetry.length})
+                    </button>
+                  </div>
+
+                  {/* PnL Calendar Modal Trigger */}
+                  <button
+                    type="button"
+                    onClick={openPnlCalendar}
+                    className={`px-2.5 py-1 rounded-full text-[11px] font-mono font-semibold border inline-flex items-center gap-1.5 cursor-pointer transition-colors ${
+                      todayRealizedPnl >= 0
+                        ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/50'
+                        : 'bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-800/60 hover:bg-rose-100 dark:hover:bg-rose-900/50'
+                    }`}
+                    title="Open Monthly PnL Calendar"
+                  >
+                    <CalendarDays className="w-3 h-3" />
+                    <span>PnL Calendar</span>
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  {bottomTab === 'HISTORY' ? (
+                    <>
+                      <div className="flex items-center gap-1 bg-slate-50 dark:bg-zinc-950 p-0.5 rounded-lg border border-slate-200 dark:border-zinc-800 font-mono text-[10px]">
+                        <button
+                          type="button"
+                          onClick={() => setHistoryScope('TODAY')}
+                          className={`px-2 py-0.5 rounded-md font-semibold cursor-pointer ${
+                            historyScope === 'TODAY'
+                              ? 'bg-[#0F172A] dark:bg-emerald-600 text-white'
+                              : 'text-slate-500 dark:text-slate-400'
+                          }`}
+                        >
+                          TODAY
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setHistoryScope('ALL')}
+                          className={`px-2 py-0.5 rounded-md font-semibold cursor-pointer ${
+                            historyScope === 'ALL'
+                              ? 'bg-[#0F172A] dark:bg-emerald-600 text-white'
+                              : 'text-slate-500 dark:text-slate-400'
+                          }`}
+                        >
+                          ALL
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={clearTradeHistory}
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-slate-50 dark:hover:bg-zinc-800 transition-colors cursor-pointer"
+                        title="Clear Entry History"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={clearTelemetry}
+                      className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-slate-50 dark:hover:bg-zinc-800 transition-colors cursor-pointer"
+                      title="Clear Telemetry Logs"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {bottomTab === 'HISTORY' && (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 px-4 py-2.5 bg-slate-50/70 dark:bg-zinc-950/60 border-b border-slate-200/80 dark:border-zinc-800 font-mono text-xs">
+                  <div className="flex flex-col">
+                    <span className="text-[10px] uppercase text-slate-400 dark:text-zinc-500">Today Realized PnL</span>
+                    <span className={`font-bold ${todayRealizedPnl >= 0 ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                      {todayRealizedPnl >= 0 ? '+' : ''}${todayRealizedPnl.toFixed(2)}{' '}
+                      <span className="text-[10px] font-normal text-slate-400">({todayTradesCount}t)</span>
+                    </span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[10px] uppercase text-slate-400 dark:text-zinc-500">Total Realized PnL</span>
+                    <span className={`font-bold ${totalRealizedPnl >= 0 ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                      {totalRealizedPnl >= 0 ? '+' : ''}${totalRealizedPnl.toFixed(2)}
+                    </span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[10px] uppercase text-slate-400 dark:text-zinc-500">Win Rate</span>
+                    <span className="font-bold text-[#0F172A] dark:text-slate-100">
+                      {winRate}% <span className="text-[10px] font-normal text-slate-400">({totalWins}W/{totalLosses}L)</span>
+                    </span>
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-[10px] uppercase text-slate-400 dark:text-zinc-500">Floating PnL</span>
+                    <span className={`font-bold ${totalFloatingPnl >= 0 ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                      {totalFloatingPnl >= 0 ? '+' : ''}${totalFloatingPnl.toFixed(2)}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {bottomTab === 'HISTORY' ? (
+                <div className="max-h-72 overflow-y-auto font-mono text-xs">
+                  {filteredHistory.length === 0 ? (
+                    <div className="p-6 text-center text-slate-400 dark:text-zinc-500">
+                      No recorded {historyScope === 'TODAY' ? "today's " : ''}crypto entry or exit logs yet. Entries and realized PnL will appear here and sync automatically with Daily PnL.
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left">
+                        <thead className="bg-slate-50/90 dark:bg-zinc-950/80 text-[10px] uppercase tracking-wider text-slate-500 dark:text-slate-400 border-b border-slate-200/80 dark:border-zinc-800">
+                          <tr>
+                            <th className="px-4 py-2">TIME</th>
+                            <th className="px-4 py-2">PAIR</th>
+                            <th className="px-4 py-2">SIDE / LEV</th>
+                            <th className="px-4 py-2">ACTION</th>
+                            <th className="px-4 py-2">PRICE (ENTRY -&gt; EXIT)</th>
+                            <th className="px-4 py-2">QTY / MARGIN</th>
+                            <th className="px-4 py-2 text-right">REALIZED PNL</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 dark:divide-zinc-800">
+                          {filteredHistory.map((item) => {
+                            const timeStr = isMounted
+                              ? new Date(item.timestamp).toLocaleTimeString([], {
+                                  hour: '2-digit',
+                                  minute: '2-digit',
+                                  second: '2-digit',
+                                })
+                              : '';
+                            const pxDigits =
+                              item.entryPrice < 0.01 ? 7 : item.entryPrice < 1 ? 5 : item.entryPrice < 10 ? 4 : 2;
+                            const hasPnl = typeof item.realizedPnl === 'number';
+                            const isWin = (item.realizedPnl ?? 0) >= 0;
+                            const isOpen = item.action === 'OPEN_AUTO' || item.action === 'OPEN_MANUAL';
+
+                            return (
+                              <tr
+                                key={item.id}
+                                className="hover:bg-slate-50/80 dark:hover:bg-zinc-800/50 transition-colors"
+                              >
+                                <td className="px-4 py-2.5 text-slate-400 dark:text-zinc-500 whitespace-nowrap">
+                                  <div>{timeStr}</div>
+                                  <div className="text-[10px]">{item.date}</div>
+                                </td>
+                                <td className="px-4 py-2.5 font-bold text-[#0F172A] dark:text-slate-100 whitespace-nowrap">
+                                  <div>{item.symbol}</div>
+                                  <div className="text-[10px] font-normal text-slate-400">{item.exchange}</div>
+                                </td>
+                                <td className="px-4 py-2.5 whitespace-nowrap">
+                                  <span
+                                    className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                                      item.side === 'LONG'
+                                        ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60'
+                                        : 'bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-800/60'
+                                    }`}
+                                  >
+                                    {item.side} {item.leverage}x
+                                  </span>
+                                </td>
+                                <td className="px-4 py-2.5 whitespace-nowrap">
+                                  <span
+                                    className={`px-2 py-0.5 rounded text-[10px] font-semibold border ${
+                                      isOpen
+                                        ? 'bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800/60'
+                                        : hasPnl && isWin
+                                        ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60'
+                                        : 'bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border-amber-200 dark:border-amber-800/60'
+                                    }`}
+                                  >
+                                    {item.action.replace('_', ' ')}
+                                  </span>
+                                  {item.note && (
+                                    <div className="text-[10px] text-slate-400 dark:text-zinc-500 mt-0.5 max-w-[180px] truncate" title={item.note}>
+                                      {item.note}
+                                    </div>
+                                  )}
+                                </td>
+                                <td className="px-4 py-2.5 text-slate-700 dark:text-slate-300 whitespace-nowrap">
+                                  ${item.entryPrice.toFixed(pxDigits)}
+                                  {item.exitPrice ? (
+                                    <>
+                                      {' -> '}
+                                      <strong className="text-[#0F172A] dark:text-slate-100">
+                                        ${item.exitPrice.toFixed(pxDigits)}
+                                      </strong>
+                                    </>
+                                  ) : (
+                                    <span className="text-slate-400"> (OPEN)</span>
+                                  )}
+                                </td>
+                                <td className="px-4 py-2.5 text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                                  {item.quantity} · ${item.marginUsdt.toFixed(2)}
+                                </td>
+                                <td className="px-4 py-2.5 text-right font-bold whitespace-nowrap">
+                                  {hasPnl ? (
+                                    <span
+                                      className={
+                                        isWin
+                                          ? 'text-emerald-700 dark:text-emerald-400'
+                                          : 'text-rose-600 dark:text-rose-400'
+                                      }
+                                    >
+                                      {isWin ? '+' : ''}${item.realizedPnl!.toFixed(2)}
+                                    </span>
+                                  ) : (
+                                    <span className="text-slate-400 dark:text-zinc-500 font-normal">ACTIVE</span>
+                                  )}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="max-h-72 overflow-y-auto divide-y divide-slate-100 dark:divide-zinc-800 font-mono text-xs">
+                  {unifiedTelemetry.length === 0 ? (
+                    <div className="p-6 text-center text-slate-400 dark:text-zinc-500">
+                      [SYSTEM] {activeExchange === 'BITGET' ? 'Bitget' : 'Binance'} Futures Execution Telemetry active for {selectedSymbol}. Waiting for scanner or manual execution event...
+                    </div>
+                  ) : (
+                    unifiedTelemetry.map((log) => {
+                      const timeStr = isMounted ? new Date(log.timestamp).toLocaleTimeString() : '';
+                      const badgeStyle =
+                        log.category === 'LOCK' || log.category === 'ORDER'
+                          ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60'
+                          : log.category === 'SIGNAL'
+                          ? 'bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800/60'
+                          : log.category === 'AI'
+                          ? 'bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-400 border-indigo-200 dark:border-indigo-800/60'
+                          : log.category === 'GUARD'
+                          ? 'bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-800/60'
+                          : 'bg-slate-100 dark:bg-zinc-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-zinc-700';
+
+                      return (
+                        <div
+                          key={log.id}
+                          className="px-4 py-2 hover:bg-slate-50/80 dark:hover:bg-zinc-800/50 flex items-start gap-2.5 leading-relaxed transition-colors"
+                        >
+                          <span className="text-slate-400 dark:text-zinc-500 shrink-0">[{timeStr}]</span>
+                          <span
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border shrink-0 ${badgeStyle}`}
+                          >
+                            [{log.category}]
+                          </span>
+                          <span className="font-semibold text-[#0F172A] dark:text-slate-100 shrink-0">[{log.symbol}]</span>
+                          <span className="text-slate-600 dark:text-slate-300 break-all">{log.message}</span>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              )}
+            </section>
+          );
+        })()}
       </main>
 
       {/* Crypto Exchange Credentials & PnL Modals (Strictly NO AI/VPS Client Config) */}

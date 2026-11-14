@@ -27,6 +27,7 @@ import {
   Sliders,
   Trash2,
   CalendarDays,
+  Lock,
 } from 'lucide-react';
 
 const TradingChart = dynamic(
@@ -61,6 +62,7 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
 
   const setActiveRoom = useRoomStore((s) => s.setActiveRoom);
   const activeRoom = useRoomStore((s) => s.activeRoom);
+  const isCryptoMaintenance = useRoomStore((s) => s.maintenance.crypto);
   const isForexActive = isActiveRoom && activeRoom !== 'CRYPTO' && activeRoom !== 'ROOM_2_BINANCE';
 
   // Exness Forex Store state
@@ -793,11 +795,24 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
               </div>
               <button
                 type="button"
-                onClick={() => setActiveRoom('CRYPTO')}
-                className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-zinc-900 hover:bg-slate-100 dark:hover:bg-zinc-800 border border-slate-200/80 dark:border-zinc-800 text-slate-600 dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-slate-100 text-xs font-mono font-medium flex items-center justify-between transition-colors cursor-pointer"
+                disabled={isCryptoMaintenance}
+                aria-disabled={isCryptoMaintenance}
+                title={isCryptoMaintenance ? 'Crypto Room sedang dalam mode Maintenance (Terkunci)' : undefined}
+                onClick={() => {
+                  if (!isCryptoMaintenance) setActiveRoom('CRYPTO');
+                }}
+                className={`w-full px-3 py-2 rounded-xl border text-xs font-mono font-medium flex items-center justify-between transition-colors ${
+                  isCryptoMaintenance
+                    ? 'bg-slate-50 dark:bg-zinc-900/50 border-slate-200/60 dark:border-zinc-800/60 text-slate-400 dark:text-zinc-500 opacity-50 cursor-not-allowed select-none'
+                    : 'bg-slate-50 dark:bg-zinc-900 hover:bg-slate-100 dark:hover:bg-zinc-800 border-slate-200/80 dark:border-zinc-800 text-slate-600 dark:text-slate-300 hover:text-[#0F172A] dark:hover:text-slate-100 cursor-pointer'
+                }`}
               >
-                <span>Switch to Crypto Perpetuals</span>
-                <ArrowUpRight className="w-3.5 h-3.5 text-slate-400" />
+                <span>{isCryptoMaintenance ? 'Crypto Maintenance' : 'Switch to Crypto Perpetuals'}</span>
+                {isCryptoMaintenance ? (
+                  <Lock className="w-3.5 h-3.5 text-amber-500" />
+                ) : (
+                  <ArrowUpRight className="w-3.5 h-3.5 text-slate-400" />
+                )}
               </button>
             </div>
           </div>

@@ -168,22 +168,26 @@ export function calculateBollingerBands(closes: number[], period: number = 20, m
 }
 
 /**
- * Calculates Intraday VWAP: sum(typicalPrice * volume) / sum(volume)
+ * Calculates Rolling Intraday VWAP (last `window` bars, default 48 = 4 hours on 5m):
+ * Avoids stale 18h+ cumulative lag while preserving session volume profile.
  */
-export function calculateVWAP(klines: BinanceKline[]): number[] {
+export function calculateVWAP(klines: BinanceKline[], window: number = 48): number[] {
   const vwap: number[] = [];
-  let cumulativeTypicalVolume = 0;
-  let cumulativeVolume = 0;
+  const win = Math.max(1, window);
 
   for (let i = 0; i < klines.length; i++) {
-    const k = klines[i];
-    const typicalPrice = (k.high + k.low + k.close) / 3;
-    const vol = k.volume > 0 ? k.volume : 1;
-
-    cumulativeTypicalVolume += typicalPrice * vol;
-    cumulativeVolume += vol;
-
-    vwap.push(cumulativeVolume > 0 ? cumulativeTypicalVolume / cumulativeVolume : typicalPrice);
+    const start = Math.max(0, i - win + 1);
+    let typicalVolSum = 0;
+    let volSum = 0;
+    for (let j = start; j <= i; j++) {
+      const k = klines[j];
+      const typicalPrice = (k.high + k.low + k.close) / 3;
+      const vol = k.volume > 0 ? k.volume : 1;
+      typicalVolSum += typicalPrice * vol;
+      volSum += vol;
+    }
+    const fallbackTp = (klines[i].high + klines[i].low + klines[i].close) / 3;
+    vwap.push(volSum > 0 ? typicalVolSum / volSum : fallbackTp);
   }
 
   return vwap;
@@ -375,7 +379,8 @@ export async function evaluateCryptoSignal(params: {
   // Indicators calculation
   const rsiSeries = calculateRSI(closes, 14);
   const bb = calculateBollingerBands(closes, 20, 2.2);
-  const vwapSeries = calculateVWAP(klines);
+  const vwapSeries = calculateVWAP(klines, 48);
+  const ema21Series = calculateEMA(closes, 21);
   const ema50Series = calculateEMA(closes, 50);
   const ema200Series = calculateEMA(closes, 200);
   const atrSeries = calculateATR(klines, 14);
@@ -385,17 +390,21 @@ export async function evaluateCryptoSignal(params: {
   const curMiddleBB = bb.middle[len - 1];
   const curLowerBB = bb.lower[len - 1];
   const curVwap = vwapSeries[len - 1];
+  const curEma21 = ema21Series[len - 1];
   const curEma50 = ema50Series[len - 1];
   const curEma200 = ema200Series[len - 1];
-  const curAtr = atrSeries[len - 1] || (price * 0.015);
+  const curAtr = atrSeries[len - 1] || (price * 0.008);
+  const atrPct = price > 0 ? curAtr / price : 0.008;
 
   // Volume SMA 20
   const volSlice = volumes.slice(Math.max(0, len - 20));
   const volSma20 = volSlice.reduce((a, b) => a + b, 0) / (volSlice.length || 1);
   const volumeRatio = volSma20 > 0 ? currentCandle.volume / volSma20 : 1.0;
 
-  // Candle wick proportions
-  const candleRange = Math.max(currentCandle.high - currentCandle.low, price * 0.001);
+  // Candle body & wick proportions
+  const candleRange = Math.max(currentCandle.high - currentCandle.low, price * 0.0005);
+  const bodySize = Math.abs(currentCandle.close - currentCandle.open);
+  const bodyRatio = bodySize / candleRange;
   const bodyTop = Math.max(currentCandle.open, currentCandle.close);
   const bodyBottom = Math.min(currentCandle.open, currentCandle.close);
   const lowerWickRatio = (bodyBottom - currentCandle.low) / candleRange;
@@ -408,7 +417,7 @@ export async function evaluateCryptoSignal(params: {
 
   // Kaufman ER-10 and Z-Score Calculation
   const er10 = calculateKaufmanEfficiencyRatio(closes, 10);
-  const digits = price < 1 ? 5 : price < 10 ? 3 : 2;
+  const digits = price < 0.01 ? 7 : price < 1 ? 5 : price < 10 ? 4 : price < 100 ? 3 : 2;
   const recent20 = closes.slice(-20);
   const mean20 = recent20.reduce((s, v) => s + v, 0) / Math.max(1, recent20.length);
   const std20 = Math.sqrt(
@@ -419,8 +428,22 @@ export async function evaluateCryptoSignal(params: {
   const valPrice = Number((curMiddleBB - (curMiddleBB - curLowerBB) * 0.7).toFixed(digits));
   const pocPrice = Number((curVwap || curMiddleBB).toFixed(digits));
 
-  const isPocAlignedLong = price < pocPrice && pocPrice <= curMiddleBB;
-  const isPocAlignedShort = price > pocPrice && pocPrice >= curMiddleBB;
+  const isPocAlignedLong = price <= pocPrice * 1.003 && pocPrice <= curMiddleBB * 1.005;
+  const isPocAlignedShort = price >= pocPrice * 0.997 && pocPrice >= curMiddleBB * 0.995;
+
+  const ema50Prev = ema50Series[Math.max(0, len - 6)] || curEma50;
+  const ema50Slope = ema50Prev > 0 ? (curEma50 - ema50Prev) / ema50Prev : 0;
+  // Require both EMA alignment AND price not broken far below/above macro structure
+  const isMacroBull =
+    (len >= 200 ? curEma50 >= curEma200 : curEma50 >= curEma200 || ema50Slope > 0.0005) &&
+    price >= curEma200 * 0.992 &&
+    curEma21 >= curEma50 * 0.996 &&
+    ema50Slope >= -0.0015;
+  const isMacroBear =
+    (len >= 200 ? curEma50 <= curEma200 : curEma50 <= curEma200 || ema50Slope < -0.0005) &&
+    price <= curEma200 * 1.008 &&
+    curEma21 <= curEma50 * 1.004 &&
+    ema50Slope <= 0.0015;
 
   const snapshot: CryptoIndicatorSnapshot = {
     timestamp: currentCandle.timestamp,
@@ -445,38 +468,49 @@ export async function evaluateCryptoSignal(params: {
     pocMagnetAligned: isPocAlignedLong || isPocAlignedShort,
   };
 
-  // --- CRYPTO DUAL-GATE EVALUATION (EITHER SETUP A OR SETUP B) ---
-  // Setup A: Trend Pullback / VWAP & POC Bounce (RSI 32-68 near VWAP, EMA50, POC, VAL, VAH)
-  // Setup B: Snap-Back Reversion (BB Outer Band or |zScore| >= 1.35 with RSI < 36 / > 64)
+  // --- CRYPTO DUAL-GATE EVALUATION (STRICT SETUP A OR SETUP B + FEE-EDGE FILTER) ---
+  // Fee-Edge Volatility Guard: reject dead chop where ATR < 0.18% (taker fees would eat profit)
+  const hasViableVolatility = atrPct >= 0.0018;
+  // Tighter ATR-adaptive proximity band (max 0.75% or 1.0x ATR) instead of loose 1.5%
+  const proxBand = Math.min(0.0075, Math.max(0.0025, atrPct * 1.05));
 
-  // LONG SETUP A:
-  const nearVwapLong = Math.abs(price - curVwap) / curVwap <= 0.015;
-  const nearEma50Long = Math.abs(price - curEma50) / curEma50 <= 0.015;
-  const nearPocLong = Math.abs(price - pocPrice) / pocPrice <= 0.015;
-  const nearValLong = Math.abs(price - valPrice) / valPrice <= 0.015;
+  // Real candle reversal/momentum confirmation (rejects tiny dojis & falling knives)
+  const isBullishConfirm =
+    (currentCandle.close > currentCandle.open && bodyRatio >= 0.25 && upperWickRatio < 0.45) ||
+    (lowerWickRatio >= 0.34 && currentCandle.close >= currentCandle.open * 0.999);
+  const isBearishConfirm =
+    (currentCandle.close < currentCandle.open && bodyRatio >= 0.25 && lowerWickRatio < 0.45) ||
+    (upperWickRatio >= 0.34 && currentCandle.close <= currentCandle.open * 1.001);
+
+  // LONG SETUP A: Trend Pullback to Dynamic Support (VWAP / EMA50 / POC / VAL)
+  const nearVwapLong = Math.abs(price - curVwap) / curVwap <= proxBand;
+  const nearEma50Long = Math.abs(price - curEma50) / curEma50 <= proxBand;
+  const nearPocLong = Math.abs(price - pocPrice) / pocPrice <= proxBand;
+  const nearValLong = Math.abs(price - valPrice) / valPrice <= proxBand;
   const isNearSupportLong = nearVwapLong || nearEma50Long || nearPocLong || nearValLong;
-  const isMomentumBullish = curEma50 >= curEma200 || price >= curEma200 * 0.995 || currentCandle.close >= currentCandle.open;
-  const isRsiSetupA = curRsi >= 32 && curRsi <= 68;
-  const setupAPassedLong = isNearSupportLong && isMomentumBullish && isRsiSetupA;
+  const isRsiSetupALong = curRsi >= 38 && curRsi <= 58;
+  const setupAPassedLong = hasViableVolatility && isNearSupportLong && isMacroBull && isBullishConfirm && isRsiSetupALong;
 
-  // LONG SETUP B:
-  const bbOuterTouchedLong = currentCandle.low <= curLowerBB * 1.002 || zScore <= -1.35;
-  const rsiOversoldLong = curRsi < 36;
-  const setupBPassedLong = bbOuterTouchedLong && rsiOversoldLong;
+  // LONG SETUP B: Snap-Back Reversion (MUST have bullish reversal candle & not runaway dump)
+  const bbOuterTouchedLong = currentCandle.low <= curLowerBB * 1.0015 || zScore <= -1.45;
+  const rsiOversoldLong = curRsi <= 32 || (divergence === 'BULLISH' && curRsi <= 38);
+  const notFallingKnifeLong = !(er10 > 0.65 && lowerWickRatio < 0.28);
+  const setupBPassedLong = hasViableVolatility && bbOuterTouchedLong && rsiOversoldLong && isBullishConfirm && notFallingKnifeLong;
 
-  // SHORT SETUP A:
-  const nearVwapShort = Math.abs(price - curVwap) / curVwap <= 0.015;
-  const nearEma50Short = Math.abs(price - curEma50) / curEma50 <= 0.015;
-  const nearPocShort = Math.abs(price - pocPrice) / pocPrice <= 0.015;
-  const nearVahShort = Math.abs(price - vahPrice) / vahPrice <= 0.015;
+  // SHORT SETUP A: Trend Pullback to Dynamic Resistance (VWAP / EMA50 / POC / VAH)
+  const nearVwapShort = Math.abs(price - curVwap) / curVwap <= proxBand;
+  const nearEma50Short = Math.abs(price - curEma50) / curEma50 <= proxBand;
+  const nearPocShort = Math.abs(price - pocPrice) / pocPrice <= proxBand;
+  const nearVahShort = Math.abs(price - vahPrice) / vahPrice <= proxBand;
   const isNearResistanceShort = nearVwapShort || nearEma50Short || nearPocShort || nearVahShort;
-  const isMomentumBearish = curEma50 <= curEma200 || price <= curEma200 * 1.005 || currentCandle.close <= currentCandle.open;
-  const setupAPassedShort = isNearResistanceShort && isMomentumBearish && isRsiSetupA;
+  const isRsiSetupAShort = curRsi >= 42 && curRsi <= 62;
+  const setupAPassedShort = hasViableVolatility && isNearResistanceShort && isMacroBear && isBearishConfirm && isRsiSetupAShort;
 
-  // SHORT SETUP B:
-  const bbOuterTouchedShort = currentCandle.high >= curUpperBB * 0.998 || zScore >= 1.35;
-  const rsiOverboughtShort = curRsi > 64;
-  const setupBPassedShort = bbOuterTouchedShort && rsiOverboughtShort;
+  // SHORT SETUP B: Snap-Back Reversion (MUST have bearish reversal candle & not runaway pump)
+  const bbOuterTouchedShort = currentCandle.high >= curUpperBB * 0.9985 || zScore >= 1.45;
+  const rsiOverboughtShort = curRsi >= 68 || (divergence === 'BEARISH' && curRsi >= 62);
+  const notRunawayPumpShort = !(er10 > 0.65 && upperWickRatio < 0.28);
+  const setupBPassedShort = hasViableVolatility && bbOuterTouchedShort && rsiOverboughtShort && isBearishConfirm && notRunawayPumpShort;
 
   let longScore = 0;
   let shortScore = 0;
@@ -487,30 +521,28 @@ export async function evaluateCryptoSignal(params: {
 
   if (setupAPassedLong) {
     longSetupName = 'SETUP_A_TREND_PULLBACK';
-    longScore += 40;
+    longScore += 46;
     const supportLabel = nearVwapLong ? 'VWAP' : nearEma50Long ? 'EMA50' : nearPocLong ? 'POC' : 'VAL';
-    longReasons.push(`Setup A Qualified: Trend Pullback to ${supportLabel} (RSI ${curRsi.toFixed(1)} [32-68], +40pts)`);
+    longReasons.push(`Setup A Qualified: Trend Pullback to ${supportLabel} (RSI ${curRsi.toFixed(1)} [38-58], +46pts)`);
   } else if (setupBPassedLong) {
     longSetupName = 'SETUP_B_SNAPBACK_REVERSION';
-    longScore += 40;
-    longReasons.push(`Setup B Qualified: Snap-Back Reversion at Lower BB/zScore ${zScore.toFixed(2)} (RSI ${curRsi.toFixed(1)} < 36, +40pts)`);
-  } else if (isNearSupportLong && isMomentumBullish) {
-    longScore += 25;
-    longReasons.push(`Near Support with Bullish Bias (+25pts)`);
+    longScore += 44;
+    longReasons.push(`Setup B Qualified: Confirmed Reversal at Lower BB/zScore ${zScore.toFixed(2)} (RSI ${curRsi.toFixed(1)}, +44pts)`);
+  } else if (!hasViableVolatility) {
+    longReasons.push(`Low Volatility Chop (ATR ${(atrPct * 100).toFixed(2)}% < 0.18%)`);
   }
 
   if (setupAPassedShort) {
     shortSetupName = 'SETUP_A_TREND_PULLBACK';
-    shortScore += 40;
+    shortScore += 46;
     const resLabel = nearVwapShort ? 'VWAP' : nearEma50Short ? 'EMA50' : nearPocShort ? 'POC' : 'VAH';
-    shortReasons.push(`Setup A Qualified: Trend Pullback to ${resLabel} (RSI ${curRsi.toFixed(1)} [32-68], +40pts)`);
+    shortReasons.push(`Setup A Qualified: Trend Pullback to ${resLabel} (RSI ${curRsi.toFixed(1)} [42-62], +46pts)`);
   } else if (setupBPassedShort) {
     shortSetupName = 'SETUP_B_SNAPBACK_REVERSION';
-    shortScore += 40;
-    shortReasons.push(`Setup B Qualified: Snap-Back Reversion at Upper BB/zScore ${zScore.toFixed(2)} (RSI ${curRsi.toFixed(1)} > 64, +40pts)`);
-  } else if (isNearResistanceShort && isMomentumBearish) {
-    shortScore += 25;
-    shortReasons.push(`Near Resistance with Bearish Bias (+25pts)`);
+    shortScore += 44;
+    shortReasons.push(`Setup B Qualified: Confirmed Reversal at Upper BB/zScore ${zScore.toFixed(2)} (RSI ${curRsi.toFixed(1)}, +44pts)`);
+  } else if (!hasViableVolatility) {
+    shortReasons.push(`Low Volatility Chop (ATR ${(atrPct * 100).toFixed(2)}% < 0.18%)`);
   }
 
   // Confluence Additions (Score boosts when setups are active)
@@ -528,9 +560,11 @@ export async function evaluateCryptoSignal(params: {
     } else if (volumeRatio >= 0.9) {
       longScore += 4;
     }
-    if (curEma50 >= curEma200 || price > curEma200) {
+    if (isMacroBull && price > curEma200) {
       longScore += 8;
       longReasons.push(`Macro Trend Bullish (+8pts)`);
+    } else if (isMacroBull) {
+      longScore += 4;
     }
     if (divergence === 'BULLISH') {
       longScore += 8;
@@ -540,9 +574,12 @@ export async function evaluateCryptoSignal(params: {
       longScore += 6;
       longReasons.push(`Funding Rate Safe (+6pts)`);
     }
-    if (er10 <= 0.50) {
-      longScore += 6;
-      longReasons.push(`ER-10 Mean-Reverting (${er10.toFixed(2)}, +6pts)`);
+    if (longSetupName === 'SETUP_A_TREND_PULLBACK' && er10 >= 0.45) {
+      longScore += 8;
+      longReasons.push(`ER-10 Trend Alignment (${er10.toFixed(2)}, +8pts)`);
+    } else if (er10 <= 0.50) {
+      longScore += 8;
+      longReasons.push(`ER-10 Mean-Reverting (${er10.toFixed(2)}, +8pts)`);
     }
     if (isPocAlignedLong) {
       longScore += 6;
@@ -564,9 +601,11 @@ export async function evaluateCryptoSignal(params: {
     } else if (volumeRatio >= 0.9) {
       shortScore += 4;
     }
-    if (curEma50 <= curEma200 || price < curEma200) {
+    if (isMacroBear && price < curEma200) {
       shortScore += 8;
       shortReasons.push(`Macro Trend Bearish (+8pts)`);
+    } else if (isMacroBear) {
+      shortScore += 4;
     }
     if (divergence === 'BEARISH') {
       shortScore += 8;
@@ -576,9 +615,12 @@ export async function evaluateCryptoSignal(params: {
       shortScore += 6;
       shortReasons.push(`Funding Rate Safe (+6pts)`);
     }
-    if (er10 <= 0.50) {
-      shortScore += 6;
-      shortReasons.push(`ER-10 Mean-Reverting (${er10.toFixed(2)}, +6pts)`);
+    if (shortSetupName === 'SETUP_A_TREND_PULLBACK' && er10 >= 0.45) {
+      shortScore += 8;
+      shortReasons.push(`ER-10 Trend Alignment (${er10.toFixed(2)}, +8pts)`);
+    } else if (er10 <= 0.50) {
+      shortScore += 8;
+      shortReasons.push(`ER-10 Mean-Reverting (${er10.toFixed(2)}, +8pts)`);
     }
     if (isPocAlignedShort) {
       shortScore += 6;
@@ -603,10 +645,11 @@ export async function evaluateCryptoSignal(params: {
 
   // Pure Quantitative Autonomous Dynamic Confidence Threshold Engine (58% - 82%)
   const recentSl = dualRoomProtections.hasRecentStopLoss(symbol, 'crypto');
+  const estKronosProb = Math.min(85, Math.max(45, candidateScore));
   const dynamicThresholdResult = calculateDynamicThreshold({
     efficiencyRatio: er10,
     pocMagnetAligned,
-    kronosProbability: 60,
+    kronosProbability: estKronosProb,
     bbwExpandingRapidly: bbWidthPct > 5.0,
     isFundingWindow: Boolean(fundingRate && Math.abs(fundingRate) > 0.0005),
     recentStopLoss: recentSl,
@@ -615,25 +658,35 @@ export async function evaluateCryptoSignal(params: {
   });
   const cryptoDynamicThreshold = dynamicThresholdResult.threshold;
 
-  // Any verified signal scoring >= cryptoDynamicThreshold when Risk Guard is clear MUST execute!
-  let isApproved = candidateScore >= cryptoDynamicThreshold && !btcBlocked;
+  // Strictly require a qualified Setup A or Setup B + viable volatility + score >= dynamic threshold
+  let isApproved =
+    hasViableVolatility &&
+    qualifiedSetup !== 'NONE' &&
+    candidateScore >= cryptoDynamicThreshold &&
+    !btcBlocked;
 
-  // Dynamic Stop Loss at 1.5x ATR(14) beyond the sweep wick
-  const rDistance = Math.max(1.5 * curAtr, price * 0.005);
+  // Dynamic Stop Loss anchored cleanly with capped wick buffer (never oversized) & positive R:R
+  const rawR = Math.max(1.5 * curAtr, price * 0.0055);
+  const rDistance = Math.min(rawR, price * 0.025); // Cap max risk at 2.5% price move
+  const slTpDigits = Math.max(digits, 4);
   let stopLossPrice = 0;
   let takeProfit1Price = 0;
   let takeProfit2Price = 0;
 
   if (candidateSide === 'LONG') {
-    stopLossPrice = Number((Math.min(currentCandle.low, price) - rDistance).toFixed(6));
-    const tp1Target = price + 0.7 * rDistance;
-    takeProfit1Price = Number(tp1Target.toFixed(6));
-    takeProfit2Price = Number((price + 2.0 * rDistance).toFixed(6));
+    const wickAnchor = Math.max(currentCandle.low, price - 0.6 * curAtr);
+    stopLossPrice = Number((wickAnchor - 1.2 * curAtr).toFixed(slTpDigits));
+    const actualRisk = Math.max(rDistance, price - stopLossPrice);
+    stopLossPrice = Number((price - actualRisk).toFixed(slTpDigits));
+    takeProfit1Price = Number((price + 1.0 * actualRisk).toFixed(slTpDigits));
+    takeProfit2Price = Number((price + 2.2 * actualRisk).toFixed(slTpDigits));
   } else {
-    stopLossPrice = Number((Math.max(currentCandle.high, price) + rDistance).toFixed(6));
-    const tp1Target = price - 0.7 * rDistance;
-    takeProfit1Price = Number(tp1Target.toFixed(6));
-    takeProfit2Price = Number((price - 2.0 * rDistance).toFixed(6));
+    const wickAnchor = Math.min(currentCandle.high, price + 0.6 * curAtr);
+    stopLossPrice = Number((wickAnchor + 1.2 * curAtr).toFixed(slTpDigits));
+    const actualRisk = Math.max(rDistance, stopLossPrice - price);
+    stopLossPrice = Number((price + actualRisk).toFixed(slTpDigits));
+    takeProfit1Price = Number((price - 1.0 * actualRisk).toFixed(slTpDigits));
+    takeProfit2Price = Number((price - 2.2 * actualRisk).toFixed(slTpDigits));
   }
 
   let aiVerdict: CryptoSignalVerdict['aiVerdict'] | undefined;
@@ -708,21 +761,33 @@ export async function evaluateCryptoSignal(params: {
           };
         } else if (centralCfg.engineSwitches?.multiAiRiskJudge !== false) {
           const activeProviders = getActiveAiProviders(centralCfg);
-          const prevCandle = klines[Math.max(0, len - 2)] || currentCandle;
+          const prevIdx = Math.max(0, len - 2);
+          const prevCandle = klines[prevIdx] || currentCandle;
+          const prevRsi = rsiSeries[prevIdx] ?? curRsi;
+          const prevUpperBB = bb.upper[prevIdx] ?? curUpperBB;
+          const prevLowerBB = bb.lower[prevIdx] ?? curLowerBB;
+          const prevMidBB = bb.middle[prevIdx] ?? curMiddleBB;
+          const prevBbw = prevMidBB > 0 ? ((prevUpperBB - prevLowerBB) / prevMidBB) * 100 : bbWidthPct;
+          const bbwExpansionPct = prevBbw > 0 ? ((bbWidthPct - prevBbw) / prevBbw) * 100 : 0;
+          const bbRange = curUpperBB - curLowerBB;
+          const bbPositionPct = bbRange > 0 ? ((price - curLowerBB) / bbRange) * 100 : 50;
+          const isSetupA = qualifiedSetup === 'SETUP_A_TREND_PULLBACK';
           const serverSnap: any = {
             symbol,
             timestamp: Date.now(),
             timeframe: 'M5',
             side: candidateSide === 'LONG' ? 'BUY' : 'SELL',
-            signalType: candidateSide === 'LONG' ? 'COUNTER_TREND_BUY' : 'COUNTER_TREND_SELL',
+            signalType: isSetupA
+              ? (candidateSide === 'LONG' ? 'WITH_TREND_BUY' : 'WITH_TREND_SELL')
+              : (candidateSide === 'LONG' ? 'COUNTER_TREND_BUY' : 'COUNTER_TREND_SELL'),
             setupName: qualifiedSetup,
             confluence_score: candidateScore,
             regime: curEma50 >= curEma200 ? 'WITH_TREND' : 'COUNTER_TREND',
             triggerPrice: price,
             rsi: curRsi,
             wick_ratio: candidateSide === 'LONG' ? lowerWickRatio : upperWickRatio,
-            bbw_expansion_pct: 0,
-            bb_position_pct: 50,
+            bbw_expansion_pct: Number(bbwExpansionPct.toFixed(2)),
+            bb_position_pct: Number(bbPositionPct.toFixed(2)),
             divergence_detected: divergence !== 'NONE',
             divergence_type: divergence,
             ema200Distance: Math.abs(price - curEma200),
@@ -733,8 +798,8 @@ export async function evaluateCryptoSignal(params: {
             resistance_price: vahPrice,
             distance_to_support_pips: Math.abs(price - valPrice),
             distance_to_resistance_pips: Math.abs(vahPrice - price),
-            wick_rejection_strength: 'MODERATE',
-            rsi_slope: 0,
+            wick_rejection_strength: (candidateSide === 'LONG' ? lowerWickRatio : upperWickRatio) >= 0.35 ? 'STRONG' : 'MODERATE',
+            rsi_slope: Number((curRsi - prevRsi).toFixed(2)),
             c0: {
               open: currentCandle.open,
               high: currentCandle.high,
@@ -753,9 +818,9 @@ export async function evaluateCryptoSignal(params: {
               high: prevCandle.high,
               low: prevCandle.low,
               close: prevCandle.close,
-              rsi: curRsi,
-              upperBB: curUpperBB,
-              lowerBB: curLowerBB,
+              rsi: prevRsi,
+              upperBB: prevUpperBB,
+              lowerBB: prevLowerBB,
             },
             proposedSlPrice: stopLossPrice,
             proposedTpPrice: takeProfit1Price,
@@ -793,9 +858,9 @@ export async function evaluateCryptoSignal(params: {
       }
 
       if (aiVerdict) {
-        if (aiVerdict.confidence >= cryptoDynamicThreshold) {
+        if (aiVerdict.decision === 'EXECUTE' && aiVerdict.confidence >= cryptoDynamicThreshold) {
           isApproved = !btcBlocked;
-        } else if (aiVerdict.decision === 'REJECT' && aiVerdict.confidence < 50) {
+        } else if (aiVerdict.decision === 'REJECT' || aiVerdict.confidence < cryptoDynamicThreshold) {
           isApproved = false;
         }
       }

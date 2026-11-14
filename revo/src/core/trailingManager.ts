@@ -929,10 +929,11 @@ export function evaluateCryptoPositionTrailing(params: {
 } {
   const isLong = params.side === 'BUY';
   const priceMove = isLong ? params.currentPrice - params.entryPrice : params.entryPrice - params.currentPrice;
-  const pricePct = priceMove / params.entryPrice;
+  const pricePct = params.entryPrice > 0 ? priceMove / params.entryPrice : 0;
+  const priceDecimals = params.entryPrice < 0.01 ? 7 : params.entryPrice < 1 ? 5 : params.entryPrice < 100 ? 4 : 2;
 
-  // Hard SL circuit breaker: loss > 3% on high leverage
-  if (pricePct <= -0.03) {
+  // Hard SL circuit breaker: loss >= 2.5% on leveraged perpetuals
+  if (pricePct <= -0.025) {
     return {
       action: 'HARD_SL_CLOSE',
       closeQuantity: params.quantity,
@@ -940,32 +941,35 @@ export function evaluateCryptoPositionTrailing(params: {
     };
   }
 
-  // Stage 1: 50% Partial Close at +0.6R (or >= +0.3% move)
-  const minStage1Pct = 0.003;
+  // Stage 1: 50% Partial Close at +0.6% or +1.2x ATR (fee-aware), lock SL to net-positive Breakeven+ (+0.18%)
+  const atrStage1Pct = params.atr14 && params.entryPrice > 0 ? (1.2 * params.atr14) / params.entryPrice : 0.006;
+  const minStage1Pct = Math.min(0.022, Math.max(0.006, atrStage1Pct));
+  const bePrice = isLong ? params.entryPrice * 1.0018 : params.entryPrice * 0.9982;
+
   if (!params.partialClosed && pricePct >= minStage1Pct) {
     const halfQty = params.quantity * 0.5;
-    const bePrice = isLong ? params.entryPrice * 1.0008 : params.entryPrice * 0.9992;
     return {
       action: 'PARTIAL_CLOSE',
       closeQuantity: halfQty,
-      newSlPrice: Number(bePrice.toFixed(params.symbol.includes('BTC') ? 2 : 4)),
-      reason: `[STAGE-1 PARTIAL CLOSE] ${params.symbol} reached +${(pricePct * 100).toFixed(2)}%: 50% Closed (${halfQty}) & SL locked at Breakeven.`,
+      newSlPrice: Number(bePrice.toFixed(priceDecimals)),
+      reason: `[STAGE-1 PARTIAL CLOSE] ${params.symbol} reached +${(pricePct * 100).toFixed(2)}%: 50% Closed & SL locked at Net-Positive Breakeven+ (+0.18%).`,
     };
   }
 
-  // Stage 2: Adaptive ATR Trailing Stop
+  // Stage 2: Adaptive ATR Trailing Stop (strictly >= Breakeven+ floor)
   if (params.partialClosed && pricePct > minStage1Pct && params.atr14) {
-    const trailDist = 1.2 * params.atr14;
-    const candidateSl = isLong ? params.currentPrice - trailDist : params.currentPrice + trailDist;
+    const trailDist = 1.4 * params.atr14;
+    const rawCandidate = isLong ? params.currentPrice - trailDist : params.currentPrice + trailDist;
+    const candidateSl = isLong ? Math.max(bePrice, rawCandidate) : Math.min(bePrice, rawCandidate);
     const isAdvancing = isLong
-      ? (!params.currentSl || candidateSl > params.currentSl)
-      : (!params.currentSl || candidateSl < params.currentSl);
+      ? (!params.currentSl || candidateSl > params.currentSl * 1.0005)
+      : (!params.currentSl || candidateSl < params.currentSl * 0.9995);
 
     if (isAdvancing) {
       return {
         action: 'MODIFY_SL',
-        newSlPrice: Number(candidateSl.toFixed(params.symbol.includes('BTC') ? 2 : 4)),
-        reason: `[STAGE-2 ATR TRAILING] Advanced trailing SL to ${candidateSl.toFixed(4)} on ${params.symbol}.`,
+        newSlPrice: Number(candidateSl.toFixed(priceDecimals)),
+        reason: `[STAGE-2 ATR TRAILING] Advanced trailing SL to ${candidateSl.toFixed(priceDecimals)} on ${params.symbol}.`,
       };
     }
   }

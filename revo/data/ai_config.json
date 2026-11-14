@@ -66,15 +66,17 @@
   ],
   "confidenceThreshold": 56,
   "autoAdaptiveThreshold": true,
-  "kronosVpsUrl": "http://129.225.13.35:8000",
-  "kronosApiKey": "nmssx-kronos-secret-2026",
+  "kronosVpsUrl": "http://104.64.192.252:8000",
+  "kronosApiKey": "revo-kronos-2026-secret",
   "engineSwitches": {
     "kronosForecaster": true,
     "multiAiRiskJudge": true,
     "localEaExecutor": true,
     "exnessWebSocket": true,
     "restMutexQueue": true,
-    "emergencyKillSwitch": false
+    "emergencyKillSwitch": false,
+    "forexMaintenance": false,
+    "cryptoMaintenance": false
   },
-  "updatedAt": 1794194512910
+  "updatedAt": 1794630770889
 }

@@ -436,13 +436,15 @@ class EngineScheduler {
       const activeAiSummaryLabel = formatActiveAiSummaryLabel(centralAi);
       const effectiveThreshold = centralAi.confidenceThreshold || state.aiConfidenceThreshold || 65;
 
-      if (centralAi.engineSwitches?.emergencyKillSwitch) {
+      if (centralAi.engineSwitches?.emergencyKillSwitch || centralAi.engineSwitches?.forexMaintenance) {
         return {
           executed: false,
           timestamp: Date.now(),
           positions: updatedPositions,
           telemetryCount: state.telemetryLogs.length,
-          message: 'Admin Emergency Kill-Switch active',
+          message: centralAi.engineSwitches?.forexMaintenance
+            ? 'Forex Room Maintenance Mode active'
+            : 'Admin Emergency Kill-Switch active',
         };
       }
 
@@ -1136,6 +1138,11 @@ class EngineScheduler {
         return { executed: false, exchange: 'IDLE', positionsCount: 0 };
       }
 
+      const centralAi = await readCentralAiConfig();
+      if (centralAi.engineSwitches?.emergencyKillSwitch || centralAi.engineSwitches?.cryptoMaintenance) {
+        return { executed: false, exchange: 'MAINTENANCE', positionsCount: 0 };
+      }
+
       // 2. Read runtime state from stateSync
       const state = await stateSync.getRuntimeState();
       // Strictly requires both in-memory scheduler flag and stateSync flag to be true
@@ -1181,7 +1188,8 @@ class EngineScheduler {
           activeBitgetKeys.add(posKey);
           const tracked = this.cryptoPartialClosedMap.get(posKey);
           const isPartialClosed = Boolean(pos.partialClosed || tracked?.partialClosed);
-          const effectiveSl = pos.trailingStopPrice || tracked?.trailingStopPrice || pos.stopLossPrice;
+          const protectiveFallbackSl = isLong ? entryPrice * 0.982 : entryPrice * 1.018;
+          const effectiveSl = pos.trailingStopPrice || tracked?.trailingStopPrice || pos.stopLossPrice || protectiveFallbackSl;
 
           const trailingAction = evaluateCryptoPositionTrailing({
             symbol: pos.symbol,
@@ -1191,7 +1199,7 @@ class EngineScheduler {
             quantity: Math.abs(pos.positionAmt),
             partialClosed: isPartialClosed,
             currentSl: effectiveSl,
-            atr14: markPrice * 0.012,
+            atr14: markPrice * 0.008,
             exchange: 'BITGET',
           });
 
@@ -1205,29 +1213,32 @@ class EngineScheduler {
             const halfSize = parseFloat(halfSizeStr);
             if (halfSize > 0) {
               await bitget.partialClosePosition(pos.symbol, pos.positionAmt, halfSize);
-              const newSl = trailingAction.newSlPrice || (isLong ? entryPrice * 1.0008 : entryPrice * 0.9992);
+              const pxDigits = entryPrice < 0.01 ? 7 : entryPrice < 1 ? 5 : entryPrice < 100 ? 4 : 2;
+              const newSl = Number((trailingAction.newSlPrice || (isLong ? entryPrice * 1.0008 : entryPrice * 0.9992)).toFixed(pxDigits));
               this.cryptoPartialClosedMap.set(posKey, {
                 partialClosed: true,
-                trailingStopPrice: Number(newSl.toFixed(4)),
+                trailingStopPrice: newSl,
               });
               dualRoomProtections.recordProfitHit(pos.symbol, 'crypto');
               await bitget.updateTrailingStop({
                 symbol: pos.symbol,
                 holdSide: isLong ? 'long' : 'short',
-                triggerPrice: Number(newSl.toFixed(4)),
+                triggerPrice: newSl,
                 planType: 'pos_loss',
               });
             }
           } else if (trailingAction.action === 'MODIFY_SL' && trailingAction.newSlPrice) {
             // Stage 2: Adaptive ATR Trailing Stop
+            const pxDigits = entryPrice < 0.01 ? 7 : entryPrice < 1 ? 5 : entryPrice < 100 ? 4 : 2;
+            const newSl = Number(trailingAction.newSlPrice.toFixed(pxDigits));
             this.cryptoPartialClosedMap.set(posKey, {
               partialClosed: isPartialClosed,
-              trailingStopPrice: Number(trailingAction.newSlPrice.toFixed(4)),
+              trailingStopPrice: newSl,
             });
             await bitget.updateTrailingStop({
               symbol: pos.symbol,
               holdSide: isLong ? 'long' : 'short',
-              triggerPrice: Number(trailingAction.newSlPrice.toFixed(4)),
+              triggerPrice: newSl,
               planType: 'pos_loss',
             });
           }
@@ -1270,8 +1281,14 @@ class EngineScheduler {
             if (!protectionCheck.allowed) continue;
 
             try {
-              const klines = await bitget.getKlines(sym, '5m', 60);
-              if (!klines || klines.length < 30) continue;
+              const klines = await bitget.getKlines(sym, '5m', 220);
+              if (!klines || klines.length < 50) continue;
+
+              const c0Ts = klines[klines.length - 1]?.timestamp || 0;
+              const lockSym = `CRYPTO_BITGET_${sym}`;
+              if (c0Ts > 0 && idempotencyLocks.isCandleLocked(lockSym, 'M5', c0Ts)) {
+                continue;
+              }
 
               const verdict = await evaluateCryptoSignal({
                 symbol: sym,
@@ -1286,8 +1303,11 @@ class EngineScheduler {
                 pocMagnetAligned: verdict.indicators?.pocMagnetAligned,
               });
 
-              const effectiveConfidence = verdict.aiVerdict?.confidence || verdict.score;
-              const isSignalQualified = (verdict.approved || verdict.score >= cryptoDynamicThreshold || effectiveConfidence >= cryptoDynamicThreshold) &&
+              const effectiveConfidence = verdict.aiVerdict ? verdict.aiVerdict.confidence : verdict.score;
+              const aiApproved = verdict.aiVerdict ? verdict.aiVerdict.decision === 'EXECUTE' : true;
+              const isSignalQualified =
+                verdict.approved &&
+                aiApproved &&
                 effectiveConfidence >= cryptoDynamicThreshold &&
                 !verdict.btcGuardBlocked;
 
@@ -1321,6 +1341,9 @@ class EngineScheduler {
                     stopLossPrice: verdict.stopLossPrice,
                     takeProfitPrice: verdict.takeProfit1Price,
                   });
+                  if (c0Ts > 0) {
+                    idempotencyLocks.recordExecutedCandle(lockSym, 'M5', c0Ts, orderSide);
+                  }
                   positionsCount++;
                   stateSync.addTelemetry(sym, 'ORDER', `⚡ [BITGET AUTO-TRADE] Dispatched ${orderSide} on ${sym} (${qty} coins | Margin $${userMargin.toFixed(2)} @ ${userLeverage}x | Confidence ${effectiveConfidence}% >= ${cryptoDynamicThreshold}%)`);
                 }
@@ -1354,7 +1377,8 @@ class EngineScheduler {
           activeBinanceKeys.add(posKey);
           const tracked = this.cryptoPartialClosedMap.get(posKey);
           const isPartialClosed = Boolean(pos.partialClosed || tracked?.partialClosed);
-          const effectiveSl = pos.trailingStopPrice || tracked?.trailingStopPrice || pos.stopLossPrice;
+          const protectiveFallbackSl = isLong ? entryPrice * 0.982 : entryPrice * 1.018;
+          const effectiveSl = pos.trailingStopPrice || tracked?.trailingStopPrice || pos.stopLossPrice || protectiveFallbackSl;
 
           const trailingAction = evaluateCryptoPositionTrailing({
             symbol: pos.symbol,
@@ -1364,7 +1388,7 @@ class EngineScheduler {
             quantity: Math.abs(pos.positionAmt),
             partialClosed: isPartialClosed,
             currentSl: effectiveSl,
-            atr14: markPrice * 0.012,
+            atr14: markPrice * 0.008,
             exchange: 'BINANCE',
           });
 
@@ -1378,17 +1402,19 @@ class EngineScheduler {
             const halfQty = parseFloat(halfSizeStr);
             if (halfQty > 0) {
               await binance.closePosition(pos.symbol, pos.positionAmt, halfQty);
-              const newSl = trailingAction.newSlPrice || (isLong ? entryPrice * 1.0008 : entryPrice * 0.9992);
+              const pxDigits = entryPrice < 0.01 ? 7 : entryPrice < 1 ? 5 : entryPrice < 100 ? 4 : 2;
+              const newSl = Number((trailingAction.newSlPrice || (isLong ? entryPrice * 1.0008 : entryPrice * 0.9992)).toFixed(pxDigits));
               this.cryptoPartialClosedMap.set(posKey, {
                 partialClosed: true,
-                trailingStopPrice: Number(newSl.toFixed(4)),
+                trailingStopPrice: newSl,
               });
               dualRoomProtections.recordProfitHit(pos.symbol, 'crypto');
             }
           } else if (trailingAction.action === 'MODIFY_SL' && trailingAction.newSlPrice) {
+            const pxDigits = entryPrice < 0.01 ? 7 : entryPrice < 1 ? 5 : entryPrice < 100 ? 4 : 2;
             this.cryptoPartialClosedMap.set(posKey, {
               partialClosed: isPartialClosed,
-              trailingStopPrice: Number(trailingAction.newSlPrice.toFixed(4)),
+              trailingStopPrice: Number(trailingAction.newSlPrice.toFixed(pxDigits)),
             });
           }
 
@@ -1430,13 +1456,27 @@ class EngineScheduler {
             if (!protectionCheck.allowed) continue;
 
             try {
-              const klines = await binance.getKlines(sym, '5m', 60);
-              if (!klines || klines.length < 30) continue;
+              const klines = await binance.getKlines(sym, '5m', 220);
+              if (!klines || klines.length < 50) continue;
+
+              const c0Ts = klines[klines.length - 1]?.timestamp || 0;
+              const lockSym = `CRYPTO_BINANCE_${sym}`;
+              if (c0Ts > 0 && idempotencyLocks.isCandleLocked(lockSym, 'M5', c0Ts)) {
+                continue;
+              }
+
+              let fundingRate = 0.0001;
+              try {
+                const prem = await binance.getPremiumIndex(sym);
+                if (typeof prem?.lastFundingRate === 'number' && Number.isFinite(prem.lastFundingRate)) {
+                  fundingRate = prem.lastFundingRate;
+                }
+              } catch {}
 
               const verdict = await evaluateCryptoSignal({
                 symbol: sym,
                 klines,
-                fundingRate: 0.0001,
+                fundingRate,
                 btcGuard,
                 enableAiJudge: true,
               });
@@ -1446,8 +1486,11 @@ class EngineScheduler {
                 pocMagnetAligned: verdict.indicators?.pocMagnetAligned,
               });
 
-              const effectiveConfidence = verdict.aiVerdict?.confidence || verdict.score;
-              const isSignalQualified = (verdict.approved || verdict.score >= cryptoDynamicThreshold || effectiveConfidence >= cryptoDynamicThreshold) &&
+              const effectiveConfidence = verdict.aiVerdict ? verdict.aiVerdict.confidence : verdict.score;
+              const aiApproved = verdict.aiVerdict ? verdict.aiVerdict.decision === 'EXECUTE' : true;
+              const isSignalQualified =
+                verdict.approved &&
+                aiApproved &&
                 effectiveConfidence >= cryptoDynamicThreshold &&
                 !verdict.btcGuardBlocked;
 
@@ -1471,12 +1514,18 @@ class EngineScheduler {
                   : Number(rawQty.toFixed(3)).toString();
 
                 if (parseFloat(qty) > 0) {
-                  await binance.placeOrder({
+                  await binance.placeMarketOrderWithProtection({
                     symbol: sym,
                     side: orderSide,
-                    type: 'MARKET',
                     quantity: qty,
+                    leverage: userLeverage,
+                    marginMode: userMarginMode.toLowerCase() === 'cross' ? 'CROSSED' : 'ISOLATED',
+                    stopLossPrice: verdict.stopLossPrice,
+                    takeProfitPrice: verdict.takeProfit1Price,
                   });
+                  if (c0Ts > 0) {
+                    idempotencyLocks.recordExecutedCandle(lockSym, 'M5', c0Ts, orderSide);
+                  }
                   positionsCount++;
                   stateSync.addTelemetry(sym, 'ORDER', `⚡ [BINANCE AUTO-TRADE] Dispatched ${orderSide} on ${sym} (${qty} coins | Margin $${userMargin.toFixed(2)} @ ${userLeverage}x | Confidence ${effectiveConfidence}% >= ${cryptoDynamicThreshold}%)`);
                 }

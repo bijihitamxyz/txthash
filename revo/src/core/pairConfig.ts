@@ -162,9 +162,25 @@ export function getPairProfile(symbol?: string): PairProfile {
   const isJpy = upper.includes('JPY');
   const isUsdt = upper.endsWith('USDT') || upper.endsWith('BUSD') || upper.endsWith('USDC');
   const isMajorCrypto = upper.includes('BTC') || upper.includes('ETH') || upper.includes('BNB') || upper.includes('SOL');
+  const isMicroMeme =
+    upper.includes('PEPE') ||
+    upper.includes('BONK') ||
+    upper.includes('SHIB') ||
+    upper.includes('FLOKI') ||
+    upper.startsWith('1000');
   const isCrypto = isUsdt || isMajorCrypto;
-  const cryptoDigits = upper.includes('BTC') || upper.includes('ETH') || upper.includes('BNB') || upper.includes('SOL') ? 2 : 4;
-  const cryptoPip = upper.includes('BTC') ? 10.0 : upper.includes('ETH') ? 1.0 : 0.01;
+  const cryptoDigits = isMicroMeme
+    ? 7
+    : upper.includes('BTC') || upper.includes('ETH') || upper.includes('BNB') || upper.includes('SOL')
+    ? 2
+    : 4;
+  const cryptoPip = upper.includes('BTC')
+    ? 10.0
+    : upper.includes('ETH')
+    ? 1.0
+    : isMicroMeme
+    ? 0.000001
+    : 0.01;
   return {
     symbol: raw,
     name: raw,

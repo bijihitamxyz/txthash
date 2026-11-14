@@ -14,7 +14,7 @@ import {
   getCryptoDynamicThreshold,
   CryptoSignalVerdict,
 } from '@/core/cryptoSignalEngine';
-import { dualRoomProtections } from '@/core/riskGuard';
+import { dualRoomProtections, idempotencyLocks } from '@/core/riskGuard';
 import { evaluateCryptoPositionTrailing } from '@/core/trailingManager';
 import {
   CryptoExchange,
@@ -37,24 +37,85 @@ export interface BinanceTelemetryItem {
   message: string;
 }
 
-export type BinanceCategory = 'ALL' | 'TOP_MOVERS' | 'L2' | 'L1_DEFI' | 'AI_MEME';
+export type CryptoTradeAction =
+  | 'OPEN_AUTO'
+  | 'OPEN_MANUAL'
+  | 'PARTIAL_CLOSE'
+  | 'CLOSE_MANUAL'
+  | 'CLOSE_SL'
+  | 'CLOSE_BE'
+  | 'PANIC_CLOSE';
 
-// Categorized symbol lists
-export const L2_MODULAR_SYMBOLS = [
+export interface CryptoTradeHistoryItem {
+  id: string;
+  timestamp: number;
+  date: string; // YYYY-MM-DD linked to dailyPnlHistory[date]
+  symbol: string;
+  exchange: CryptoExchange;
+  side: 'LONG' | 'SHORT';
+  action: CryptoTradeAction;
+  entryPrice: number;
+  exitPrice?: number;
+  quantity: number;
+  leverage: number;
+  marginUsdt: number;
+  realizedPnl?: number;
+  setupName?: string;
+  note?: string;
+}
+
+export type CoinCategory = 'MEME' | 'L1' | 'L2' | 'ALT';
+export type TargetCategory = 'ALL' | CoinCategory;
+export type BinanceCategory = 'ALL' | 'TOP_MOVERS' | CoinCategory;
+
+// Categorized symbol lists (MEME, L1, L2, ALT)
+export const MEME_SYMBOLS = [
+  'DOGEUSDT', '1000PEPEUSDT', 'PEPEUSDT', 'WIFUSDT', 'BONKUSDT',
+  '1000SHIBUSDT', 'SHIBUSDT', '1000FLOKIUSDT', 'FLOKIUSDT', 'BOMEUSDT',
+  'MEMEUSDT', 'POPCATUSDT', 'NEIROUSDT', 'TURBOUSDT', 'PNUTUSDT',
+  'BRETTUSDT', 'PEOPLEUSDT', 'ORDIUSDT', '1000SATSUSDT', 'MOODENGUSDT',
+  'ACTUSDT', 'HIPPOUSDT', 'SPXUSDT', 'PENGUUSDT', 'FARTCOINUSDT',
+];
+
+export const L1_SYMBOLS = [
+  'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'ADAUSDT',
+  'AVAXUSDT', 'SUIUSDT', 'TONUSDT', 'NEARUSDT', 'APTUSDT',
+  'SEIUSDT', 'DOTUSDT', 'ATOMUSDT', 'XRPUSDT', 'TRXUSDT',
+  'KASUSDT', 'FTMUSDT', 'SONICUSDT', 'INJUSDT', 'TIAUSDT',
+  'ALGOUSDT', 'HBARUSDT', 'ICPUSDT', 'ETCUSDT', 'LTCUSDT',
+];
+
+export const L2_SYMBOLS = [
   'ARBUSDT', 'OPUSDT', 'STRKUSDT', 'ZKUSDT', 'POLUSDT',
-  'TIAUSDT', 'MANTAUSDT', 'METISUSDT', 'ZROUSDT', 'IMXUSDT'
+  'MATICUSDT', 'MANTAUSDT', 'METISUSDT', 'IMXUSDT', 'MNTUSDT',
+  'BLASTUSDT', 'SCRUSDT', 'ZROUSDT', 'LINEAUSDT', 'TAIKOUSDT',
 ];
 
-export const L1_DEFI_SYMBOLS = [
-  'SOLUSDT', 'SUIUSDT', 'SEIUSDT', 'APTUSDT', 'AVAXUSDT',
-  'INJUSDT', 'ONDOUSDT', 'PENDLEUSDT', 'ENAUSDT', 'NEARUSDT',
-  'LINKUSDT', 'ADAUSDT', 'DOTUSDT'
+export const ALT_SYMBOLS = [
+  'LINKUSDT', 'UNIUSDT', 'AAVEUSDT', 'ONDOUSDT', 'PENDLEUSDT',
+  'ENAUSDT', 'FETUSDT', 'RENDERUSDT', 'WLDUSDT', 'TAOUSDT',
+  'BCHUSDT', 'FILUSDT', 'GALAUSDT', 'SANDUSDT', 'RUNEUSDT',
+  'JUPUSDT', 'PYTHUSDT', 'CRVUSDT', 'SNXUSDT', 'MKRUSDT',
+  'LDOUSDT', 'GMXUSDT', 'DYDXUSDT', 'STXUSDT', 'ENSUSDT',
 ];
 
-export const AI_MEME_SYMBOLS = [
-  'FETUSDT', 'RENDERUSDT', 'WLDUSDT', 'DOGEUSDT', '1000PEPEUSDT',
-  'WIFUSDT', 'BONKUSDT', '1000SHIBUSDT', '1000FLOKIUSDT', 'TAOUSDT'
-];
+// Backwards-compatible aliases
+export const L2_MODULAR_SYMBOLS = L2_SYMBOLS;
+export const L1_DEFI_SYMBOLS = L1_SYMBOLS;
+export const AI_MEME_SYMBOLS = MEME_SYMBOLS;
+
+const MEME_SET = new Set(MEME_SYMBOLS);
+const L1_SET = new Set(L1_SYMBOLS);
+const L2_SET = new Set(L2_SYMBOLS);
+
+/** Classify a futures symbol into MEME, L1, L2, or ALT (default fallback). */
+export function getCoinCategory(symbol: string): CoinCategory {
+  const sym = symbol.toUpperCase().trim();
+  if (MEME_SET.has(sym)) return 'MEME';
+  if (L2_SET.has(sym)) return 'L2';
+  if (L1_SET.has(sym)) return 'L1';
+  return 'ALT';
+}
 
 export const ANCHOR_MAJOR_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT'];
 
@@ -108,6 +169,8 @@ export interface BinanceStoreState {
   tickers: Record<string, Binance24hTicker>;
   selectedCategory: BinanceCategory;
   setSelectedCategory: (cat: BinanceCategory) => void;
+  targetCategory: TargetCategory;
+  setTargetCategory: (cat: TargetCategory) => void;
   searchQuery: string;
   setSearchQuery: (q: string) => void;
   customWatchlist: string[];
@@ -156,8 +219,18 @@ export interface BinanceStoreState {
   isPnlCalendarOpen: boolean;
   openPnlCalendar: () => void;
   closePnlCalendar: () => void;
-  recordTradePnL: (realizedPnl: number) => void;
+  recordTradePnL: (
+    realizedPnl: number,
+    tradeMeta?: Omit<CryptoTradeHistoryItem, 'id' | 'timestamp' | 'date' | 'realizedPnl'>
+  ) => void;
   resetCalendarHistory: () => void;
+
+  // 6b. Crypto Entry & Trade History Log (linked to Daily PnL)
+  tradeHistory: CryptoTradeHistoryItem[];
+  recordTradeEntry: (
+    entry: Omit<CryptoTradeHistoryItem, 'id' | 'timestamp' | 'date'> & { timestamp?: number; date?: string }
+  ) => void;
+  clearTradeHistory: () => void;
 
   // 7. Positions & Trade Execution
   positions: BinancePosition[];
@@ -251,6 +324,8 @@ export const useBinanceStore = create<BinanceStoreState>()(
       tickers: {},
       selectedCategory: 'TOP_MOVERS',
       setSelectedCategory: (selectedCategory) => set({ selectedCategory }),
+      targetCategory: 'ALL',
+      setTargetCategory: (targetCategory) => set({ targetCategory }),
       searchQuery: '',
       setSearchQuery: (searchQuery) => set({ searchQuery }),
       customWatchlist: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'ARBUSDT', 'SUIUSDT', 'OPUSDT'],
@@ -281,16 +356,25 @@ export const useBinanceStore = create<BinanceStoreState>()(
       activeExchange: 'BINANCE',
       setActiveExchange: (activeExchange) => {
         set({ activeExchange });
-        const creds = activeExchange === 'BITGET' ? get().bitgetConfig : get().binanceConfig;
-        const configured = isCryptoVaultConfigured(
-          {
-            activeCryptoExchange: activeExchange,
-            binance: get().binanceConfig,
-            bitget: get().bitgetConfig,
-            updatedAt: Date.now(),
-          },
-          activeExchange
-        );
+        const binanceCfg = get().binanceConfig;
+        const bitgetCfg = get().bitgetConfig;
+        const creds = activeExchange === 'BITGET' ? bitgetCfg : binanceCfg;
+        const nextVault: CryptoVaultData = {
+          activeCryptoExchange: activeExchange,
+          binance: binanceCfg,
+          bitget: bitgetCfg,
+          updatedAt: Date.now(),
+        };
+        const configured = isCryptoVaultConfigured(nextVault, activeExchange);
+
+        // Persist active exchange to both localStorage vault and server vault
+        saveCryptoVaultToLocalStorage(nextVault).catch(() => {});
+        fetch('/api/binance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'SAVE_SERVER_VAULT', vault: nextVault }),
+        }).catch(() => {});
+
         set({
           apiKey: creds.apiKey || '',
           apiSecret: creds.secretKey || '',
@@ -299,6 +383,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
           positions: [],
         });
         get().fetchSymbolsAndTickers(true);
+        get().fetchKlines(get().selectedSymbol);
         if (configured) {
           get().fetchAccountInfo();
         }
@@ -307,7 +392,7 @@ export const useBinanceStore = create<BinanceStoreState>()(
       bitgetConfig: { apiKey: '', secretKey: '', passphrase: '', accountType: 'REAL' },
       apiKey: '',
       apiSecret: '',
-      isTestnet: false,
+      isTestnet: true,
       isVaultConfigured: false,
       isVaultModalOpen: false,
       openVaultModal: () => set({ isVaultModalOpen: true }),
@@ -447,6 +532,12 @@ export const useBinanceStore = create<BinanceStoreState>()(
               isTestnet: activeCreds?.accountType === 'DEMO',
               isVaultConfigured: configured,
             });
+
+            if (configured) {
+              get().fetchSymbolsAndTickers(true);
+              get().fetchKlines(get().selectedSymbol);
+              get().fetchAccountInfo();
+            }
           }
 
           // Ensure backend and client auto-trading state are strictly aligned
@@ -482,11 +573,31 @@ export const useBinanceStore = create<BinanceStoreState>()(
       dailyPnl: 0,
       dailyPnlPercent: 0,
       dailyPnlHistory: {},
+      tradeHistory: [],
       isPnlCalendarOpen: false,
       openPnlCalendar: () => set({ isPnlCalendarOpen: true }),
       closePnlCalendar: () => set({ isPnlCalendarOpen: false }),
 
-      recordTradePnL: (realizedPnl: number) => {
+      recordTradeEntry: (entry) => {
+        const ts = entry.timestamp ?? Date.now();
+        const dateStr = entry.date ?? getTodayDateString();
+        const newItem: CryptoTradeHistoryItem = {
+          ...entry,
+          id: `tr_${ts}_${Math.random().toString(36).slice(2, 7)}`,
+          timestamp: ts,
+          date: dateStr,
+        };
+        set((state) => ({
+          tradeHistory: [newItem, ...state.tradeHistory].slice(0, 200),
+        }));
+      },
+
+      clearTradeHistory: () => {
+        set({ tradeHistory: [] });
+        get().addTelemetryLog('INFO', 'INFO', 'Crypto Entry & Trade History log cleared.');
+      },
+
+      recordTradePnL: (realizedPnl: number, tradeMeta) => {
         const today = getTodayDateString();
         const history = { ...get().dailyPnlHistory };
         const record = history[today] || { date: today, pnl: 0, trades: 0, wins: 0, losses: 0 };
@@ -504,6 +615,14 @@ export const useBinanceStore = create<BinanceStoreState>()(
           dailyPnlPercent: pnlPct,
           dailyPnlHistory: history,
         });
+
+        if (tradeMeta) {
+          get().recordTradeEntry({
+            ...tradeMeta,
+            realizedPnl: Number(realizedPnl.toFixed(2)),
+            date: today,
+          });
+        }
       },
 
       resetCalendarHistory: () => {
@@ -511,8 +630,9 @@ export const useBinanceStore = create<BinanceStoreState>()(
           dailyPnl: 0,
           dailyPnlPercent: 0,
           dailyPnlHistory: {},
+          tradeHistory: [],
         });
-        get().addTelemetryLog('GUARD', 'INFO', 'Binance Futures Daily PnL calendar history reset to $0.00');
+        get().addTelemetryLog('GUARD', 'INFO', 'Binance Futures Daily PnL & Entry History reset to $0.00');
       },
 
       // Positions & Logs
@@ -755,6 +875,11 @@ export const useBinanceStore = create<BinanceStoreState>()(
             pos.highestPriceSinceEntry = Math.max(pos.highestPriceSinceEntry || curPrice, curPrice);
             pos.lowestPriceSinceEntry = Math.min(pos.lowestPriceSinceEntry || curPrice, curPrice);
 
+            const posAtr = state.lastVerdict[pos.symbol]?.indicators?.atr14 || curPrice * 0.008;
+            const protectiveFallbackSl = isLong ? pos.entryPrice * 0.982 : pos.entryPrice * 1.018;
+            const effectiveSl = pos.trailingStopPrice || pos.stopLossPrice || protectiveFallbackSl;
+            if (!pos.stopLossPrice) pos.stopLossPrice = protectiveFallbackSl;
+
             // Evaluate 2-Stage Trailing Stop via trailingManager
             const trailingAction = evaluateCryptoPositionTrailing({
               symbol: pos.symbol,
@@ -763,8 +888,8 @@ export const useBinanceStore = create<BinanceStoreState>()(
               currentPrice: curPrice,
               quantity: absAmt,
               partialClosed: pos.partialClosed,
-              currentSl: pos.trailingStopPrice || pos.stopLossPrice,
-              atr14: curPrice * 0.012,
+              currentSl: effectiveSl,
+              atr14: posAtr,
               exchange: state.activeExchange,
             });
 
@@ -776,7 +901,18 @@ export const useBinanceStore = create<BinanceStoreState>()(
                 ? (curPrice - pos.entryPrice) * closeQty
                 : (pos.entryPrice - curPrice) * closeQty;
 
-              state.recordTradePnL(realizedPnl);
+              state.recordTradePnL(realizedPnl, {
+                symbol: pos.symbol,
+                exchange: state.activeExchange,
+                side: isLong ? 'LONG' : 'SHORT',
+                action: 'PARTIAL_CLOSE',
+                entryPrice: pos.entryPrice,
+                exitPrice: curPrice,
+                quantity: closeQty,
+                leverage: pos.leverage || state.leverage,
+                marginUsdt: pos.isolatedMargin ? Number((pos.isolatedMargin * 0.5).toFixed(2)) : Number((state.marginUsdt * 0.5).toFixed(2)),
+                note: 'Stage-1 50% Partial Close -> BE+ Locked',
+              });
               dualRoomProtections.recordProfitHit(pos.symbol, 'crypto');
               const remainingAbs = Math.max(0, absAmt - closeQty);
               pos.positionAmt = isLong ? remainingAbs : -remainingAbs;
@@ -862,7 +998,18 @@ export const useBinanceStore = create<BinanceStoreState>()(
               const realizedPnl = isLong
                 ? (curPrice - pos.entryPrice) * remainingQty
                 : (pos.entryPrice - curPrice) * remainingQty;
-              state.recordTradePnL(realizedPnl);
+              state.recordTradePnL(realizedPnl, {
+                symbol: pos.symbol,
+                exchange: state.activeExchange,
+                side: isLong ? 'LONG' : 'SHORT',
+                action: pos.isBreakevenLocked ? 'CLOSE_BE' : 'CLOSE_SL',
+                entryPrice: pos.entryPrice,
+                exitPrice: curPrice,
+                quantity: remainingQty,
+                leverage: pos.leverage || state.leverage,
+                marginUsdt: pos.isolatedMargin || state.marginUsdt,
+                note: pos.isBreakevenLocked ? 'Breakeven+ Trailing Exit' : 'Stop Loss Exit',
+              });
               dualRoomProtections.recordStopLossHit(
                 pos.symbol,
                 'crypto',
@@ -900,11 +1047,41 @@ export const useBinanceStore = create<BinanceStoreState>()(
           set({ positions: currentPositions });
 
           // Step 3: Determine Coins to Scan
-          // Priority: User's customWatchlist -> or dynamically selected Top Liquid / L2s
-          let scanQueue = state.customWatchlist.length > 0 ? [...state.customWatchlist] : [...L2_MODULAR_SYMBOLS];
-          // Ensure active chart pair is evaluated if selected
-          if (state.selectedSymbol && !scanQueue.includes(state.selectedSymbol)) {
-            scanQueue.unshift(state.selectedSymbol);
+          // If user selected a specific targetCategory (MEME, L1, L2, ALT), prioritize liquid pairs from that category.
+          // Otherwise, use user's customWatchlist or high-liquidity majors.
+          let scanQueue: string[];
+          if (state.targetCategory && state.targetCategory !== 'ALL') {
+            const catPool = state.allSymbols
+              .filter((s) => getCoinCategory(s.symbol) === state.targetCategory)
+              .map((s) => s.symbol);
+            const fallbackPool =
+              state.targetCategory === 'MEME'
+                ? MEME_SYMBOLS
+                : state.targetCategory === 'L1'
+                ? L1_SYMBOLS
+                : state.targetCategory === 'L2'
+                ? L2_SYMBOLS
+                : ALT_SYMBOLS;
+            const pool = catPool.length > 0 ? catPool : fallbackPool;
+            scanQueue = [...pool].sort(
+              (a, b) => (state.tickers[b]?.quoteVolume || 0) - (state.tickers[a]?.quoteVolume || 0)
+            );
+            if (
+              state.selectedSymbol &&
+              getCoinCategory(state.selectedSymbol) === state.targetCategory &&
+              !scanQueue.includes(state.selectedSymbol)
+            ) {
+              scanQueue.unshift(state.selectedSymbol);
+            }
+          } else {
+            scanQueue =
+              state.customWatchlist.length > 0
+                ? [...state.customWatchlist]
+                : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'DOGEUSDT'];
+            // Ensure active chart pair is evaluated if selected
+            if (state.selectedSymbol && !scanQueue.includes(state.selectedSymbol)) {
+              scanQueue.unshift(state.selectedSymbol);
+            }
           }
           // Limit to max 6 coins per scan tick to keep Termux lightning fast
           scanQueue = scanQueue.slice(0, 6);
@@ -938,9 +1115,15 @@ export const useBinanceStore = create<BinanceStoreState>()(
 
             const ex = state.activeExchange || 'BINANCE';
             const isTest = state.isTestnet;
-            const klineRes = await fetch(`/api/binance?action=KLINES&symbol=${sym}&interval=5m&limit=60&exchange=${ex}&isTestnet=${isTest}`);
+            const klineRes = await fetch(`/api/binance?action=KLINES&symbol=${sym}&interval=5m&limit=220&exchange=${ex}&isTestnet=${isTest}`);
             const klineJson = await klineRes.json();
-            if (!klineJson.success || !Array.isArray(klineJson.klines)) continue;
+            if (!klineJson.success || !Array.isArray(klineJson.klines) || klineJson.klines.length < 50) continue;
+
+            const c0Ts = klineJson.klines[klineJson.klines.length - 1]?.timestamp || 0;
+            const lockSym = `CRYPTO_${ex}_${sym}`;
+            if (c0Ts > 0 && idempotencyLocks.isCandleLocked(lockSym, 'M5', c0Ts)) {
+              continue;
+            }
 
             const verdict = await evaluateCryptoSignal({
               symbol: sym,
@@ -966,8 +1149,10 @@ export const useBinanceStore = create<BinanceStoreState>()(
             });
 
             const effectiveScore = verdict.aiVerdict ? verdict.aiVerdict.confidence : verdict.score;
-            // Any verified signal scoring >= dynamic threshold (when Risk Guard is clear) MUST execute!
-            const isSignalQualified = (verdict.approved || verdict.score >= cryptoDynamicThreshold || effectiveScore >= cryptoDynamicThreshold) &&
+            const aiApproved = verdict.aiVerdict ? verdict.aiVerdict.decision === 'EXECUTE' : true;
+            const isSignalQualified =
+              verdict.approved &&
+              aiApproved &&
               effectiveScore >= cryptoDynamicThreshold &&
               !verdict.btcGuardBlocked;
 
@@ -1041,6 +1226,23 @@ export const useBinanceStore = create<BinanceStoreState>()(
                   );
                   continue;
                 }
+
+                if (c0Ts > 0) {
+                  idempotencyLocks.recordExecutedCandle(lockSym, 'M5', c0Ts, verdict.side === 'LONG' ? 'BUY' : 'SELL');
+                }
+
+                state.recordTradeEntry({
+                  symbol: sym,
+                  exchange: state.activeExchange,
+                  side: verdict.side,
+                  action: 'OPEN_AUTO',
+                  entryPrice: verdict.entryPrice,
+                  quantity: qtyNum,
+                  leverage: lev,
+                  marginUsdt: margin,
+                  setupName: verdict.setupName,
+                  note: `Score ${verdict.score}/${verdict.dynamicThreshold || 65}% | SL $${verdict.stopLossPrice} | TP1 $${verdict.takeProfit1Price}`,
+                });
 
                 state.addTelemetryLog(
                   sym,
@@ -1136,6 +1338,18 @@ export const useBinanceStore = create<BinanceStoreState>()(
             return;
           }
 
+          state.recordTradeEntry({
+            symbol,
+            exchange: state.activeExchange,
+            side,
+            action: 'OPEN_MANUAL',
+            entryPrice: price,
+            quantity: qtyNum,
+            leverage: lev,
+            marginUsdt: margin,
+            note: `Manual Market ${side} (${lev}x ${state.marginMode})`,
+          });
+
           state.addTelemetryLog(
             symbol,
             'ORDER',
@@ -1166,7 +1380,18 @@ export const useBinanceStore = create<BinanceStoreState>()(
           ? (curPrice - pos.entryPrice) * qty
           : (pos.entryPrice - curPrice) * qty;
 
-        state.recordTradePnL(realizedPnl);
+        state.recordTradePnL(realizedPnl, {
+          symbol,
+          exchange: state.activeExchange,
+          side: isLong ? 'LONG' : 'SHORT',
+          action: quantityToClose && quantityToClose < totalAbs ? 'PARTIAL_CLOSE' : 'CLOSE_MANUAL',
+          entryPrice: pos.entryPrice,
+          exitPrice: curPrice,
+          quantity: qty,
+          leverage: pos.leverage || state.leverage,
+          marginUsdt: pos.isolatedMargin || state.marginUsdt,
+          note: 'Manual Position Close',
+        });
         state.addTelemetryLog(
           symbol,
           'ORDER',
@@ -1211,14 +1436,24 @@ export const useBinanceStore = create<BinanceStoreState>()(
 
         if (currentPositions.length > 0) {
           const tickers = state.tickers;
-          let totalPanicPnl = 0;
           for (const pos of currentPositions) {
             const curPrice = tickers[pos.symbol]?.lastPrice || pos.markPrice || pos.entryPrice;
             const isLong = pos.positionAmt > 0;
             const qty = Math.abs(pos.positionAmt);
-            totalPanicPnl += isLong ? (curPrice - pos.entryPrice) * qty : (pos.entryPrice - curPrice) * qty;
+            const posPnl = isLong ? (curPrice - pos.entryPrice) * qty : (pos.entryPrice - curPrice) * qty;
+            state.recordTradePnL(posPnl, {
+              symbol: pos.symbol,
+              exchange: state.activeExchange,
+              side: isLong ? 'LONG' : 'SHORT',
+              action: 'PANIC_CLOSE',
+              entryPrice: pos.entryPrice,
+              exitPrice: curPrice,
+              quantity: qty,
+              leverage: pos.leverage || state.leverage,
+              marginUsdt: pos.isolatedMargin || state.marginUsdt,
+              note: 'Panic Close All Liquidation',
+            });
           }
-          state.recordTradePnL(totalPanicPnl);
         }
 
         // 1. Immediately set execution lock for 5s, turn off auto-trading & scanning, and clear positions array
@@ -1265,11 +1500,13 @@ export const useBinanceStore = create<BinanceStoreState>()(
         marginMode: state.marginMode,
         maxConcurrentCoins: state.maxConcurrentCoins,
         selectedCategory: state.selectedCategory,
+        targetCategory: state.targetCategory,
         customWatchlist: state.customWatchlist,
         selectedSymbol: state.selectedSymbol,
         timeframe: state.timeframe,
         isTestnet: state.isTestnet,
         dailyPnlHistory: state.dailyPnlHistory,
+        tradeHistory: state.tradeHistory,
         isAutoTrading: state.isAutoTrading,
       }),
       onRehydrateStorage: () => (rehydratedState) => {
@@ -1277,6 +1514,10 @@ export const useBinanceStore = create<BinanceStoreState>()(
           rehydratedState.isScanning = false;
           rehydratedState.isPanicClosing = false;
           rehydratedState.isAutoTrading = Boolean(rehydratedState.isAutoTrading);
+          const cat = rehydratedState.selectedCategory as string;
+          if (cat === 'L1_DEFI') rehydratedState.selectedCategory = 'L1';
+          else if (cat === 'AI_MEME') rehydratedState.selectedCategory = 'MEME';
+          if (!rehydratedState.targetCategory) rehydratedState.targetCategory = 'ALL';
         }
       },
     }

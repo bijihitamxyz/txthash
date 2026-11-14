@@ -2,7 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import { useBinanceStore } from '@/store/useBinanceStore';
+import { useBinanceStore, getTodayDateString } from '@/store/useBinanceStore';
 import { Calendar, ChevronLeft, ChevronRight, X, RotateCcw } from 'lucide-react';
 
 export const BinancePnlCalendarModal: React.FC = () => {
@@ -14,9 +14,11 @@ export const BinancePnlCalendarModal: React.FC = () => {
   const isPnlCalendarOpen = useBinanceStore((s) => s.isPnlCalendarOpen);
   const closePnlCalendar = useBinanceStore((s) => s.closePnlCalendar);
   const dailyPnlHistory = useBinanceStore((s) => s.dailyPnlHistory);
+  const tradeHistory = useBinanceStore((s) => s.tradeHistory);
   const resetCalendarHistory = useBinanceStore((s) => s.resetCalendarHistory);
 
   const [currentDate, setCurrentDate] = useState(() => new Date());
+  const [selectedDate, setSelectedDate] = useState<string>(() => getTodayDateString());
 
   if (!isPnlCalendarOpen) return null;
 
@@ -191,24 +193,29 @@ export const BinancePnlCalendarModal: React.FC = () => {
 
             {calendarDays.map((d) => {
               const isProfit = d.pnl >= 0;
+              const isSelected = selectedDate === d.dateStr;
               return (
-                <div
+                <button
+                  type="button"
                   key={d.dateStr}
-                  className={`h-14 sm:h-16 rounded-xl p-1.5 flex flex-col justify-between border transition-all ${
+                  onClick={() => setSelectedDate(d.dateStr)}
+                  className={`h-14 sm:h-16 rounded-xl p-1.5 flex flex-col justify-between border text-left transition-all cursor-pointer ${
+                    isSelected ? 'ring-2 ring-[#0F172A] dark:ring-emerald-400 ' : ''
+                  }${
                     d.hasTrade
                       ? isProfit
                         ? 'bg-emerald-50 dark:bg-emerald-950/60 border-emerald-200 dark:border-emerald-800/80 text-emerald-900 dark:text-emerald-200'
                         : 'bg-rose-50 dark:bg-rose-950/60 border-rose-200 dark:border-rose-800/80 text-rose-900 dark:text-rose-200'
-                      : 'bg-white dark:bg-zinc-900 border-slate-200/80 dark:border-zinc-800 text-slate-400 dark:text-zinc-500'
+                      : 'bg-white dark:bg-zinc-900 border-slate-200/80 dark:border-zinc-800 text-slate-400 dark:text-zinc-500 hover:bg-slate-50 dark:hover:bg-zinc-800/60'
                   }`}
                 >
-                  <div className="flex items-center justify-between text-[10px]">
+                  <div className="flex items-center justify-between w-full text-[10px]">
                     <span className="font-semibold text-slate-700 dark:text-slate-300">{d.dayNumber}</span>
                     {d.hasTrade && <span className="text-[9px] opacity-75 font-sans">{d.trades}t</span>}
                   </div>
 
                   {d.hasTrade ? (
-                    <div className="truncate">
+                    <div className="truncate w-full">
                       <div className={`font-bold text-[10px] sm:text-[11px] truncate ${isProfit ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
                         {isProfit ? '+' : ''}${d.pnl.toFixed(2)}
                       </div>
@@ -216,10 +223,83 @@ export const BinancePnlCalendarModal: React.FC = () => {
                   ) : (
                     <div className="text-[9px] text-slate-300 dark:text-zinc-600 truncate">-</div>
                   )}
-                </div>
+                </button>
               );
             })}
           </div>
+
+          {/* Selected Day Entry & Trade History Breakdown */}
+          {(() => {
+            const dayLogs = tradeHistory.filter((item) => item.date === selectedDate);
+            const daySummary = dailyPnlHistory[selectedDate];
+            const dayPnl = daySummary?.pnl ?? 0;
+            return (
+              <div className="mt-4 pt-3 border-t border-slate-200 dark:border-zinc-800 space-y-2 font-mono">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-bold text-[#0F172A] dark:text-slate-100">
+                    Entry &amp; Trade Log ({selectedDate})
+                  </span>
+                  <span
+                    className={`font-bold ${
+                      dayPnl >= 0 ? 'text-emerald-700 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'
+                    }`}
+                  >
+                    Daily PnL: {dayPnl >= 0 ? '+' : ''}${dayPnl.toFixed(2)} USDT
+                  </span>
+                </div>
+                {dayLogs.length === 0 ? (
+                  <div className="p-3 rounded-xl bg-slate-50 dark:bg-zinc-950 border border-slate-200/80 dark:border-zinc-800 text-[11px] text-slate-400 dark:text-zinc-500 text-center">
+                    No recorded entry or exit logs for {selectedDate}.
+                  </div>
+                ) : (
+                  <div className="max-h-40 overflow-y-auto space-y-1.5 pr-1">
+                    {dayLogs.map((item) => {
+                      const hasPnl = typeof item.realizedPnl === 'number';
+                      const isWin = (item.realizedPnl ?? 0) >= 0;
+                      const pxDigits = item.entryPrice < 0.01 ? 7 : item.entryPrice < 1 ? 5 : item.entryPrice < 10 ? 4 : 2;
+                      return (
+                        <div
+                          key={item.id}
+                          className="p-2 rounded-xl bg-slate-50 dark:bg-zinc-950 border border-slate-200/80 dark:border-zinc-800 flex items-center justify-between gap-2 text-[11px]"
+                        >
+                          <div className="flex items-center gap-2 min-w-0">
+                            <span className="text-slate-400 dark:text-zinc-500 shrink-0">
+                              {new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            </span>
+                            <span
+                              className={`px-1.5 py-0.5 rounded text-[9px] font-bold border shrink-0 ${
+                                item.side === 'LONG'
+                                  ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60'
+                                  : 'bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-800/60'
+                              }`}
+                            >
+                              {item.side} {item.leverage}x
+                            </span>
+                            <span className="font-bold text-[#0F172A] dark:text-slate-100 shrink-0">{item.symbol}</span>
+                            <span className="text-[10px] text-slate-500 dark:text-slate-400 truncate">
+                              {item.action.replace('_', ' ')} @ ${item.entryPrice.toFixed(pxDigits)}
+                              {item.exitPrice ? ` -> $${item.exitPrice.toFixed(pxDigits)}` : ''}
+                            </span>
+                          </div>
+                          <span
+                            className={`font-bold shrink-0 ${
+                              !hasPnl
+                                ? 'text-sky-600 dark:text-sky-400'
+                                : isWin
+                                ? 'text-emerald-700 dark:text-emerald-400'
+                                : 'text-rose-600 dark:text-rose-400'
+                            }`}
+                          >
+                            {hasPnl ? `${isWin ? '+' : ''}$${item.realizedPnl!.toFixed(2)}` : 'ENTRY'}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
 
         {/* Footer */}

@@ -1,6 +1,7 @@
 'use client';
 
 import React from 'react';
+import { Lock } from 'lucide-react';
 import { useRoomStore } from '@/store/useRoomStore';
 import { useBinanceStore } from '@/store/useBinanceStore';
 
@@ -15,6 +16,7 @@ export const TopRoomSwitcher: React.FC<TopRoomSwitcherProps> = ({
 }) => {
   const storeActiveRoom = useRoomStore((s) => s.activeRoom);
   const setActiveRoom = useRoomStore((s) => s.setActiveRoom);
+  const maintenance = useRoomStore((s) => s.maintenance);
   const activeExchange = useBinanceStore((s) => s.activeExchange || 'BINANCE');
 
   const isForex = propActiveMarket
@@ -22,6 +24,8 @@ export const TopRoomSwitcher: React.FC<TopRoomSwitcherProps> = ({
     : storeActiveRoom === 'FOREX' || (storeActiveRoom as string) === 'ROOM_1_EXNESS';
 
   const handleSelect = (market: 'FOREX' | 'CRYPTO') => {
+    if (market === 'FOREX' && maintenance.forex) return;
+    if (market === 'CRYPTO' && maintenance.crypto) return;
     onMarketChange?.(market);
     setActiveRoom(market);
   };
@@ -36,27 +40,45 @@ export const TopRoomSwitcher: React.FC<TopRoomSwitcherProps> = ({
           <div className="flex items-center bg-slate-100 p-0.5 rounded-xl border border-slate-200">
             <button
               type="button"
+              disabled={maintenance.forex}
+              aria-disabled={maintenance.forex}
+              title={maintenance.forex ? 'Forex Room sedang dalam mode Maintenance (Terkunci)' : undefined}
               onClick={() => handleSelect('FOREX')}
-              className={`px-3 py-1 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer flex items-center gap-1.5 ${
-                isForex
-                  ? 'bg-[#0F172A] text-white shadow-xs'
-                  : 'text-slate-600 hover:text-[#0F172A]'
+              className={`px-3 py-1 rounded-lg text-xs font-bold font-mono transition-all flex items-center gap-1.5 ${
+                maintenance.forex
+                  ? 'opacity-50 cursor-not-allowed text-slate-400 select-none'
+                  : isForex
+                  ? 'bg-[#0F172A] text-white shadow-xs cursor-pointer'
+                  : 'text-slate-600 hover:text-[#0F172A] cursor-pointer'
               }`}
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${isForex ? 'bg-emerald-400' : 'bg-slate-400'}`} />
+              {maintenance.forex ? (
+                <Lock className="w-3 h-3 text-amber-500" />
+              ) : (
+                <span className={`w-1.5 h-1.5 rounded-full ${isForex ? 'bg-emerald-400' : 'bg-slate-400'}`} />
+              )}
               <span>FOREX · Exness</span>
             </button>
 
             <button
               type="button"
+              disabled={maintenance.crypto}
+              aria-disabled={maintenance.crypto}
+              title={maintenance.crypto ? 'Crypto Room sedang dalam mode Maintenance (Terkunci)' : undefined}
               onClick={() => handleSelect('CRYPTO')}
-              className={`px-3 py-1 rounded-lg text-xs font-bold font-mono transition-all cursor-pointer flex items-center gap-1.5 ${
-                !isForex
-                  ? 'bg-[#0F172A] text-white shadow-xs'
-                  : 'text-slate-600 hover:text-[#0F172A]'
+              className={`px-3 py-1 rounded-lg text-xs font-bold font-mono transition-all flex items-center gap-1.5 ${
+                maintenance.crypto
+                  ? 'opacity-50 cursor-not-allowed text-slate-400 select-none'
+                  : !isForex
+                  ? 'bg-[#0F172A] text-white shadow-xs cursor-pointer'
+                  : 'text-slate-600 hover:text-[#0F172A] cursor-pointer'
               }`}
             >
-              <span className={`w-1.5 h-1.5 rounded-full ${!isForex ? 'bg-emerald-400' : 'bg-slate-400'}`} />
+              {maintenance.crypto ? (
+                <Lock className="w-3 h-3 text-amber-500" />
+              ) : (
+                <span className={`w-1.5 h-1.5 rounded-full ${!isForex ? 'bg-emerald-400' : 'bg-slate-400'}`} />
+              )}
               <span>CRYPTO · {activeExchange === 'BITGET' ? 'Bitget' : 'Binance'}</span>
             </button>
           </div>
