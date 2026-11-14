@@ -1142,7 +1142,7 @@ export async function evaluateMultiAiConsensus(
     marketType: isCrypto ? 'CRYPTO' : 'FOREX',
   });
 
-  const effectiveThreshold = typeof confidenceThreshold === 'number' && confidenceThreshold > 0 && confidenceThreshold !== 65 && confidenceThreshold !== 56
+  const effectiveThreshold = typeof confidenceThreshold === 'number' && confidenceThreshold > 0
     ? confidenceThreshold
     : dynamicThresholdResult.threshold;
 

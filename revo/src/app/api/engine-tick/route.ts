@@ -289,6 +289,7 @@ export async function POST(req: NextRequest) {
 
     const updatedPositions: ManagedPosition[] = [...currentPositions];
     const newOrdersPlaced: any[] = [];
+    let latestAiVerdictUpdate = runtimeState.latestAiVerdict || null;
     const closedTrades: { id: string; symbol: string; pnl: number; reason: string }[] = [];
     const dailyLoss = Math.max(
       Number(runtimeState.dailyRealizedLossUsd || 0),
@@ -623,12 +624,21 @@ export async function POST(req: NextRequest) {
         }
       );
 
-      const isSignalVerified = aiVerdict.executionAllowed || aiVerdict.confidence_score >= dynamicThresholdRes.threshold;
+      const isSignalVerified = aiVerdict.executionAllowed || aiVerdict.confidence_score >= symbolThreshold;
       const autoGovDecision = isSignalVerified ? 'EXECUTE' : 'REJECT';
+      latestAiVerdictUpdate = {
+        symbol: symbolSnapshot,
+        decision: autoGovDecision === 'EXECUTE' ? 'EXECUTE' : aiVerdict.decision,
+        confidence_score: aiVerdict.confidence_score,
+        dynamicThreshold: symbolThreshold,
+        source: aiVerdict.source,
+        reasoning: aiVerdict.reasoning,
+        timestamp: Date.now(),
+      };
       log(
         symbolSnapshot,
         'AI',
-        `[AUTO-GOVERNANCE] AI Score: ${aiVerdict.confidence_score}% vs Dynamic Threshold: ${dynamicThresholdRes.threshold}% (${dynamicThresholdRes.reasons.join(', ')}) -> ${autoGovDecision}`
+        `[AUTO-GOVERNANCE] AI Score: ${aiVerdict.confidence_score}% vs Dynamic Threshold: ${symbolThreshold}% (${dynamicThresholdRes.reasons.join(', ')}) -> ${autoGovDecision}`
       );
 
       log(
@@ -638,7 +648,7 @@ export async function POST(req: NextRequest) {
       );
 
       if (!isSignalVerified) {
-        log(symbolSnapshot, 'AI', `Order REJECTED by Multi-AI Consensus: Score ${aiVerdict.confidence_score}% < Dynamic Threshold ${dynamicThresholdRes.threshold}%`);
+        log(symbolSnapshot, 'AI', `Order REJECTED by Multi-AI Consensus: Score ${aiVerdict.confidence_score}% < Dynamic Threshold ${symbolThreshold}%`);
         continue;
       }
 
@@ -758,6 +768,7 @@ export async function POST(req: NextRequest) {
     await stateSync.updateRuntimeState({
       positions: updatedPositions,
       lastTickTimestamp: Date.now(),
+      latestAiVerdict: latestAiVerdictUpdate,
     });
 
     return NextResponse.json({

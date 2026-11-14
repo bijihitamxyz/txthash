@@ -24,7 +24,7 @@ export async function POST(req: NextRequest) {
     const verdict = await evaluateMultiAiConsensus(
       snapshot,
       activeProviders,
-      centralAi.confidenceThreshold || 70
+      centralAi.autoAdaptiveThreshold !== false ? undefined : (centralAi.confidenceThreshold || 70)
     );
 
     return NextResponse.json({

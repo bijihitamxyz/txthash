@@ -94,6 +94,7 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
   const fetchAccountInfo = useTradingStore((s) => s.fetchAccountInfo);
   const kronosPrediction = useTradingStore((s) => s.kronosPrediction);
   const kronosHealth = useTradingStore((s) => s.kronosHealth);
+  const latestAiVerdict = useTradingStore((s) => s.latestAiVerdict);
   const checkKronosHealth = useTradingStore((s) => s.checkKronosHealth);
 
   // Synchronized SL/TP execution parameter states with useTradingStore
@@ -1005,6 +1006,23 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
                 </span>
               </div>
               <div className="flex items-center justify-between">
+                <span className="text-slate-500 dark:text-zinc-400">AI Score:</span>
+                <span
+                  className={`font-bold ${
+                    !latestAiVerdict
+                      ? 'text-slate-500 dark:text-zinc-400'
+                      : latestAiVerdict.decision === 'EXECUTE' ||
+                        latestAiVerdict.confidence_score >= latestAiVerdict.dynamicThreshold
+                      ? 'text-emerald-700 dark:text-emerald-400'
+                      : 'text-rose-600 dark:text-rose-400'
+                  }`}
+                >
+                  {latestAiVerdict
+                    ? `${latestAiVerdict.confidence_score}% / ${latestAiVerdict.dynamicThreshold}% (${latestAiVerdict.decision})`
+                    : 'Standby'}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
                 <span className="text-slate-500 dark:text-zinc-400">Risk Governance:</span>
                 <span className="font-bold text-[#0F172A] dark:text-slate-100 truncate max-w-[130px]">
                   {aiMetrics.verdict}
@@ -1558,6 +1576,18 @@ export const ForexTerminalRoom: React.FC<ForexTerminalRoomProps> = ({ isActiveRo
                     <div className="font-mono text-[10px] uppercase tracking-wider text-slate-400 dark:text-zinc-500 font-semibold">
                       Multi-AI Consensus / Risk Governance
                     </div>
+                    {latestAiVerdict && (
+                      <span
+                        className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold border ${
+                          latestAiVerdict.decision === 'EXECUTE' ||
+                          latestAiVerdict.confidence_score >= latestAiVerdict.dynamicThreshold
+                            ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/30'
+                            : 'bg-rose-50 dark:bg-rose-500/15 text-rose-600 dark:text-rose-400 border-rose-200 dark:border-rose-500/30'
+                        }`}
+                      >
+                        AI {latestAiVerdict.confidence_score}% / {latestAiVerdict.dynamicThreshold}%
+                      </span>
+                    )}
                     {isSlotsFull && (
                       <span
                         className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold border ${

@@ -913,13 +913,13 @@ class EngineScheduler {
           }
         );
 
-        const isSignalVerified = aiVerdict.executionAllowed || aiVerdict.confidence_score >= dynamicThresholdRes.threshold;
+        const isSignalVerified = aiVerdict.executionAllowed || aiVerdict.confidence_score >= symbolEffectiveThreshold;
         const autoGovDecision = isSignalVerified ? 'EXECUTE' : 'REJECT';
         latestAiVerdictUpdate = {
           symbol: symbolSnapshot,
           decision: autoGovDecision === 'EXECUTE' ? 'EXECUTE' : aiVerdict.decision,
           confidence_score: aiVerdict.confidence_score,
-          dynamicThreshold: dynamicThresholdRes.threshold,
+          dynamicThreshold: symbolEffectiveThreshold,
           source: aiVerdict.source,
           reasoning: aiVerdict.reasoning,
           timestamp: Date.now(),
@@ -927,7 +927,7 @@ class EngineScheduler {
         log(
           symbolSnapshot,
           'AI',
-          `[AUTO-GOVERNANCE] AI Score: ${aiVerdict.confidence_score}% vs Dynamic Threshold: ${dynamicThresholdRes.threshold}% (${dynamicThresholdRes.reasons.join(', ')}) -> ${autoGovDecision}`
+          `[AUTO-GOVERNANCE] AI Score: ${aiVerdict.confidence_score}% vs Dynamic Threshold: ${symbolEffectiveThreshold}% (${dynamicThresholdRes.reasons.join(', ')}) -> ${autoGovDecision}`
         );
 
         log(
@@ -937,7 +937,7 @@ class EngineScheduler {
         );
 
         if (!isSignalVerified) {
-          log(symbolSnapshot, 'AI', `Order REJECTED by Multi-AI Consensus: Score ${aiVerdict.confidence_score}% < Dynamic Threshold ${dynamicThresholdRes.threshold}%`);
+          log(symbolSnapshot, 'AI', `Order REJECTED by Multi-AI Consensus: Score ${aiVerdict.confidence_score}% < Dynamic Threshold ${symbolEffectiveThreshold}%`);
           continue;
         }
 

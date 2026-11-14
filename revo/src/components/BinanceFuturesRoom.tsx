@@ -595,9 +595,11 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   const aiBullish = isKronosMatch ? kronosCrypto.bullishPct : 50;
   const aiBearish = 100 - aiBullish;
   const aiVerdict = isKronosMatch ? kronosCrypto.verdict : 'NEUTRAL CONSOLIDATION';
-  const aiSummary = isKronosMatch
-    ? kronosCrypto.multiAiSummary
-    : `Multi-AI Consensus / Risk Governance active on ${selectedSymbol} (${timeframe}).`;
+  const aiSummary =
+    activeVerdict?.aiVerdict?.reasoning ||
+    (isKronosMatch
+      ? kronosCrypto.multiAiSummary
+      : `Multi-AI Consensus / Risk Governance active on ${selectedSymbol} (${timeframe}).`);
   const aiSignal = isKronosMatch
     ? kronosCrypto.signal
     : activeVerdict?.approved
@@ -1727,7 +1729,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
               </div>
 
               {/* Key Quantitative Metrics Grid */}
-              <div className="grid grid-cols-3 gap-2 font-mono text-[11px]">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono text-[11px]">
                 <div className="p-2 rounded-xl bg-[#F8FAFC] dark:bg-zinc-950 border border-slate-200/80 dark:border-zinc-800">
                   <div className="text-[10px] text-slate-400 dark:text-zinc-500">POC</div>
                   <div className="font-bold text-[#0F172A] dark:text-slate-100 truncate">
@@ -1753,6 +1755,25 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                   >
                     {activeVerdict
                       ? `${activeVerdict.score}/${activeVerdict.dynamicThreshold || 65}%`
+                      : '---'}
+                  </div>
+                </div>
+                <div className="p-2 rounded-xl bg-[#F8FAFC] dark:bg-zinc-950 border border-slate-200/80 dark:border-zinc-800">
+                  <div className="text-[10px] text-slate-400 dark:text-zinc-500">AI SCORE</div>
+                  <div
+                    className={`font-bold truncate ${
+                      activeVerdict?.aiVerdict
+                        ? activeVerdict.aiVerdict.decision === 'EXECUTE' ||
+                          activeVerdict.aiVerdict.confidence >= (activeVerdict.dynamicThreshold || 65)
+                          ? 'text-emerald-700 dark:text-emerald-400'
+                          : 'text-rose-600 dark:text-rose-400'
+                        : 'text-slate-600 dark:text-slate-300'
+                    }`}
+                  >
+                    {activeVerdict?.aiVerdict
+                      ? `${activeVerdict.aiVerdict.confidence}% ${activeVerdict.aiVerdict.decision === 'EXECUTE' ? '✓' : '✕'}`
+                      : activeVerdict
+                      ? `${activeVerdict.score}%`
                       : '---'}
                   </div>
                 </div>

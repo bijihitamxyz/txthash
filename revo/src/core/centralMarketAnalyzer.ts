@@ -178,12 +178,16 @@ export async function runCentralizedMarketAnalysisCycle(): Promise<CentralizedAn
         enableAiJudge: true,
       });
 
-      const dynamicThreshold =
+      const cryptoDynamicThreshold =
         verdict.dynamicThreshold ||
         getCryptoDynamicThreshold({
           efficiencyRatio: verdict.indicators?.efficiencyRatio,
           pocMagnetAligned: verdict.indicators?.pocMagnetAligned,
         });
+      const dynamicThreshold =
+        centralAi.autoAdaptiveThreshold !== false
+          ? cryptoDynamicThreshold
+          : (centralAi.confidenceThreshold || cryptoDynamicThreshold);
 
       const effectiveConfidence = verdict.aiVerdict
         ? verdict.aiVerdict.confidence

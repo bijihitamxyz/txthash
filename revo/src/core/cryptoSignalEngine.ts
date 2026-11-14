@@ -693,6 +693,7 @@ export async function evaluateCryptoSignal(params: {
   }
 
   let aiVerdict: CryptoSignalVerdict['aiVerdict'] | undefined;
+  let activeAiThreshold = cryptoDynamicThreshold;
 
   // Call Multi-AI Consensus / Risk Governance Judge when setup is qualified or scoring >= dynamic threshold
   if (isApproved && enableAiJudge) {
@@ -836,10 +837,14 @@ export async function evaluateCryptoSignal(params: {
             zScore,
             btcGuardStatus: judgePayload.btcGuardStatus,
           };
+          activeAiThreshold =
+            centralCfg.autoAdaptiveThreshold !== false
+              ? cryptoDynamicThreshold
+              : (centralCfg.confidenceThreshold || cryptoDynamicThreshold);
           const srvVerdict = await evaluateMultiAiConsensus(
             serverSnap,
             activeProviders,
-            centralCfg.autoAdaptiveThreshold !== false ? cryptoDynamicThreshold : centralCfg.confidenceThreshold,
+            activeAiThreshold,
             {
               bullishPct: candidateSide === 'LONG' ? 62 : 38,
               pocPrice,
@@ -861,9 +866,9 @@ export async function evaluateCryptoSignal(params: {
       }
 
       if (aiVerdict) {
-        if (aiVerdict.decision === 'EXECUTE' && aiVerdict.confidence >= cryptoDynamicThreshold) {
+        if (aiVerdict.decision === 'EXECUTE' && aiVerdict.confidence >= activeAiThreshold) {
           isApproved = !btcBlocked;
-        } else if (aiVerdict.decision === 'REJECT' || aiVerdict.confidence < cryptoDynamicThreshold) {
+        } else if (aiVerdict.decision === 'REJECT' || aiVerdict.confidence < activeAiThreshold) {
           isApproved = false;
         }
       }
