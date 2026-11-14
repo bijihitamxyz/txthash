@@ -803,7 +803,30 @@ export function computeQuantHeuristicVerdict(
 }
 
 /**
+ * Normalizes an AI score value (supports numbers, numeric strings with optional '%',
+ * and 0.0-1.0 decimal probabilities which are scaled to 0-100).
+ */
+function normalizeAiScore(rawScore: unknown): number | null {
+  if (rawScore === null || rawScore === undefined) return null;
+  let num: number;
+  if (typeof rawScore === 'number') {
+    num = rawScore;
+  } else if (typeof rawScore === 'string') {
+    const cleaned = rawScore.replace(/%/g, '').trim();
+    if (!cleaned) return null;
+    num = Number(cleaned);
+  } else {
+    return null;
+  }
+  if (!Number.isFinite(num)) return null;
+  // Convert 0.0 - 1.0 decimal scale (e.g. 0.78 -> 78) to 0 - 100 percentage scale
+  const scaled = num > 0 && num <= 1 ? num * 100 : num;
+  return Math.max(0, Math.min(100, Math.round(scaled)));
+}
+
+/**
  * Parses JSON response from LLM, stripping reasoning model <think>...</think> blocks
+ * and markdown code fences, with regex fallback and multi-key score normalization.
  */
 export function parseAiJsonResponse(
   rawText: string,
@@ -814,40 +837,68 @@ export function parseAiJsonResponse(
     let cleaned = rawText.trim();
     // Strip <think>...</think> reasoning blocks from reasoning models before parsing JSON
     cleaned = cleaned.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+    // Strip markdown code fences (```json ... ``` or ``` ... ```) anywhere in the text
+    cleaned = cleaned.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
 
-    if (cleaned.startsWith('```')) {
-      cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
-    }
     const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       cleaned = jsonMatch[0];
     }
     let parsed: any;
+    let parseErrMessage = '';
     try {
       parsed = JSON.parse(cleaned);
-    } catch {
-      const decMatch = cleaned.match(/"decision"\s*:\s*"(EXECUTE|REJECT)"/i);
-      const confMatch = cleaned.match(/"confidence_score"\s*:\s*(\d+(?:\.\d+)?)/i);
+    } catch (parseErr: any) {
+      parseErrMessage = parseErr?.message || String(parseErr);
+      const decMatch =
+        cleaned.match(/"decision"\s*:\s*"(EXECUTE|REJECT)"/i) ||
+        rawText.match(/"decision"\s*:\s*"(EXECUTE|REJECT)"/i);
+      const scoreRegexQuoted =
+        /"(?:confidence_score|score|confidence|ai_score|probability)"\s*:\s*"?(\d+(?:\.\d+)?)"?/i;
+      const scoreRegexUnquoted =
+        /(?:confidence_score|ai_score|confidence|score|probability)\s*[:=]\s*(\d+(?:\.\d+)?)/i;
+      const confMatch =
+        cleaned.match(scoreRegexQuoted) ||
+        rawText.match(scoreRegexQuoted) ||
+        cleaned.match(scoreRegexUnquoted) ||
+        rawText.match(scoreRegexUnquoted);
       const slMatch = cleaned.match(/"recommended_sl_pips"\s*:\s*(\d+(?:\.\d+)?)/i);
       const tpMatch = cleaned.match(/"recommended_tp_pips"\s*:\s*(\d+(?:\.\d+)?)/i);
       const reasonMatch = cleaned.match(/"reasoning"\s*:\s*"([^"]*)/i);
-      if (decMatch || confMatch) {
+
+      const fallbackScore = confMatch ? normalizeAiScore(confMatch[1]) : null;
+      if (decMatch || fallbackScore !== null) {
         parsed = {
           decision: decMatch ? decMatch[1].toUpperCase() : 'EXECUTE',
-          confidence_score: confMatch ? Number(confMatch[1]) : 75,
+          confidence_score: fallbackScore !== null ? fallbackScore : 75,
           recommended_sl_pips: slMatch ? Number(slMatch[1]) : snapshot.proposedSlPips,
           recommended_tp_pips: tpMatch ? Number(tpMatch[1]) : snapshot.proposedTpPips,
           reasoning: reasonMatch?.[1]?.trim() || 'AI confluence validation complete.',
         };
       } else {
-        throw new Error('Invalid JSON');
+        console.warn(
+          `[AI Judge] JSON.parse & regex fallback failed (${parseErrMessage}). Raw snippet: ${rawText.slice(0, 240)}`
+        );
+        throw new Error(`Invalid JSON (${parseErrMessage})`);
       }
     }
 
-    const parsedDecision: 'EXECUTE' | 'REJECT' = parsed.decision === 'EXECUTE' ? 'EXECUTE' : 'REJECT';
-    const confidence_score = typeof parsed.confidence_score === 'number'
-      ? Math.max(0, Math.min(100, parsed.confidence_score))
-      : 50;
+    const rawDecision = typeof parsed.decision === 'string' ? parsed.decision.trim().toUpperCase() : '';
+    const parsedDecision: 'EXECUTE' | 'REJECT' = rawDecision === 'EXECUTE' ? 'EXECUTE' : 'REJECT';
+
+    const scoreKeys = ['confidence_score', 'score', 'confidence', 'ai_score', 'probability'] as const;
+    let normalizedScore: number | null = null;
+    for (const key of scoreKeys) {
+      normalizedScore = normalizeAiScore(parsed?.[key]);
+      if (normalizedScore !== null) break;
+    }
+
+    const confidence_score = normalizedScore !== null ? normalizedScore : 50;
+    if (confidence_score === 0) {
+      console.warn(
+        `[AI Judge] Parsed AI score is 0% (decision=${parsedDecision}${parseErrMessage ? `, parseErr=${parseErrMessage}` : ''}). Raw snippet: ${rawText.slice(0, 240)}`
+      );
+    }
 
     const recommended_sl_pips = typeof parsed.recommended_sl_pips === 'number' && parsed.recommended_sl_pips > 0
       ? parsed.recommended_sl_pips
@@ -873,7 +924,10 @@ export function parseAiJsonResponse(
       executionAllowed,
     };
   } catch (err) {
-    console.warn('[AI Judge] Non-JSON LLM response. Reverting to Quantitative Fallback.');
+    console.warn(
+      `[AI Judge] Non-JSON LLM response. Reverting to Quantitative Fallback. Raw snippet: ${rawText.slice(0, 240)}`,
+      err instanceof Error ? err.message : err
+    );
     return computeQuantHeuristicVerdict(snapshot, confidenceThreshold);
   }
 }
@@ -1014,12 +1068,19 @@ async function evaluateSingleProviderStrict(
       const json = await response.json();
       rawContent = json.content?.[0]?.text || '';
     } else {
+      const isOllamaOrCustom =
+        isVpsOrOllama ||
+        (provider.id || '').toLowerCase() === 'custom' ||
+        rawBaseUrl.toLowerCase().includes('ollama');
+
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${effectiveKey}`,
-        'HTTP-Referer': 'https://nmssx.xyz',
-        'X-Title': 'NEMESIS x Trade Multi-AI Consensus',
       };
+      if (!isOllamaOrCustom) {
+        headers['HTTP-Referer'] = 'https://nmssx.xyz';
+        headers['X-Title'] = 'NEMESIS x Trade Multi-AI Consensus';
+      }
 
       const basePayload: any = {
         model,
@@ -1027,15 +1088,20 @@ async function evaluateSingleProviderStrict(
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
-        max_tokens: 80,
-        temperature: 0.1,
       };
 
-      if (reasoning) {
-        basePayload.max_completion_tokens = 80;
+      if (isOllamaOrCustom) {
+        // Ollama & custom OpenAI-compatible endpoints: avoid max_completion_tokens / response_format
+        // and allow enough tokens so local models don't truncate JSON mid-object.
+        basePayload.max_tokens = 256;
+        if (!reasoning) {
+          basePayload.temperature = 0.1;
+        }
+      } else if (reasoning) {
+        basePayload.max_completion_tokens = 256;
       } else {
         basePayload.temperature = 0.1;
-        basePayload.max_tokens = 80;
+        basePayload.max_tokens = 256;
       }
 
       let response = await fetch(chatEndpoint, {
@@ -1087,12 +1153,17 @@ async function evaluateSingleProviderStrict(
 
       const json = await response.json();
       const choice = json.choices?.[0];
-      rawContent = choice?.message?.content || choice?.message?.reasoning_content || '';
+      rawContent =
+        choice?.message?.content ||
+        choice?.message?.reasoning_content ||
+        json.message?.content ||
+        json.response ||
+        '';
     }
 
     const parsed = parseAiJsonResponse(rawContent, snapshot, confidenceThreshold);
     if (parsed.source !== 'LLM') {
-      throw new Error('Invalid JSON output');
+      throw new Error(`Invalid JSON output (raw: ${rawContent.slice(0, 120)})`);
     }
 
     return {
