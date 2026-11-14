@@ -47,7 +47,7 @@ export async function GET(req: NextRequest) {
         try {
           controller.abort();
         } catch {}
-      }, 2000);
+      }, 4000);
       const probeStart = Date.now();
       try {
         const res = await fetch(`${targetVpsUrl}/health`, {

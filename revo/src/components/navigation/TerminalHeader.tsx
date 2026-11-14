@@ -27,6 +27,12 @@ export const TerminalHeader: React.FC = () => {
   const checkKronosHealth = useTradingStore((s) => s.checkKronosHealth);
   const openExnessVaultModal = useTradingStore((s) => s.openVaultModal);
 
+  React.useEffect(() => {
+    if (kronosHealth === null) {
+      checkKronosHealth().catch(() => {});
+    }
+  }, [kronosHealth, checkKronosHealth]);
+
   const openBinanceVaultModal = useBinanceStore((s) => s.openVaultModal);
   const activeCryptoExchange = useBinanceStore((s) => s.activeExchange);
 
@@ -249,33 +255,54 @@ export const TerminalHeader: React.FC = () => {
       </div>
 
       {/* Mobile Status Strip */}
-      <div className="md:hidden px-3 pb-2 flex items-center justify-between gap-1.5 font-mono text-[10px]">
+      <div
+        onClick={() => checkKronosHealth()}
+        className="md:hidden px-3 pb-2 flex items-center justify-between gap-1.5 font-mono text-[10px] cursor-pointer"
+      >
         <span
           className={`flex-1 text-center py-1 rounded-lg border font-semibold ${
             kronosReadyState === 'READY'
               ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/30'
+              : kronosReadyState === 'CHECKING'
+              ? 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
               : 'bg-rose-50 dark:bg-rose-500/15 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/30'
           }`}
         >
-          {kronosReadyState === 'READY' ? '● Kronos Ready' : '○ Kronos Offline'}
+          {kronosReadyState === 'READY'
+            ? '● Kronos Ready'
+            : kronosReadyState === 'CHECKING'
+            ? '○ Checking...'
+            : '○ Kronos Offline'}
         </span>
         <span
           className={`flex-1 text-center py-1 rounded-lg border font-semibold ${
             vpsReadyState === 'READY'
               ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/30'
+              : vpsReadyState === 'CHECKING'
+              ? 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
               : 'bg-rose-50 dark:bg-rose-500/15 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-500/30'
           }`}
         >
-          {vpsReadyState === 'READY' ? '● VPS Ready' : '○ VPS Offline'}
+          {vpsReadyState === 'READY'
+            ? '● VPS Ready'
+            : vpsReadyState === 'CHECKING'
+            ? '○ Checking...'
+            : '○ VPS Offline'}
         </span>
         <span
           className={`flex-1 text-center py-1 rounded-lg border font-semibold ${
             aiReadyState === 'READY'
               ? 'bg-emerald-50 dark:bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/30'
+              : aiReadyState === 'CHECKING'
+              ? 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
               : 'bg-amber-50 dark:bg-amber-500/15 text-amber-800 dark:text-amber-300 border-amber-200 dark:border-amber-500/30'
           }`}
         >
-          {aiReadyState === 'READY' ? '● AI Ready' : '○ AI Standby'}
+          {aiReadyState === 'READY'
+            ? '● AI Ready'
+            : aiReadyState === 'CHECKING'
+            ? '○ Checking...'
+            : '○ AI Standby'}
         </span>
       </div>
     </header>

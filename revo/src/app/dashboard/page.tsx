@@ -25,19 +25,42 @@ function ClientTerminalWorkspace() {
   const activeMarket: 'FOREX' | 'CRYPTO' =
     activeRoom === 'CRYPTO' || activeRoom === 'ROOM_2_BINANCE' ? 'CRYPTO' : 'FOREX';
 
-  // Poll Admin maintenance switches from /api/health
+  // Poll Admin maintenance switches & Kronos/Multi-AI health from /api/kronos
   React.useEffect(() => {
     let mounted = true;
-    const syncMaintenance = async () => {
+    const syncSystemHealth = async () => {
       try {
-        const res = await fetch('/api/health', { cache: 'no-store' });
+        const res = await fetch('/api/kronos', { cache: 'no-store' });
         if (!res.ok) return;
         const data = await res.json();
         const sw = data?.engineSwitches || {};
         const forex = Boolean(sw.forexMaintenance);
         const crypto = Boolean(sw.cryptoMaintenance);
+        const vpsReady = Boolean(data.vpsReady);
+        const kronosReady = Boolean(data.kronosReady);
+        const aiReady = Boolean(data.aiReady);
+
         if (mounted) {
           setMaintenance({ forex, crypto });
+          useTradingStore.setState({
+            kronosHealth: {
+              ok: Boolean(data.ok),
+              status: data.status || (vpsReady && kronosReady ? 'healthy' : aiReady ? 'degraded' : 'offline'),
+              kronosReady,
+              vpsReady,
+              aiReady,
+              engineStatus: data.engineStatus || (vpsReady ? 'kronos-neural-ready' : 'local-quant-fallback'),
+              activeAiCount: Number(data.activeAiCount ?? 0),
+              activeAiModels: Array.isArray(data.activeAiModels) ? data.activeAiModels : [],
+              vpsStatus: vpsReady ? 'ONLINE' : 'OFFLINE',
+              aiModel: data.aiModel || data.model || 'Multi-AI Consensus / Risk Governance',
+              engine: data.engine || 'NMSSx-Kronos-MultiAI',
+              architecture: data.architecture || 'MULTI-AI CONSENSUS + KRONOS VPS',
+              authenticated: Boolean(data.authenticated),
+              latencyMs: Number(data.latencyMs ?? 0),
+              timestamp: Number(data.timestamp || Date.now()),
+            },
+          });
         }
         if (forex && useTradingStore.getState().isAutoTrading) {
           useTradingStore.getState().toggleAutoTrading(false).catch(() => {});
@@ -48,8 +71,8 @@ function ClientTerminalWorkspace() {
       } catch {}
     };
 
-    syncMaintenance();
-    const timer = setInterval(syncMaintenance, 15000);
+    syncSystemHealth();
+    const timer = setInterval(syncSystemHealth, 10000);
     return () => {
       mounted = false;
       clearInterval(timer);
