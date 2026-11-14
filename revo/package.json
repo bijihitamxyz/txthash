@@ -9,8 +9,8 @@
     "prod:build": "next build --webpack",
     "build": "next build --webpack",
     "lint": "node --max-old-space-size=400 ./node_modules/typescript/bin/tsc --noEmit",
-    "worker": "node --experimental-strip-types src/scripts/daemonRunner.ts",
-    "trade-worker": "node --experimental-strip-types src/workers/tradeWorker.ts"
+    "worker": "npx tsx src/scripts/daemonRunner.ts",
+    "trade-worker": "npx tsx src/workers/tradeWorker.ts"
   },
   "dependencies": {
     "@types/ws": "^8.18.2",
