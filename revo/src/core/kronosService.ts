@@ -257,20 +257,20 @@ export function computeRealTimeKronosForecast(params: {
           regime = 'MEAN_REVERTING';
         }
 
-        // Mean-reversion vs trend scoring:
-        // - Trend component: EMA21 vs EMA50 + price vs EMA50
-        // - Exhaustion/Reversion component: if |zScore| >= 1.6 and RSI extreme, penalize chasing!
+        // Mean-reversion vs trend scoring (timeframe-sensitive for M1/M5 scalping):
+        const tfFactor = timeframe === 'M1' ? 1.2 : timeframe === 'M5' ? 1.05 : timeframe === 'M15' ? 0.95 : 0.85;
         const trendScore =
-          Math.max(-16, Math.min(16, emaDiffAtr * 7)) +
-          Math.max(-8, Math.min(8, priceVsEma50Atr * 4));
-        const rsiScore = Math.max(-12, Math.min(12, (rsiVal - 50) * 0.45));
+          (Math.max(-16, Math.min(16, emaDiffAtr * 7.5)) +
+            Math.max(-8, Math.min(8, priceVsEma50Atr * 4.5))) *
+          tfFactor;
+        const rsiScore = Math.max(-12, Math.min(12, (rsiVal - 50) * 0.5));
         // Mean-reversion pull toward POC when overextended
         const reversionBias = Math.abs(zScore) >= 1.5 ? -Math.sign(zScore) * Math.min(12, (Math.abs(zScore) - 1.2) * 8) : 0;
         const pocMagnetScore =
           regime === 'MEAN_REVERTING'
             ? Math.max(-8, Math.min(8, -pocDiffAtr * 3.5))
             : Math.max(-6, Math.min(6, pocDiffAtr * 2.5));
-        const momScore = Math.max(-6, Math.min(6, candleMomentum * 4));
+        const momScore = Math.max(-7, Math.min(7, candleMomentum * 4.5 * tfFactor));
 
         const rawBullish = 50 + trendScore + rsiScore + pocMagnetScore + reversionBias + momScore;
         bullishPct = Math.max(15, Math.min(86, Math.round(rawBullish)));
@@ -283,13 +283,13 @@ export function computeRealTimeKronosForecast(params: {
           : lastC.close - atr14 * horizonMultiplier;
         horizonPrice = Number(rawHorizon.toFixed(effectiveDigits));
 
-        // Signal only when edge is clear (>= 62% or <= 38%) and not chasing extreme overbought/oversold in chop
-        if (bullishPct >= 62 && !(regime === 'MEAN_REVERTING' && rsiVal > 68)) {
+        // Signal when directional edge is clear (>= 58% or <= 42%) and not chasing extreme overbought/oversold in chop
+        if (bullishPct >= 58 && !(regime === 'MEAN_REVERTING' && rsiVal > 68)) {
           signal = 'BUY';
-          gateSummary = `CRYPTO_QUANT (${regime}, ER=${er10.toFixed(2)}, Z=${zScore.toFixed(2)})`;
-        } else if (bullishPct <= 38 && !(regime === 'MEAN_REVERTING' && rsiVal < 32)) {
+          gateSummary = `CRYPTO_QUANT_${timeframe} (${regime}, ER=${er10.toFixed(2)}, Z=${zScore.toFixed(2)})`;
+        } else if (bullishPct <= 42 && !(regime === 'MEAN_REVERTING' && rsiVal < 32)) {
           signal = 'SELL';
-          gateSummary = `CRYPTO_QUANT (${regime}, ER=${er10.toFixed(2)}, Z=${zScore.toFixed(2)})`;
+          gateSummary = `CRYPTO_QUANT_${timeframe} (${regime}, ER=${er10.toFixed(2)}, Z=${zScore.toFixed(2)})`;
         }
       } else {
         const emaDiffPips = (lastEma21 - lastEma50) / (profile.pipValue || 0.01);

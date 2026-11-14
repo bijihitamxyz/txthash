@@ -242,6 +242,7 @@ export interface BinanceStoreState {
   // Action Methods
   fetchSymbolsAndTickers: (forceExchangeInfo?: boolean) => Promise<void>;
   fetchKlines: (symbol: string) => Promise<void>;
+  upsertLiveKline: (symbol: string, kline: BinanceKline, livePrice?: number) => void;
   fetchAccountInfo: () => Promise<void>;
   executeScannerTick: () => Promise<void>;
   executeManualTrade: (symbol: string, side: 'LONG' | 'SHORT') => Promise<void>;
@@ -663,9 +664,9 @@ export const useBinanceStore = create<BinanceStoreState>()(
         try {
           const promises: [Promise<Response> | null, Promise<Response>] = [
             needsExchangeInfo
-              ? fetch(`/api/binance?action=EXCHANGE_INFO&exchange=${ex}&isTestnet=${isTest}`)
+              ? fetch(`/api/binance?action=EXCHANGE_INFO&exchange=${ex}&isTestnet=${isTest}`, { cache: 'no-store' })
               : null,
-            fetch(`/api/binance?action=TICKERS&exchange=${ex}&isTestnet=${isTest}`),
+            fetch(`/api/binance?action=TICKERS&exchange=${ex}&isTestnet=${isTest}`, { cache: 'no-store' }),
           ];
 
           const [infoRes, tickRes] = await Promise.all([
@@ -699,10 +700,31 @@ export const useBinanceStore = create<BinanceStoreState>()(
               };
             });
             const totalUnrealized = updatedPositions.reduce((sum, p) => sum + (p.unRealizedProfit || 0), 0);
+            const activeSym = get().selectedSymbol;
+            const activeTicker = newTickers[activeSym];
+            const existingKlines = get().klines[activeSym];
+            let nextKlinesMap = get().klines;
+            if (activeTicker?.lastPrice > 0 && Array.isArray(existingKlines) && existingKlines.length > 0) {
+              const lastBar = existingKlines[existingKlines.length - 1];
+              const livePrice = activeTicker.lastPrice;
+              if (lastBar && livePrice !== lastBar.close) {
+                const updatedLast: BinanceKline = {
+                  ...lastBar,
+                  close: livePrice,
+                  high: Math.max(lastBar.high, livePrice),
+                  low: Math.min(lastBar.low, livePrice),
+                };
+                nextKlinesMap = {
+                  ...nextKlinesMap,
+                  [activeSym]: [...existingKlines.slice(0, -1), updatedLast],
+                };
+              }
+            }
             set({
               tickers: newTickers,
               positions: updatedPositions,
               unrealizedProfit: Number(totalUnrealized.toFixed(2)),
+              klines: nextKlinesMap,
             });
           }
         } catch (e) {
@@ -715,7 +737,10 @@ export const useBinanceStore = create<BinanceStoreState>()(
         const ex = get().activeExchange || 'BINANCE';
         const isTest = get().isTestnet;
         try {
-          const res = await fetch(`/api/binance?action=KLINES&symbol=${symbol}&interval=${tf}&limit=100&exchange=${ex}&isTestnet=${isTest}`);
+          const res = await fetch(
+            `/api/binance?action=KLINES&symbol=${symbol}&interval=${tf}&limit=100&exchange=${ex}&isTestnet=${isTest}`,
+            { cache: 'no-store' }
+          );
           const json = await res.json();
           if (json.success && Array.isArray(json.klines)) {
             set((state) => ({
@@ -725,6 +750,50 @@ export const useBinanceStore = create<BinanceStoreState>()(
         } catch (e) {
           console.warn(`Error fetching klines for ${symbol}:`, e);
         }
+      },
+
+      upsertLiveKline: (symbol, kline, livePrice) => {
+        set((state) => {
+          const existing = state.klines[symbol] || [];
+          let nextBars: BinanceKline[];
+          if (existing.length === 0) {
+            nextBars = [kline];
+          } else {
+            const last = existing[existing.length - 1];
+            if (kline.timestamp === last.timestamp) {
+              nextBars = [...existing.slice(0, -1), kline];
+            } else if (kline.timestamp > last.timestamp) {
+              nextBars = [...existing.slice(-99), kline];
+            } else {
+              return state;
+            }
+          }
+
+          const priceToSync = typeof livePrice === 'number' && livePrice > 0 ? livePrice : kline.close;
+          const prevTicker = state.tickers[symbol];
+          const nextTickers =
+            priceToSync > 0
+              ? {
+                  ...state.tickers,
+                  [symbol]: {
+                    ...(prevTicker || {
+                      symbol,
+                      priceChangePercent: 0,
+                      highPrice: kline.high,
+                      lowPrice: kline.low,
+                      volume: kline.volume,
+                      quoteVolume: 0,
+                    }),
+                    lastPrice: priceToSync,
+                  },
+                }
+              : state.tickers;
+
+          return {
+            klines: { ...state.klines, [symbol]: nextBars },
+            tickers: nextTickers,
+          };
+        });
       },
 
       fetchAccountInfo: async () => {

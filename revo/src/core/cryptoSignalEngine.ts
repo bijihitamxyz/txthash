@@ -345,11 +345,12 @@ export function evaluateBtcVelocityGuard(btcKlines: BinanceKline[]): {
 export async function evaluateCryptoSignal(params: {
   symbol: string;
   klines: BinanceKline[];
+  timeframe?: string;
   fundingRate?: number;
   btcGuard?: { dumpBlocked: boolean; pumpBlocked: boolean };
   enableAiJudge?: boolean;
 }): Promise<CryptoSignalVerdict> {
-  const { symbol, klines, fundingRate = 0.0001, btcGuard, enableAiJudge = true } = params;
+  const { symbol, klines, timeframe = 'M5', fundingRate = 0.0001, btcGuard, enableAiJudge = true } = params;
 
   if (!klines || klines.length < 50) {
     return {
@@ -469,8 +470,10 @@ export async function evaluateCryptoSignal(params: {
   };
 
   // --- CRYPTO DUAL-GATE EVALUATION (STRICT SETUP A OR SETUP B + FEE-EDGE FILTER) ---
-  // Fee-Edge Volatility Guard: reject dead chop where ATR < 0.18% (taker fees would eat profit)
-  const hasViableVolatility = atrPct >= 0.0018;
+  // Fee-Edge Volatility Guard scaled by timeframe (M1 scalping has smaller per-bar ATR than M15/H1)
+  const tfUpper = String(timeframe || 'M5').toUpperCase();
+  const minAtrPct = tfUpper === 'M1' || tfUpper === '1M' ? 0.0005 : tfUpper === 'M5' || tfUpper === '5M' ? 0.0012 : 0.0018;
+  const hasViableVolatility = atrPct >= minAtrPct;
   // Tighter ATR-adaptive proximity band (max 0.75% or 1.0x ATR) instead of loose 1.5%
   const proxBand = Math.min(0.0075, Math.max(0.0025, atrPct * 1.05));
 

@@ -41,6 +41,8 @@ import {
   evaluateCryptoSignal,
   CryptoSignalVerdict,
 } from '@/core/cryptoSignalEngine';
+import { computeRealTimeKronosForecast } from '@/core/kronosService';
+import { Timeframe } from '@/core/indicatorEngine';
 import { useTheme } from '@/components/InstitutionalChrome';
 import { useRoomStore } from '@/store/useRoomStore';
 
@@ -63,8 +65,10 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   const isForexMaintenance = useRoomStore((s) => s.maintenance.forex);
   const [isMounted, setIsMounted] = useState(false);
   const [isCoinSelectorOpen, setIsCoinSelectorOpen] = useState(false);
+  const [isWsLive, setIsWsLive] = useState(false);
   const [kronosCrypto, setKronosCrypto] = useState<{
     symbol: string;
+    timeframe: string;
     bullishPct: number;
     bearishPct: number;
     verdict: string;
@@ -78,6 +82,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
     horizonPrice: number;
     signal: 'BUY' | 'SELL' | 'NEUTRAL';
   } | null>(null);
+  const lastKronosFetchRef = useRef<{ key: string; ts: number }>({ key: '', ts: 0 });
 
   // Store selectors
   const allSymbols = useBinanceStore((s) => s.allSymbols);
@@ -167,18 +172,21 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
       if (klineInterval) clearInterval(klineInterval);
       if (accountInterval) clearInterval(accountInterval);
 
+      const curTf = (useBinanceStore.getState().timeframe || 'M5').toUpperCase();
+      const klinePollMs = curTf === 'M1' ? 1500 : curTf === 'M5' ? 2000 : 3500;
+
       tickerInterval = setInterval(() => {
         if (typeof document !== 'undefined' && document.hidden) return;
         if (!shouldPollCrypto()) return;
         useBinanceStore.getState().fetchSymbolsAndTickers();
-      }, 2500);
+      }, 2000);
 
       klineInterval = setInterval(() => {
         if (typeof document !== 'undefined' && document.hidden) return;
         if (!shouldPollCrypto()) return;
         const sym = useBinanceStore.getState().selectedSymbol;
         useBinanceStore.getState().fetchKlines(sym);
-      }, 3500);
+      }, klinePollMs);
 
       accountInterval = setInterval(() => {
         if (typeof document !== 'undefined' && document.hidden) return;
@@ -236,23 +244,189 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
     }
   }, [isActiveRoom]);
 
-  // Poll Multi-AI + Kronos forecast via POST /api/kronos for active Crypto pair
+  // Real-time WebSocket K-Line Stream for active Crypto pair & timeframe (M1/M5/M15/H1)
+  useEffect(() => {
+    if (!isActiveRoom || typeof window === 'undefined' || typeof WebSocket === 'undefined') {
+      setIsWsLive(false);
+      return;
+    }
+
+    let ws: WebSocket | null = null;
+    let closedByCleanup = false;
+    let reconnectTimer: NodeJS.Timeout | null = null;
+    let pingTimer: NodeJS.Timeout | null = null;
+
+    const ex = (activeExchange || 'BINANCE').toUpperCase();
+    const tfUpper = (timeframe || 'M5').toUpperCase();
+    const binanceTf =
+      tfUpper === 'M1' ? '1m' : tfUpper === 'M5' ? '5m' : tfUpper === 'M15' ? '15m' : '1h';
+    const bitgetChannel =
+      tfUpper === 'M1' ? 'candle1m' : tfUpper === 'M5' ? 'candle5m' : tfUpper === 'M15' ? 'candle15m' : 'candle1H';
+
+    const connectWs = () => {
+      if (closedByCleanup) return;
+      try {
+        if (ex === 'BITGET') {
+          ws = new WebSocket('wss://ws.bitget.com/v2/ws/public');
+          ws.onopen = () => {
+            setIsWsLive(true);
+            const cleanInstId = selectedSymbol.replace(/[-_]/g, '').toUpperCase();
+            ws?.send(
+              JSON.stringify({
+                op: 'subscribe',
+                args: [{ instType: 'USDT-FUTURES', channel: bitgetChannel, instId: cleanInstId }],
+              })
+            );
+            pingTimer = setInterval(() => {
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('ping');
+              }
+            }, 25000);
+          };
+          ws.onmessage = (evt) => {
+            if (evt.data === 'pong') return;
+            try {
+              const msg = JSON.parse(evt.data);
+              if (Array.isArray(msg?.data) && msg.data.length > 0) {
+                const row = msg.data[msg.data.length - 1];
+                if (Array.isArray(row) && row.length >= 6) {
+                  const close = parseFloat(row[4]);
+                  if (Number.isFinite(close) && close > 0) {
+                    useBinanceStore.getState().upsertLiveKline(
+                      selectedSymbol,
+                      {
+                        timestamp: parseInt(row[0], 10),
+                        open: parseFloat(row[1]),
+                        high: parseFloat(row[2]),
+                        low: parseFloat(row[3]),
+                        close,
+                        volume: parseFloat(row[5] || '0'),
+                      },
+                      close
+                    );
+                  }
+                }
+              }
+            } catch {}
+          };
+        } else {
+          const streamSym = selectedSymbol.toLowerCase();
+          const wsHost = isTestnet ? 'wss://stream.binancefuture.com' : 'wss://fstream.binance.com';
+          ws = new WebSocket(`${wsHost}/ws/${streamSym}@kline_${binanceTf}`);
+          ws.onopen = () => setIsWsLive(true);
+          ws.onmessage = (evt) => {
+            try {
+              const msg = JSON.parse(evt.data);
+              const k = msg?.k;
+              if (k && typeof k.t === 'number') {
+                const close = parseFloat(k.c);
+                if (Number.isFinite(close) && close > 0) {
+                  useBinanceStore.getState().upsertLiveKline(
+                    selectedSymbol,
+                    {
+                      timestamp: k.t,
+                      open: parseFloat(k.o),
+                      high: parseFloat(k.h),
+                      low: parseFloat(k.l),
+                      close,
+                      volume: parseFloat(k.v || '0'),
+                    },
+                    close
+                  );
+                }
+              }
+            } catch {}
+          };
+        }
+
+        ws.onerror = () => {
+          setIsWsLive(false);
+        };
+        ws.onclose = () => {
+          setIsWsLive(false);
+          if (pingTimer) clearInterval(pingTimer);
+          if (!closedByCleanup) {
+            reconnectTimer = setTimeout(connectWs, 3000);
+          }
+        };
+      } catch {
+        setIsWsLive(false);
+      }
+    };
+
+    connectWs();
+
+    return () => {
+      closedByCleanup = true;
+      setIsWsLive(false);
+      if (pingTimer) clearInterval(pingTimer);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      try {
+        ws?.close();
+      } catch {}
+    };
+  }, [isActiveRoom, selectedSymbol, timeframe, activeExchange, isTestnet]);
+
+  // Synchronous + Throttled Server Multi-AI + Kronos forecast for active Crypto pair
   const lastKlineClose = klines.length > 0 ? klines[klines.length - 1]?.close : 0;
   useEffect(() => {
     if (!isActiveRoom && !isAutoTrading && (!positions || positions.length === 0)) return;
+    if (klines.length < 5) return;
     let cancelled = false;
+
+    const mappedCandles = klines.slice(-100).map((k) => ({
+      time: k.timestamp > 1e11 ? Math.floor(k.timestamp / 1000) : k.timestamp,
+      open: k.open,
+      high: k.high,
+      low: k.low,
+      close: k.close,
+      volume: k.volume,
+    }));
+
+    // 1. Immediate synchronous local quantitative forecast (zero lag when switching TF/pair or on WS ticks)
+    const localForecast = computeRealTimeKronosForecast({
+      symbol: selectedSymbol,
+      timeframe: (timeframe || 'M5') as Timeframe,
+      candles: klines.slice(-100),
+    });
+    setKronosCrypto((prev) => {
+      const sameContext = prev && prev.symbol === selectedSymbol && prev.timeframe === timeframe;
+      return {
+        symbol: selectedSymbol,
+        timeframe,
+        bullishPct: localForecast.bullishPct,
+        bearishPct: localForecast.bearishPct,
+        verdict: localForecast.verdict,
+        multiAiSummary: sameContext && prev.multiAiSummary ? prev.multiAiSummary : localForecast.multiAiSummary,
+        pocPrice: localForecast.pocPrice,
+        vahPrice: localForecast.vahPrice,
+        valPrice: localForecast.valPrice,
+        rsi: localForecast.rsi,
+        zScore: localForecast.zScore,
+        regime: localForecast.regime,
+        horizonPrice: localForecast.horizonPrice,
+        signal: localForecast.signal,
+      };
+    });
+
+    // 2. Throttled server /api/kronos sync (max once every 4s per symbol:timeframe, immediate on symbol/TF switch)
+    const contextKey = `${selectedSymbol}:${timeframe}`;
+    const now = Date.now();
+    const shouldFetchServer =
+      lastKronosFetchRef.current.key !== contextKey ||
+      now - lastKronosFetchRef.current.ts >= 4000;
+
+    if (!shouldFetchServer) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    lastKronosFetchRef.current = { key: contextKey, ts: now };
+
     const syncCryptoKronos = async () => {
       if (typeof document !== 'undefined' && document.hidden) return;
       if (!isActiveRoom && !useBinanceStore.getState().isAutoTrading && (!useBinanceStore.getState().positions || useBinanceStore.getState().positions.length === 0)) return;
       try {
-        const mappedCandles = klines.slice(-60).map((k) => ({
-          time: k.timestamp > 1e11 ? Math.floor(k.timestamp / 1000) : k.timestamp,
-          open: k.open,
-          high: k.high,
-          low: k.low,
-          close: k.close,
-          volume: k.volume,
-        }));
         const res = await fetch('/api/kronos', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -267,20 +441,21 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
           if (data.ok || data.success) {
             setKronosCrypto({
               symbol: selectedSymbol,
-              bullishPct: typeof data.bullishPct === 'number' ? data.bullishPct : 58,
-              bearishPct: typeof data.bearishPct === 'number' ? data.bearishPct : 42,
-              verdict: data.verdict || 'NEUTRAL CONSOLIDATION',
+              timeframe,
+              bullishPct: typeof data.bullishPct === 'number' ? data.bullishPct : localForecast.bullishPct,
+              bearishPct: typeof data.bearishPct === 'number' ? data.bearishPct : localForecast.bearishPct,
+              verdict: data.verdict || localForecast.verdict,
               multiAiSummary:
                 data.multiAiSummary ||
-                `Multi-AI Consensus / Risk Governance active on ${selectedSymbol} (${timeframe}).`,
-              pocPrice: typeof data.pocPrice === 'number' ? data.pocPrice : lastKlineClose,
-              vahPrice: typeof data.vahPrice === 'number' ? data.vahPrice : lastKlineClose,
-              valPrice: typeof data.valPrice === 'number' ? data.valPrice : lastKlineClose,
-              rsi: typeof data.rsi === 'number' ? data.rsi : 50,
-              zScore: typeof data.zScore === 'number' ? data.zScore : 0,
-              regime: data.regime || 'MEAN_REVERTING',
-              horizonPrice: typeof data.horizonPrice === 'number' ? data.horizonPrice : lastKlineClose,
-              signal: data.signal || 'NEUTRAL',
+                localForecast.multiAiSummary,
+              pocPrice: typeof data.pocPrice === 'number' ? data.pocPrice : localForecast.pocPrice,
+              vahPrice: typeof data.vahPrice === 'number' ? data.vahPrice : localForecast.vahPrice,
+              valPrice: typeof data.valPrice === 'number' ? data.valPrice : localForecast.valPrice,
+              rsi: typeof data.rsi === 'number' ? data.rsi : localForecast.rsi,
+              zScore: typeof data.zScore === 'number' ? data.zScore : localForecast.zScore,
+              regime: data.regime || localForecast.regime,
+              horizonPrice: typeof data.horizonPrice === 'number' ? data.horizonPrice : localForecast.horizonPrice,
+              signal: data.signal || localForecast.signal,
             });
           }
         }
@@ -291,15 +466,16 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
     return () => {
       cancelled = true;
     };
-  }, [isActiveRoom, isAutoTrading, positions, selectedSymbol, timeframe, lastKlineClose]);
+  }, [isActiveRoom, isAutoTrading, positions, selectedSymbol, timeframe, lastKlineClose, klines.length]);
 
-  // Compute live local Crypto Quant Verdict preview (no external AI cost) for selected symbol
+  // Compute live local Crypto Quant Verdict preview (no external AI cost) for selected symbol & timeframe
   useEffect(() => {
     if (!isActiveRoom || klines.length < 50) return;
     let cancelled = false;
     evaluateCryptoSignal({
       symbol: selectedSymbol,
       klines,
+      timeframe,
       enableAiJudge: false,
     })
       .then((v) => {
@@ -309,7 +485,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
     return () => {
       cancelled = true;
     };
-  }, [isActiveRoom, selectedSymbol, klines]);
+  }, [isActiveRoom, selectedSymbol, timeframe, klines]);
 
   // Background auto-scanner loop
   useEffect(() => {
@@ -416,15 +592,21 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
   );
 
   const activeVerdict = lastVerdict[selectedSymbol] || (localVerdict?.symbol === selectedSymbol ? localVerdict : undefined);
-  const aiBullish = kronosCrypto?.symbol === selectedSymbol ? kronosCrypto.bullishPct : 50;
+  const isKronosMatch =
+    kronosCrypto?.symbol === selectedSymbol && kronosCrypto?.timeframe === timeframe;
+  const aiBullish = isKronosMatch ? kronosCrypto.bullishPct : 50;
   const aiBearish = 100 - aiBullish;
-  const aiVerdict =
-    kronosCrypto?.symbol === selectedSymbol ? kronosCrypto.verdict : 'NEUTRAL CONSOLIDATION';
-  const aiSummary =
-    kronosCrypto?.symbol === selectedSymbol
-      ? kronosCrypto.multiAiSummary
-      : `Multi-AI Consensus / Risk Governance active on ${selectedSymbol} (${timeframe}).`;
-  const aiSignal = kronosCrypto?.symbol === selectedSymbol ? kronosCrypto.signal : 'NEUTRAL';
+  const aiVerdict = isKronosMatch ? kronosCrypto.verdict : 'NEUTRAL CONSOLIDATION';
+  const aiSummary = isKronosMatch
+    ? kronosCrypto.multiAiSummary
+    : `Multi-AI Consensus / Risk Governance active on ${selectedSymbol} (${timeframe}).`;
+  const aiSignal = isKronosMatch
+    ? kronosCrypto.signal
+    : activeVerdict?.approved
+    ? activeVerdict.side === 'LONG'
+      ? 'BUY'
+      : 'SELL'
+    : 'NEUTRAL';
   const priceDigits = currentPrice < 0.01 ? 7 : currentPrice < 1 ? 5 : currentPrice < 10 ? 4 : currentPrice < 100 ? 3 : 2;
 
   // Institutional Dark / Light Adaptive HTML5 Canvas Candlestick Renderer
@@ -488,7 +670,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
       const pVal = maxPrice - (i / 6) * priceRange;
       ctx.fillStyle = isDark ? '#94a3b8' : '#64748B';
       ctx.font = '10px ui-monospace, monospace';
-      ctx.fillText(pVal.toFixed(pVal < 1 ? 4 : 2), chartW + 6, y + 3);
+      ctx.fillText(pVal.toFixed(priceDigits), chartW + 6, y + 3);
     }
 
     // Right price axis separator
@@ -590,7 +772,7 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
         ctx.fillStyle = isDark ? '#cbd5e1' : '#475569';
         ctx.font = '9px ui-monospace, monospace';
         ctx.fillText(
-          `POC ${kronosCrypto.pocPrice.toFixed(kronosCrypto.pocPrice < 1 ? 4 : 2)}`,
+          `POC ${kronosCrypto.pocPrice.toFixed(priceDigits)}`,
           chartW * 0.45 + 4,
           yPoc - 3
         );
@@ -615,8 +797,8 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
     ctx.fillRect(chartW + 2, lastY - 8, paddingRight - 4, 16);
     ctx.fillStyle = '#FFFFFF';
     ctx.font = 'bold 10px ui-monospace, monospace';
-    ctx.fillText(lastClose.toFixed(lastClose < 1 ? 4 : 2), chartW + 5, lastY + 3);
-  }, [klines, canvasWidthTick, isDark, kronosCrypto, selectedSymbol]);
+    ctx.fillText(lastClose.toFixed(priceDigits), chartW + 5, lastY + 3);
+  }, [klines, canvasWidthTick, isDark, kronosCrypto, selectedSymbol, timeframe, priceDigits]);
 
   const watchlistSymbols =
     customWatchlist.length > 0
@@ -1126,7 +1308,21 @@ export const BinanceFuturesRoom: React.FC<BinanceFuturesRoomProps> = ({ onSwitch
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                     BB 2.2
                   </span>
-                  {kronosCrypto && kronosCrypto.symbol === selectedSymbol && kronosCrypto.horizonPrice > 0 && (
+                  <span
+                    className={`px-2 py-0.5 rounded-md font-semibold border inline-flex items-center gap-1 ${
+                      isWsLive
+                        ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60'
+                        : 'bg-slate-100 dark:bg-zinc-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-zinc-700'
+                    }`}
+                  >
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full ${
+                        isWsLive ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
+                      }`}
+                    />
+                    {isWsLive ? 'LIVE WS' : 'REST'}
+                  </span>
+                  {isKronosMatch && kronosCrypto && kronosCrypto.horizonPrice > 0 && (
                     <span className="px-2 py-0.5 rounded-md bg-indigo-50 dark:bg-indigo-950/50 text-indigo-700 dark:text-indigo-300 border border-indigo-200/80 dark:border-indigo-800/60 font-semibold">
                       Target: ${kronosCrypto.horizonPrice.toFixed(priceDigits)}
                     </span>

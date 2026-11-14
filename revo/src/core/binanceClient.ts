@@ -285,6 +285,7 @@ export class BinanceFuturesClient {
     try {
       const res = await fetch(`${this.baseUrl}/fapi/v1/ticker/24hr`, {
         headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
         signal: AbortSignal.timeout(6000),
       });
 
@@ -326,7 +327,11 @@ export class BinanceFuturesClient {
     else if (interval === 'H1') binanceInterval = '1h';
 
     const url = `${this.baseUrl}/fapi/v1/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
-    const res = await fetch(url, { headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(6000) });
+    const res = await fetch(url, {
+      headers: { 'Content-Type': 'application/json' },
+      cache: 'no-store',
+      signal: AbortSignal.timeout(6000),
+    });
 
     if (!res.ok) {
       throw new Error(`Binance klines HTTP ${res.status}: ${res.statusText}`);
