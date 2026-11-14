@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useTradingStore } from '@/store/useTradingStore';
 import { useBinanceStore } from '@/store/useBinanceStore';
 import { InstitutionalFooter, ThemeToggle } from '@/components/InstitutionalChrome';
+import EngineMonitorChart from '@/components/admin/EngineMonitorChart';
 import {
   EngineSwitches,
   AiProviderSlot,
@@ -1291,6 +1292,11 @@ export default function SystemAdminPage() {
               </button>
             ))}
           </div>
+
+          {/* SECTION 0: REAL-TIME SERVER & ENGINE LATENCY MONITOR */}
+          {(activeTab === 'ALL' || activeTab === 'AI_VPS') && (
+            <EngineMonitorChart />
+          )}
 
           {/* SECTION 1: CENTRALIZED MULTI-AI PROVIDER SLOTS & ORACLE VPS KRONOS */}
           {(activeTab === 'ALL' || activeTab === 'AI_VPS') && (

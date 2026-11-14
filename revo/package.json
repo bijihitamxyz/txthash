@@ -9,15 +9,19 @@
     "prod:build": "next build --webpack",
     "build": "next build --webpack",
     "lint": "node --max-old-space-size=400 ./node_modules/typescript/bin/tsc --noEmit",
-    "worker": "node --experimental-strip-types src/scripts/daemonRunner.ts"
+    "worker": "node --experimental-strip-types src/scripts/daemonRunner.ts",
+    "trade-worker": "node --experimental-strip-types src/workers/tradeWorker.ts"
   },
   "dependencies": {
     "@types/ws": "^8.18.2",
+    "bullmq": "^6.7.6",
     "clsx": "^2.1.1",
+    "ioredis": "^6.0.0",
     "lucide-react": "^0.475.0",
     "next": "^16.4.2",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "recharts": "^3.10.1",
     "tailwind-merge": "^2.6.0",
     "ws": "^8.22.1",
     "zustand": "^4.5.5"
